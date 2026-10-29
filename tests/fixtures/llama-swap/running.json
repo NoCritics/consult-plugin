@@ -1,0 +1,1 @@
+{"running":[{"model":"qwen3.5-4b","state":"ready","cmd":"<trimmed>","proxy":"http://localhost:10002","ttl":1800,"name":"Qwen3.5 4B (vision)","description":"Fastest rung: 71 tok/s through llama-swap. Ollama's Q4 copy, with the vision projector."}]}

@@ -1,0 +1,8 @@
+# Excluded from the packed .mcpb: tests and test harness, and build output.
+# The bundle needs consult.js, lib/, vendor/, delegate-run.js, package.json, manifest.json.
+# node_modules only builds vendor/ and runs the tests; the server never loads it.
+*-test.js
+test-helpers.js
+*.mcpb
+build-vendor.js
+node_modules/

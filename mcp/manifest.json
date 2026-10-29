@@ -1,0 +1,44 @@
+{
+  "$schema": "https://raw.githubusercontent.com/anthropics/mcpb/main/schemas/mcpb-manifest-v0.4.schema.json",
+  "manifest_version": "0.4",
+  "name": "consult",
+  "display_name": "consult",
+  "version": "0.15.0",
+  "description": "Ask Codex, Antigravity (agy) and local models for a second opinion, chat with them, run a ranked council, or generate images with agy or GPT through Codex.",
+  "long_description": "Wraps the Codex and Antigravity (agy) CLIs, the legacy Gemini CLI, and any local OpenAI-compatible runner (llama-swap, Ollama, LM Studio, llama-server, vLLM) as tools: one-shot asks with optional images, multi-turn chat, a council that ranks parallel answers by Borda count, and image generation through Antigravity (Google) or through Codex (GPT images under your ChatGPT plan).\n\n**Requires** the CLIs you want to use to be installed and signed in on this machine (`codex login`; run `agy` once). Nothing is bundled except the MCP server itself.\n\nSettings are read from `.claude/consult.local.md` in the server's working directory, falling back to `~/.claude/consult.local.md`. Under Claude Desktop that is effectively always the global file.\n\nThe same server ships in the `consult` Claude Code plugin, which adds slash commands and an auto-triggering skill on top.",
+  "author": { "name": "NoCritics", "url": "https://github.com/NoCritics" },
+  "license": "MIT",
+  "keywords": ["codex", "antigravity", "agy", "gemini", "ollama", "local-llm", "second-opinion", "council", "multi-llm"],
+  "server": {
+    "type": "node",
+    "entry_point": "consult.js",
+    "mcp_config": {
+      "command": "node",
+      "args": ["${__dirname}/consult.js"],
+      "env": { "CONSULT_DELEGATE": "off" }
+    }
+  },
+  "tools": [
+    { "name": "ask_codex", "description": "Ask the Codex CLI (OpenAI) a question, optionally with images." },
+    { "name": "ask_agy", "description": "Ask the Antigravity CLI (Google; also fronts Claude and GPT-OSS models)." },
+    { "name": "agy_generate_image", "description": "Generate images with Antigravity and save them to disk." },
+    { "name": "codex_generate_image", "description": "Generate GPT images through the Codex CLI and save them to disk." },
+    { "name": "agy_status", "description": "Check agy sign-in, list reachable models, report its file-write posture." },
+    { "name": "ask_gemini", "description": "Ask the legacy Gemini CLI (needs a paid API key)." },
+    { "name": "ask_local", "description": "Ask a local model (llama-swap, Ollama, LM Studio, llama-server, any OpenAI-compatible runner)." },
+    { "name": "local_status", "description": "Check the local runner and list its models." },
+    { "name": "local_setup", "description": "Set up local runners and model nicknames; saves only what you confirm." },
+    { "name": "local_unload", "description": "Unload the models a local runner holds, after you agree." },
+    { "name": "codex_login_status", "description": "Check whether the Codex CLI is signed in." },
+    { "name": "codex_login_start", "description": "Start a Codex device sign-in and return the URL." },
+    { "name": "gemini_auth_status", "description": "Diagnose the legacy Gemini CLI's auth." },
+    { "name": "consult_chat_start", "description": "Start a multi-turn chat with codex, agy or gemini." },
+    { "name": "consult_chat_send", "description": "Send the next message in a chat." },
+    { "name": "consult_chat_end", "description": "End a chat and delete its session from disk." },
+    { "name": "council_vote", "description": "Send one prompt to several models, have them rank each other, return the winner." }
+  ],
+  "compatibility": {
+    "platforms": ["win32", "darwin", "linux"],
+    "runtimes": { "node": ">=20" }
+  }
+}

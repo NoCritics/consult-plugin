@@ -1,0 +1,212 @@
+{
+  "models": [
+    {
+      "type": "llm",
+      "publisher": "unsloth",
+      "key": "qwen3.8-27b",
+      "display_name": "Qwen3.8 27B UD",
+      "architecture": "qwen35",
+      "quantization": {
+        "name": "IQ4_XS",
+        "bits_per_weight": 4
+      },
+      "size_bytes": 15180457232,
+      "params_string": "27B",
+      "loaded_instances": [],
+      "max_context_length": 262144,
+      "format": "gguf",
+      "capabilities": {
+        "vision": true,
+        "trained_for_tool_use": true,
+        "reasoning": {
+          "allowed_options": [
+            "off",
+            "on"
+          ],
+          "default": "on"
+        }
+      },
+      "description": null
+    },
+    {
+      "type": "llm",
+      "publisher": "mradermacher",
+      "key": "huihui-qwen3.6-35b-a3b-abliterated-i1",
+      "display_name": "Huihui Qwen3.6 35B A3B Abliterated I1",
+      "architecture": "qwen35moe",
+      "quantization": {
+        "name": "IQ3_XXS",
+        "bits_per_weight": 3
+      },
+      "size_bytes": 14237954752,
+      "params_string": "35B-A3B",
+      "loaded_instances": [],
+      "max_context_length": 262144,
+      "format": "gguf",
+      "capabilities": {
+        "vision": true,
+        "trained_for_tool_use": true,
+        "reasoning": {
+          "allowed_options": [
+            "off",
+            "on"
+          ],
+          "default": "on"
+        }
+      },
+      "description": null
+    },
+    {
+      "type": "llm",
+      "publisher": "ISTA-DASLab",
+      "key": "qwen3.8-flash-next-gsq-rco",
+      "display_name": "Qwen3.8 Flash Next GSQ RCO",
+      "architecture": "qwen4exp",
+      "quantization": {
+        "name": "IQ2_XS",
+        "bits_per_weight": 2
+      },
+      "size_bytes": 68026093024,
+      "params_string": "512x56B",
+      "loaded_instances": [],
+      "max_context_length": 262144,
+      "format": "gguf",
+      "capabilities": {
+        "vision": false,
+        "trained_for_tool_use": true,
+        "reasoning": {
+          "allowed_options": [
+            "off",
+            "on"
+          ],
+          "default": "on"
+        }
+      },
+      "description": null
+    },
+    {
+      "type": "llm",
+      "publisher": "empero-ai",
+      "key": "qwen3.8-9b-distill",
+      "display_name": "Qwen3.8 9B",
+      "architecture": "qwen35",
+      "quantization": {
+        "name": "Q4_K_M",
+        "bits_per_weight": 4
+      },
+      "size_bytes": 5780090176,
+      "params_string": "9B",
+      "loaded_instances": [],
+      "max_context_length": 262144,
+      "format": "gguf",
+      "capabilities": {
+        "vision": false,
+        "trained_for_tool_use": true,
+        "reasoning": {
+          "allowed_options": [
+            "off",
+            "on"
+          ],
+          "default": "on"
+        }
+      },
+      "description": null
+    },
+    {
+      "type": "llm",
+      "publisher": "ollama",
+      "key": "qwen3_5-4b",
+      "display_name": "Qwen3 5 4B",
+      "architecture": "qwen35",
+      "quantization": null,
+      "size_bytes": 3324162336,
+      "params_string": "4.2B",
+      "loaded_instances": [],
+      "max_context_length": 262144,
+      "format": "gguf",
+      "capabilities": {
+        "vision": true,
+        "trained_for_tool_use": true,
+        "reasoning": {
+          "allowed_options": [
+            "off",
+            "on"
+          ],
+          "default": "on"
+        }
+      },
+      "description": null
+    },
+    {
+      "type": "llm",
+      "publisher": "unsloth",
+      "key": "qwen3.6-35b-a3b",
+      "display_name": "Qwen3.6 35B A3B UD",
+      "architecture": "qwen35moe",
+      "quantization": {
+        "name": "IQ3_XXS",
+        "bits_per_weight": 3
+      },
+      "size_bytes": 13211155424,
+      "params_string": "35B-A3B",
+      "loaded_instances": [],
+      "max_context_length": 262144,
+      "format": "gguf",
+      "capabilities": {
+        "vision": false,
+        "trained_for_tool_use": true,
+        "reasoning": {
+          "allowed_options": [
+            "off",
+            "on"
+          ],
+          "default": "on"
+        }
+      },
+      "description": null
+    },
+    {
+      "type": "llm",
+      "publisher": "unsloth",
+      "key": "qwen3.5-9b",
+      "display_name": "Qwen3.5 9B UD",
+      "architecture": "qwen35",
+      "quantization": {
+        "name": "Q4_K_XL",
+        "bits_per_weight": 4
+      },
+      "size_bytes": 5966095584,
+      "params_string": "9B",
+      "loaded_instances": [],
+      "max_context_length": 262144,
+      "format": "gguf",
+      "capabilities": {
+        "vision": false,
+        "trained_for_tool_use": true,
+        "reasoning": {
+          "allowed_options": [
+            "off",
+            "on"
+          ],
+          "default": "on"
+        }
+      },
+      "description": null
+    },
+    {
+      "type": "embedding",
+      "publisher": "nomic-ai",
+      "key": "text-embedding-nomic-embed-text-v1.5",
+      "display_name": "Nomic Embed Text v1.5",
+      "quantization": {
+        "name": "Q4_K_M",
+        "bits_per_weight": 4
+      },
+      "size_bytes": 84106624,
+      "params_string": null,
+      "loaded_instances": [],
+      "max_context_length": 2048,
+      "format": "gguf"
+    }
+  ]
+}

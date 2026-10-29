@@ -1,0 +1,2 @@
+{"type":"session_meta","payload":{"id":"01a1742b-ffff-7000-8000-00000000cafe"}}
+{"type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{"limit_id":"codex","primary":{"used_percent":100.0,"window_minutes":300,"resets_at":1792975000},"secondary":{"used_percent":41.0,"window_minutes":10080,"resets_at":1793521508},"credits":null,"plan_type":"plus","rate_limit_reached_type":"usage_limit_reached"}}}

@@ -1,0 +1,5 @@
+{"type":"session_meta","payload":{"id":"01a1742b-62a9-7593-8add-31fd439d28dc"}}
+{"type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{"limit_id":"codex","primary":{"used_percent":2.0,"window_minutes":300,"resets_at":1792968375},"secondary":{"used_percent":1.0,"window_minutes":10080,"resets_at":1793521508},"credits":null,"plan_type":"plus","rate_limit_reached_type":null}}}
+{"type":"event_msg","payload":{"type":"agent_message","message":"done"}}
+{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":61284,"output_tokens":272}},"rate_limits":{"limit_id":"codex","primary":{"used_percent":3.0,"window_minutes":300,"resets_at":1792968375},"secondary":{"used_percent":1.0,"window_minutes":10080,"resets_at":1793521508},"credits":null,"plan_type":"plus","rate_limit_reached_type":null}}}
+{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":61284,"output_tokens":272}},"rate_limits":null}}

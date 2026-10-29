@@ -1,0 +1,9 @@
+{
+  "timeout_ms": 180000,
+  "codex_timeout_floor_ms": 600000,
+  "agy_image_timeout_ms": 300000,
+  "codex_image_timeout_ms": 300000,
+  "notify_after_s": 120,
+  "history_size": 50,
+  "local_slow_floor_ms": 1200000
+}

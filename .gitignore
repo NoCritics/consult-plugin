@@ -1,0 +1,17 @@
+# Plugin-internal state
+.claude/*.local.md
+
+# MCP server install artifacts
+mcp/node_modules/
+
+# Packed Claude Desktop extension (build output of `mcpb pack`)
+*.mcpb
+
+# Claude Code writes the mod's TypeScript types here each time it loads the mod.
+.claude-plugin/types/
+
+# Claude Code writes this beside the types it generates; it points at them.
+tsconfig.json
+
+# Images agy_generate_image saves when Claude Code runs in this folder
+consult-images/

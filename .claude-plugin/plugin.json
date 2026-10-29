@@ -1,0 +1,31 @@
+{
+  "name": "consult",
+  "version": "0.15.0",
+  "description": "Consult external AI CLIs (Codex, Antigravity) and local models (llama-swap, Ollama, LM Studio, llama-server, vLLM) from inside Claude Code. Exposes them as MCP tools, slash commands, an auto-triggering skill, and multi-turn chat sessions.",
+  "author": {
+    "name": "NoCritics",
+    "url": "https://github.com/NoCritics"
+  },
+  "homepage": "https://github.com/NoCritics/consult-plugin",
+  "repository": "https://github.com/NoCritics/consult-plugin",
+  "license": "MIT",
+  "keywords": [
+    "multi-llm",
+    "codex",
+    "antigravity",
+    "gemini",
+    "ollama",
+    "local-llm",
+    "second-opinion",
+    "mcp"
+  ],
+  "types": "./types/index.d.ts",
+  "mcpServers": {
+    "consult": {
+      "command": "node",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/mcp/consult.js"
+      ]
+    }
+  }
+}

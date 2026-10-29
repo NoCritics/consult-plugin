@@ -1,0 +1,28 @@
+{
+  "name": "consult-mcp",
+  "version": "0.15.0",
+  "private": true,
+  "type": "module",
+  "description": "MCP server that wraps the Codex, Antigravity, Gemini and Claude CLIs plus any local OpenAI-compatible runner (llama-swap, Ollama, LM Studio, llama-server, vLLM) as headless tools. Provides single-shot asks, multi-turn chat with on-disk session relay, and a Borda-count council tournament.",
+  "main": "consult.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "//": "test = free/offline. test:local = free, needs a local runner. The rest cost real API tokens.",
+    "test": "node unit-test.js && node delegate-test.js && node smoke-test.js",
+    "test:local": "node local-test.js",
+    "test:live": "node live-test.js",
+    "test:chat": "node chat-test.js",
+    "test:chat-end": "node chat-end-test.js",
+    "test:council": "node council-test.js",
+    "test:image": "node image-test.js",
+    "test:codex-image": "node codex-image-test.js",
+    "build:vendor": "node build-vendor.js"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "esbuild": "0.28.2"
+  }
+}
