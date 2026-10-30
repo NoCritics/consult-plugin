@@ -410,13 +410,24 @@ function warnIfProjectEscalation(parsed, sourcePath, isProjectScope) {
   }
 }
 
+function realFolderKey(folder) {
+  try {
+    return fs.realpathSync.native(folder).toLowerCase();
+  } catch (_) {
+    return path.resolve(folder).toLowerCase();
+  }
+}
+
 export function loadSettings() {
   const projectPath = path.join(process.cwd(), '.claude', 'consult.local.md');
   const globalPath = path.join(os.homedir(), '.claude', 'consult.local.md');
   // A host that starts the server in the home directory (rather than a
   // project) would otherwise read the GLOBAL file as a project file and apply
-  // the project-scope security warnings to it.
-  const sameFile = path.resolve(projectPath).toLowerCase() === path.resolve(globalPath).toLowerCase();
+  // the project-scope security warnings to it. The two folders are compared as
+  // real paths too: the home folder can be reached through a link (macOS's
+  // /var is /private/var).
+  const sameFile = path.resolve(projectPath).toLowerCase() === path.resolve(globalPath).toLowerCase()
+    || realFolderKey(process.cwd()) === realFolderKey(os.homedir());
   const candidates = [
     ...(sameFile ? [] : [{ path: projectPath, projectScope: true }]),
     { path: globalPath, projectScope: false },

@@ -91,20 +91,42 @@ function windowsPathKey(file) {
   return path.win32.normalize(file).toLowerCase().replace(/\\+$/, '');
 }
 
+// where.exe prints a hit's long real path, while the project can be open
+// through a junction or an 8.3 short name (C:\Users\RUNNER~1\...): a path is
+// compared both as written and as its real long path.
+function windowsPathKeys(file) {
+  const keys = [windowsPathKey(file)];
+  try {
+    const realKey = windowsPathKey(fs.realpathSync.native(file));
+    if (realKey !== keys[0]) keys.push(realKey);
+  } catch (_) { /* a path that does not exist keeps its written form */ }
+  return keys;
+}
+
 // Started from the home folder, one of its parents or a drive root, "inside the
 // project" would cover every trusted install (%APPDATA%\npm, Program Files), so
 // only the absolute-path rule applies there.
 function isBroadFolder(projectKey) {
-  const homeKey = windowsPathKey(os.homedir());
-  return /^[a-z]:$/.test(projectKey) || homeKey === projectKey || homeKey.startsWith(projectKey + '\\');
+  if (/^[a-z]:$/.test(projectKey)) return true;
+  for (const homeKey of windowsPathKeys(os.homedir())) {
+    if (homeKey === projectKey || homeKey.startsWith(projectKey + '\\')) return true;
+  }
+  return false;
 }
 
+// Inside the project in either spelling of either path means inside.
 function isOutsideProject(file, projectFolder) {
   if (!path.win32.isAbsolute(file)) return false;
-  const fileKey = windowsPathKey(file);
-  const projectKey = windowsPathKey(projectFolder);
-  if (isBroadFolder(projectKey)) return true;
-  return fileKey !== projectKey && !fileKey.startsWith(projectKey + '\\');
+  const projectKeys = windowsPathKeys(projectFolder);
+  for (const projectKey of projectKeys) {
+    if (isBroadFolder(projectKey)) return true;
+  }
+  for (const fileKey of windowsPathKeys(file)) {
+    for (const projectKey of projectKeys) {
+      if (fileKey === projectKey || fileKey.startsWith(projectKey + '\\')) return false;
+    }
+  }
+  return true;
 }
 
 // True when a resolved program is an absolute Windows path inside this folder.

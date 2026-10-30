@@ -4,6 +4,15 @@ All notable changes to this plugin are documented here. Format loosely follows [
 
 ## [Unreleased]
 
+### Security
+
+- **A project opened through an 8.3 short path or a junction still can't run its own `codex.cmd` or `agy.cmd`.** On Windows, `where` reports a CLI by its long real path, so a project whose folder was spelled `C:\Users\RUNNER~1\...`, or reached through a junction, didn't match and its own `codex.cmd` could be picked. Both paths are now also compared by their real long path.
+
+### Fixed
+
+- **A home folder reached through a link is still the home folder.** When the home folder was reached through a symlink or junction (macOS's `/var` is `/private/var`), starting in it read `~/.claude/consult.local.md` as a project file and warned about it.
+- The tests now pass on Linux and macOS. The mod's tests resolved their Windows-style paths there, and the git-hook test scripts weren't executable.
+
 ### Added
 
 - **Tests run on Linux, macOS and Windows for every push and pull request** (GitHub Actions): the server's `npm test` and the mod's `claude plugin validate` and `claude plugin test`. The paid tests never run there.

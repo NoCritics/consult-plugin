@@ -961,7 +961,7 @@ try {
         const marker = path.join(scratch, 'fsmonitor-ran.txt');
         const markerForSh = marker.replace(/\\/g, '/');
         const fsmonitorScript = path.join(scratch, 'fsm.sh').replace(/\\/g, '/');
-        fs.writeFileSync(fsmonitorScript, `#!/bin/sh\necho ran > "${markerForSh}"\nexit 1\n`);
+        fs.writeFileSync(fsmonitorScript, `#!/bin/sh\necho ran > "${markerForSh}"\nexit 1\n`, { mode: 0o755 });
         const fakeRepo = path.join(gitFixtures, 'fake gitdir repo');
         fs.mkdirSync(fakeRepo);
         gitSync(fakeRepo, 'init');
@@ -994,7 +994,7 @@ try {
       const posixPath = (file) => file.replace(/\\/g, '/');
       const writeMarkerScript = (name, markerFile, body = '') => {
         const scriptPath = path.join(scratch, name);
-        fs.writeFileSync(scriptPath, `#!/bin/sh\necho ran > "${posixPath(markerFile)}"\n${body}`);
+        fs.writeFileSync(scriptPath, `#!/bin/sh\necho ran > "${posixPath(markerFile)}"\n${body}`, { mode: 0o755 });
         return posixPath(scriptPath);
       };
 
@@ -1252,7 +1252,8 @@ try {
           truthy('mergeCopy junction: the reason names the link', merged.skipped.every((entry) => /symlink|junction/.test(entry.reason)));
           eq('mergeCopy junction: the file outside the repo is untouched', fs.readFileSync(path.join(outsideFolder, 'secret.txt'), 'utf8'), 'secret\r\n');
           eq('mergeCopy junction: nothing new appeared outside the repo', fs.readdirSync(outsideFolder), ['secret.txt']);
-          fs.rmdirSync(path.join(project, 'linked'));
+          // A Windows junction is removed as a folder, a POSIX symlink as a file.
+          if (process.platform === 'win32') fs.rmdirSync(path.join(project, 'linked')); else fs.unlinkSync(path.join(project, 'linked'));
         }
         await removeCopy(project, { id: 'mc0003', worktree: copy.worktree, branch: copy.branch }, { keepBranch: false });
       }

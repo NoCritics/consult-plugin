@@ -99,8 +99,11 @@ export const DEFAULTS_JSON = JSON.stringify({
   local_slow_floor_ms: 1200000,
 })
 
+// The tests' paths are Windows paths ('C:/proj/...'). On Linux and macOS they are
+// relative, so the engine resolves them under the real working directory before
+// a hook sees them: what stands before the drive letter is dropped.
 function slashes(path: string): string {
-  return path.replace(/\\/g, '/')
+  return path.replace(/\\/g, '/').replace(/^.*\/(?=[A-Za-z]:\/)/, '')
 }
 
 export function world(on: On, options: WorldOptions = {}): World {

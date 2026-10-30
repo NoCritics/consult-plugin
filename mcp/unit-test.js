@@ -731,6 +731,34 @@ eq('codexDefaultLabel: unknown', codexDefaultLabel(undefined, null), '(codex def
   eq('loadSettings: cwd == home reads the global file', s.local_base_url, 'http://10.0.0.5:11434/v1');
   truthy('loadSettings: cwd == home is NOT treated as project scope', !/project/i.test(warned));
 }
+// The same home reached through a link (macOS: /var is /private/var) is still home.
+{
+  const origCwd = process.cwd();
+  const origEnv = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE };
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'consult-linkedhome-'));
+  const linkedHome = `${home}-link`;
+  fs.mkdirSync(path.join(home, '.claude'));
+  fs.writeFileSync(path.join(home, '.claude', 'consult.local.md'), '---\nlocal_base_url: http://10.0.0.6:11434/v1\n---\n');
+  fs.symlinkSync(home, linkedHome, process.platform === 'win32' ? 'junction' : 'dir');
+  const origWrite = process.stderr.write.bind(process.stderr);
+  let warned = '';
+  process.stderr.write = (chunk) => { warned += String(chunk); return true; };
+  let s;
+  try {
+    process.chdir(home);
+    process.env.HOME = linkedHome;
+    process.env.USERPROFILE = linkedHome;
+    s = loadSettings();
+  } finally {
+    process.stderr.write = origWrite;
+    process.chdir(origCwd);
+    for (const [k, v] of Object.entries(origEnv)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+    fs.rmSync(linkedHome, { force: true, recursive: false });
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+  eq('loadSettings: a home reached through a link reads the global file', s.local_base_url, 'http://10.0.0.6:11434/v1');
+  truthy('loadSettings: a home reached through a link is NOT treated as project scope', !/project/i.test(warned));
+}
 
 // ---- v0.9.1: agy_generate_image helpers ----
 {
@@ -2541,6 +2569,25 @@ if (process.platform === 'win32') {
 eq('resolve: isInsideFolder sees a program in the project, not beside it',
   [isInsideFolder('C:\\proj\\bin\\agy.cmd', 'C:\\proj'), isInsideFolder('C:\\proj-tools\\agy.cmd', 'C:\\proj'), isInsideFolder('agy', 'C:\\proj')], [true, false, false]);
 eq('resolve: isInsideFolder exempts a drive root', isInsideFolder('C:\\Program Files\\agy.exe', 'C:\\'), false);
+// where.exe prints a hit's long real path, while the project can be open through a
+// junction or an 8.3 short name (GitHub's Windows runners: C:\Users\RUNNER~1\...).
+if (process.platform === 'win32') {
+  const realProject = fs.mkdtempSync(path.join(os.tmpdir(), 'consult-realproj-'));
+  const linkedProject = `${realProject}-link`;
+  try {
+    fs.writeFileSync(path.join(realProject, 'codex.cmd'), '@echo off');
+    fs.symlinkSync(realProject, linkedProject, 'junction');
+    eq('resolve: a project opened through a junction still refuses its own codex.cmd',
+      [pickWindowsHit([path.join(realProject, 'codex.cmd')], linkedProject), isInsideFolder(path.join(realProject, 'codex.cmd'), linkedProject)], [null, true]);
+    eq('resolve: and a hit spelled through the junction is refused from the real folder',
+      pickWindowsHit([path.join(linkedProject, 'codex.cmd')], realProject), null);
+  } finally {
+    try { fs.rmdirSync(linkedProject); } catch (_) {}
+    fs.rmSync(realProject, { recursive: true, force: true });
+  }
+} else {
+  console.log('PASS-SKIP resolve: a project opened through a junction (Windows only)');
+}
 {
   const { refuseProgramInsideProject } = await import('./lib/delegate-supervisor.js');
   let refusal = '';
