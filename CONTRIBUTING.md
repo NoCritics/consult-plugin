@@ -4,7 +4,7 @@ Thanks for considering a contribution. This is a small plugin with a small surfa
 
 ## Repository layout
 
-See [File layout](./README.md#file-layout) in the README. `mcp/` is both the Claude Code MCP server and the Claude Desktop extension (`mcp/manifest.json`).
+See [File layout](#file-layout) below. `mcp/` is both the Claude Code MCP server and the Claude Desktop extension (`mcp/manifest.json`).
 
 ## Setup
 
@@ -82,6 +82,87 @@ Include:
 - No build step for consult's own code: the source is what runs. The one generated file is `mcp/vendor/mcp-sdk.js` (see *Updating the bundled SDK*).
 - Comments explain WHY, not WHAT. Don't add a comment if the code already reads cleanly.
 - Don't add lint configs / prettier / TypeScript. The plugin is small enough that house style is enforced by reviewers, not tooling.
+
+## Tests
+
+| Command | Run from | Cost | Needs |
+|---|---|---|---|
+| `claude plugin test .` | the plugin folder | free | the band, pane and health line (`tests/`) |
+| `claude plugin validate .` | the plugin folder | free | |
+| `npm test` | `mcp/` | free | nothing: unit tests, the delegate tests (fake workers, a temporary git repository) and an MCP smoke test |
+| `npm run test:local` | `mcp/` | free | a local runner with a model; skips without one, and on llama-swap uses `fast` only |
+| `npm run test:live` | `mcp/` | ~2 LLM calls | codex and agy signed in |
+| `npm run test:chat` | `mcp/` | ~4 LLM calls | codex and agy signed in |
+| `npm run test:chat-end` | `mcp/` | ~2 LLM calls | codex and agy signed in |
+| `npm run test:council` | `mcp/` | ~6 LLM calls | codex, agy and claude |
+| `npm run test:image` | `mcp/` | 1 image, ~1–2 min | agy signed in |
+
+CI (`.github/workflows/test.yml`) runs the free ones on Linux, macOS and Windows for every push and pull request.
+
+`CONSULT_NO_USER_ENV=1` is for tests only: it stops consult reading a key from the Windows user environment, to simulate a missing key. It never makes consult send a key.
+
+## File layout
+
+```
+consult/
+  .claude-plugin/plugin.json
+  commands/                   # slash commands
+  examples/consult.local.md   # every setting, commented out
+  hooks/
+    hooks.json                # the SessionStart check and the band's module
+    scripts/auth-check.js     # SessionStart check
+    scripts/health.js         # the status line's checks
+    scripts/setlocal.js       # the Local models tab's door to local_setup
+    scripts/delegate.js       # the Delegated tab's door to the delegate code
+    register.tsx              # the band, pane and health line: wiring
+    mod/                      # call tracking, settings, history, health, results; delegate.ts wakes Claude
+    ui/                       # band.tsx, pane.tsx, local-tab.tsx, delegated-tab.tsx
+  types/index.d.ts            # the module's $.state contract
+  tests/                      # claude plugin test: the module's tests
+  skills/second-opinion/      # SKILL.md + references/file-handling.md
+  mcp/                        # the MCP server; also the Claude Desktop extension
+    manifest.json             # Claude Desktop extension manifest (MCPB)
+    consult.js                # tool registry + request dispatch
+    lib/
+      codex.js  agy.js  gemini.js  claude.js  local.js   # one wrapper per provider
+      council.js              # generate -> anonymize -> judge -> Borda
+      local-runners.js        # runner types, keys, detection, nicknames, setup writes
+      local-models.js         # Ollama's inventory: facts, nickname proposals, quant swaps
+      local-setup.js          # local_setup and local_unload, shared with the pane
+      delegate.js             # the eight delegate tools
+      delegate-route.js       # worker words, aliases and the default table
+      delegate-store.js       # task folders, state files, the index, per-project settings
+      delegate-workers.js     # codex, agy and pi command lines and output parsers
+      delegate-supervisor.js  # runs one task: time limit, watchdog, stop on close, leftovers
+      delegate-git.js         # copies (worktrees), file-by-file merge, held files, git setup
+      delegate-limits.js      # Codex and agy usage limits
+      delegate-local.js       # local queue and slots
+      delegate-sweep.js       # heartbeat and clean-up of dead tasks
+      pi-provider.js          # the pi extension that points a local task at your runner
+      image.js                # image validation and PNG downscaling
+      spawn-cli.js            # subprocess runner: timeouts, buffer cap, tree-kill
+      resolve-cmd.js          # CLI lookup: PATH, .cmd shims, install locations
+      settings.js             # consult.local.md loader
+      defaults.json           # time-limit defaults shared with the band
+      util.js                 # validators, PII scrubbing, INCOMPLETE errors
+    vendor/                   # the MCP SDK, bundled (npm run build:vendor), and its licenses
+    build-vendor.js           # builds vendor/ from node_modules
+    delegate-run.js           # entry of a task's detached supervisor
+    *-test.js, test-helpers.js
+```
+
+## Ideas
+
+Not scheduled.
+
+- A response-schema argument (agy has `--json-schema`, codex `--output-schema`).
+- Grounded search with citations.
+- JPEG and WebP downscaling for local models (needs an image library).
+- Images in chats; local chats.
+- Answers side by side without judging; a one-line reason per council judge.
+- Progress notifications for long calls.
+- Fencing for the pi and agy workers.
+- Background tasks in Claude Desktop.
 
 ## License
 

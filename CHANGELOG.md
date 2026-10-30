@@ -4,6 +4,8 @@ All notable changes to this plugin are documented here. Format loosely follows [
 
 ## [Unreleased]
 
+## [0.15.2] - 2026-10-30
+
 ### Security
 
 - **A project opened through an 8.3 short path or a junction still can't run its own `codex.cmd` or `agy.cmd`.** On Windows, `where` reports a CLI by its long real path, so a project whose folder was spelled `C:\Users\RUNNER~1\...`, or reached through a junction, didn't match and its own `codex.cmd` could be picked. Both paths are now also compared by their real long path.
@@ -18,6 +20,11 @@ All notable changes to this plugin are documented here. Format loosely follows [
 ### Added
 
 - **Tests run on Linux, macOS and Windows for every push and pull request** (GitHub Actions): the server's `npm test` and the mod's `claude plugin validate` and `claude plugin test`. The paid tests never run there.
+
+### Changed
+
+- **The README is a quarter of its old length.** The tests, file layout and ideas moved to CONTRIBUTING.md, and `examples/consult.local.md` is now the full settings reference.
+- `LICENSE` names NoCritics.
 
 ## [0.15.1] - 2026-10-30
 

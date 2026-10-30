@@ -6,7 +6,7 @@
 # `<project>/.claude/consult.local.md` (project). The first file found is used,
 # the project's before the global one; they don't merge.
 # Only this frontmatter is read. Invalid values are dropped and the default
-# is used. The README's Settings table lists every key with its default.
+# is used. This file lists every key with its default.
 
 # ----- Codex (OpenAI) -----
 # Omit both to use codex's own defaults (`model`, `model_reasoning_effort` in
@@ -28,7 +28,7 @@
 # codex_image_dir: C:\Users\me\Pictures\ai  # codex_generate_image output; default: <project>/consult-images, else ~/Pictures/consult-images
 # codex_image_timeout_ms: 300000        # codex_generate_image takes ~1 min per image; +2 min per extra image
 # codex_image_aspect_ratio: 1:1         # 1:1 2:3 3:2 3:4 4:3 9:16 16:9, or auto (the model picks)
-# File writes are governed by agy's own settings, not here: see the README caveat.
+# File writes are governed by agy's own settings, not here: see the README, "Good to know".
 
 # ----- Gemini CLI (legacy; needs a paid GEMINI_API_KEY) -----
 # gemini_model: gemini-3.1-pro-preview  # leave unset: preview names rotate
