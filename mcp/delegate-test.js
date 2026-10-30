@@ -2149,14 +2149,15 @@ try {
 
       scenarios.push({ name: 'watchdog waits for a command', run: async () => {
         const task = newTask();
-        launchWith(task, { FAKE_SCENARIO: 'busy-step', FAKE_RUN_MS: '3500', CONSULT_DELEGATE_WATCHDOG_MS: '1000' });
+        // 3 s, not 1: a loaded Windows runner can take over a second to start the worker, and the watchdog counts from the spawn.
+        launchWith(task, { FAKE_SCENARIO: 'busy-step', FAKE_RUN_MS: '7000', CONSULT_DELEGATE_WATCHDOG_MS: '3000' });
         const finished = await waitForTask(task.id, hasEnded);
         eq('supervisor watchdog: silence inside one started command is not a hang', [finished.state, finished.stop_reason], ['done', null]);
       } });
 
       scenarios.push({ name: 'time limit covers a command', run: async () => {
-        const task = newTask({ time_limit_ms: 2500 });
-        launchWith(task, { FAKE_SCENARIO: 'busy-step', FAKE_NEVER_ENDS: '1', CONSULT_DELEGATE_WATCHDOG_MS: '1000' });
+        const task = newTask({ time_limit_ms: 7000 });
+        launchWith(task, { FAKE_SCENARIO: 'busy-step', FAKE_NEVER_ENDS: '1', CONSULT_DELEGATE_WATCHDOG_MS: '3000' });
         const stopped = await waitForTask(task.id, hasEnded);
         eq('supervisor watchdog: a worker hung inside a command still meets the time limit', [stopped.state, stopped.stop_reason], ['stopped', 'time-limit']);
       } });
