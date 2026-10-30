@@ -26,7 +26,7 @@ claude plugin validate .
 
 To try them live, start Claude Code with `claude --plugin-dir <your clone>`: that copy overrides the installed consult for the session.
 
-The `live-test.js`, `chat-test.js`, `chat-end-test.js`, `council-test.js` and `image-test.js` scripts call the real CLIs and spend tokens, so run them deliberately (codex and agy must be signed in). There is no CI; `npm test` is the gate before every release.
+The `live-test.js`, `chat-test.js`, `chat-end-test.js`, `council-test.js` and `image-test.js` scripts call the real CLIs and spend tokens, so run them deliberately (codex and agy must be signed in). CI (`.github/workflows/test.yml`) runs `npm test`, `claude plugin validate .` and `claude plugin test .` on Linux, macOS and Windows for every push and pull request; the paid tests never run there.
 
 ## Design constraints (please read before editing)
 

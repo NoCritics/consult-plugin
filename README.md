@@ -337,6 +337,8 @@ The server, from `mcp/`, after `npm install` (it installs the SDK and esbuild, w
 
 `npm test` includes `mcp/delegate-test.js`: the delegate tools, supervisor, copies and merges, usage limits and the local queue, against fake workers and a temporary git repository (it never starts a real Codex, agy or pi).
 
+Every push and pull request runs `npm test` and the mod's tests on Linux, macOS and Windows (`.github/workflows/test.yml`). The paid tests never run there.
+
 `npm run test:local` on llama-swap uses `fast` only, and skips when another model is loaded so it never swaps out one you are using.
 
 `CONSULT_NO_USER_ENV=1` is **for tests only**: it stops consult reading a key from the Windows user environment, to simulate a missing key. It can only turn that read off; it never makes consult send a key. Don't set it in normal use.

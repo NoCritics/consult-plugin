@@ -4,6 +4,10 @@ All notable changes to this plugin are documented here. Format loosely follows [
 
 ## [Unreleased]
 
+### Added
+
+- **Tests run on Linux, macOS and Windows for every push and pull request** (GitHub Actions): the server's `npm test` and the mod's `claude plugin validate` and `claude plugin test`. The paid tests never run there.
+
 ## [0.15.1] - 2026-10-30
 
 ### Security
