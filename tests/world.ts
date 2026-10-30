@@ -8,6 +8,16 @@ import type { RanResult } from './fixtures/results'
 // files and environment its settings come from, and the UI and tools it
 // calls. Each call it answers is recorded in `seen`.
 
+// The engine checks an Image's file against the host's own path rules, so the
+// tests' Windows image paths can be drawn only on a Windows host. The host shows
+// in the real path the mod read its defaults from; with no such read yet, Windows.
+export function onWindowsHost(w: World): boolean {
+  for (const path of w.seen.reads) {
+    if (path.endsWith('mcp/lib/defaults.json')) return /^[A-Za-z]:\//.test(path)
+  }
+  return true
+}
+
 export const PLUGIN = 'consult'
 export const CONSULT = 'mcp__plugin_consult_consult__'
 

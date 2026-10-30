@@ -3,7 +3,7 @@ import type { Engine } from 'claude-code/testing'
 
 import type { HistoryEntry } from '../types'
 import * as fixtures from './fixtures/results'
-import { CONSULT, PLUGIN, answerConsult, world } from './world'
+import { CONSULT, PLUGIN, answerConsult, onWindowsHost, world } from './world'
 import type { World } from './world'
 
 const PANE = {
@@ -153,6 +153,7 @@ describe('pane', () => {
     const w = world(on)
     answerConsult(on, w.clock, fixtures.CODEX_IMAGE_ANSWER, { afterMs: 1000 })
     await oneCall($, w, 'codex_generate_image', 'img-2')
+    if (!onWindowsHost(w)) return // Windows image paths; see onWindowsHost
     const ui = await $.ui.mount(PANE)
     await ui.press({ key: 'entry:img-2' })
     expect((await ui.find({ key: 'entry:img-2' }))?.props.label).toContain('codex image')
@@ -164,6 +165,7 @@ describe('pane', () => {
     const w = world(on)
     answerConsult(on, w.clock, fixtures.IMAGE_ANSWER, { afterMs: 1000 })
     await oneCall($, w, 'agy_generate_image', 'img-1')
+    if (!onWindowsHost(w)) return // Windows image paths; see onWindowsHost
     const ui = await $.ui.mount(PANE)
     await ui.press({ key: 'entry:img-1' })
     const link = await ui.find({ type: 'Link' })

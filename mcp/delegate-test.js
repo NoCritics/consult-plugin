@@ -2902,6 +2902,8 @@ try {
               return { time_limit_ms: BACKSTOP_MS };
             }
           },
+          // Finding the copy's folder takes long; on Linux git answers in a few ms, so the wait is made here.
+          copyWorkFolder: async (copyTask) => { await sleep(300); return supervisorModule.copyWorkFolder(copyTask); },
           pollMs: 20, now: () => Date.now() + skewMs,
           io: {
             updateTask: (id, changes) => {
@@ -4380,7 +4382,10 @@ try {
           eq('delegate: one change is said in the singular', [singleStart.value.uncommitted?.count, singleStart.value.uncommitted?.note], [1, "The copy starts from the project as it is now: its 1 uncommitted change is in it, ignored files are not."]);
 
           eq('uncommittedCount: counts the dirty project', await gitNamespace.uncommittedCount(dirty), 2);
-          eq('uncommittedCount: a call that outlives its time limit is no count', await gitNamespace.uncommittedCount(dirty, { timeoutMs: 1 }), 0);
+          // On Linux git reads a two-file repository within 1 ms; two thousand untracked files it does not.
+          const crowded = makeRepo('git repo crowded', { 'readme.txt': 'hello\n' });
+          for (let index = 0; index < 2000; index++) fs.writeFileSync(path.join(crowded, `untracked ${index}.txt`), 'x\n');
+          eq('uncommittedCount: a call that outlives its time limit is no count', await gitNamespace.uncommittedCount(crowded, { timeoutMs: 1 }), 0);
           const hereStart = await call('delegate', briefArgs({ worker: 'codex', location: 'here' }), contextFor(dirty));
           eq('delegate: a task working here has no note (no copy is made)', [hereStart.value.location, 'uncommitted' in hereStart.value], ['here', false]);
           const description = toolsModule.DELEGATE_TOOLS[0].description;

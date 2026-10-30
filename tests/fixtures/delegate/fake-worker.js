@@ -109,7 +109,7 @@ if (scenario === 'ok') {
   hangForever();
 } else if (scenario === 'lingering') {
   // A complete codex stream and exit 0, but a grandchild is left holding stdout open.
-  const grandchild = spawn(process.execPath, ['-e', `setInterval(() => {}, 1000) // ${GRANDCHILD_MARKER}`], { stdio: ['ignore', 'inherit', 'inherit'], detached: true }); // detached: on Windows a child otherwise dies with its parent
+  const grandchild = spawn(process.execPath, ['-e', `setInterval(() => {}, 1000) // ${GRANDCHILD_MARKER}`], { stdio: ['ignore', 'inherit', 'inherit'], detached: process.platform === 'win32' }); // detached on Windows only: there a child otherwise dies with its parent; on POSIX it would leave the worker's process group, as a real CLI's child does not
   grandchild.unref();
   fs.writeFileSync(process.env.FAKE_GRANDCHILD_FILE, String(grandchild.pid));
   emit({ type: 'thread.started', thread_id: threadId });

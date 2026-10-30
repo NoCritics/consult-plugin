@@ -763,7 +763,7 @@ function stopPreRunBeat(context) {
 // task `running` when it lets it through; the signal aborts when the task is
 // cancelled or stopped while it waits. The
 // other options are for tests: `settings`, `inventoryFor(runner, key,
-// settings)`, `watchdogMs`, `pollMs`, `killGiveUpMs`, a clock `now`, and `io`
+// settings)`, `copyWorkFolder(task)`, `watchdogMs`, `pollMs`, `killGiveUpMs`, a clock `now`, and `io`
 // (replacements for `updateTask`, `appendFile`, `killTree` and `rolloutLimits`
 // that inject faults). A task with a `followup` resumes the worker's session
 // with that text. Never throws.
@@ -921,7 +921,7 @@ async function superviseTask(context, options) {
     }
   }
 
-  const workFolder = task.location === 'copy' ? await copyWorkFolder(task) : null;
+  const workFolder = task.location === 'copy' ? await (options.copyWorkFolder ?? copyWorkFolder)(task) : null;
   if (workFolder !== null) fs.mkdirSync(workFolder, { recursive: true });
   // A follow-up continues the worker's session with its text.
   const isFollowUp = typeof task.followup === 'string' && task.followup !== '';
