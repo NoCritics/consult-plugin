@@ -7,7 +7,7 @@ import { proposeNicknames, describeFact, ollamaArch, NICKNAME_ROLES, NICKNAME_SP
 import { measuredSpeed } from './local-speeds.js';
 import {
   PROBE_URLS, isValidEnvName, runnerKey, runnerInventory, otherRunners, probeRunners, proposeSwapNicknames, saveRunnerSettings,
-  unloadRunner, runnersHolding, mayReadSuppliedKey, isLmstudioInventory
+  unloadRunner, runnersHolding, mayReadSuppliedKey, sameUrl, isLmstudioInventory
 } from './local-runners.js';
 import { loadSettings, runnerSettings, runnerFor, configuredRunners } from './settings.js';
 import { guardUnload } from './delegate-local.js';
@@ -93,10 +93,15 @@ export async function setupLocal(args, settings, { home = os.homedir(), reloadSe
   };
   if (!type) return { ...overview, runner: null, proposal: null, note: 'No runner is in use: pick one of the runners found (or give its address) and call again with `runner`.' };
 
-  let runner = runnerSettings(settings, type);
+  const savedRunner = runnerSettings(settings, type);
+  let runner = savedRunner;
   const known = configured.some(one => one.type === type);
   const discovered = { url: null, key_env: null };
   if (args.url !== undefined) runner = { ...runner, url: args.url };
+  // A saved key belongs to the address it was saved for: a new address gets it
+  // only when this call names the variable again (also in what is written).
+  const movesToNewUrl = args.url !== undefined && args.key_env === undefined && !sameUrl(args.url, savedRunner.url);
+  if (movesToNewUrl) runner = { ...runner, key_env: null };
   if (args.key_env !== undefined) runner = { ...runner, key_env: args.key_env };
   if (args.start !== undefined) runner = { ...runner, start: args.start };
   if (!known || runner.url === null) {
@@ -106,7 +111,8 @@ export async function setupLocal(args, settings, { home = os.homedir(), reloadSe
         if (runner.url !== found.url) discovered.url = found.url;
         runner = { ...runner, url: found.url };
       }
-      if (!runner.key_env && found.key_env) {
+      // Not for a new address: a key variable found on the standard port stays there.
+      if (!runner.key_env && found.key_env && sameUrl(runner.url, found.url)) {
         discovered.key_env = found.key_env;
         runner = { ...runner, key_env: found.key_env };
       }
@@ -120,7 +126,7 @@ export async function setupLocal(args, settings, { home = os.homedir(), reloadSe
   // runner that asked for a key at a standard or configured address: a tool
   // call can't send an arbitrary variable to an arbitrary local port.
   let keyRunner = runner;
-  const suppliedKeyEnv = args.key_env !== undefined && args.key_env !== runnerSettings(settings, type).key_env;
+  const suppliedKeyEnv = args.key_env !== undefined && args.key_env !== savedRunner.key_env;
   if (suppliedKeyEnv && !mayReadSuppliedKey({ url: runner.url, probe, configured })) keyRunner = { ...runner, key_env: null };
   const { api_key } = await runnerKey(keyRunner);
   const inventory = await runnerInventory(runner, api_key, settings);
@@ -131,7 +137,9 @@ export async function setupLocal(args, settings, { home = os.homedir(), reloadSe
   const writing = args.save !== undefined || args.use !== undefined || args.url !== undefined || args.key_env !== undefined || args.start !== undefined;
   let written = null;
   if (writing) {
-    written = saveRunnerSettings({ changes: setupChanges(type, args, inventory, discovered), home, preview: args.preview === true });
+    const changes = setupChanges(type, args, inventory, discovered);
+    if (movesToNewUrl) changes[`${type}.key_env`] = null;
+    written = saveRunnerSettings({ changes, home, preview: args.preview === true });
   }
   // After a write the file changed: read it again so the proposal shows the new state.
   const nicknames = written && args.preview !== true ? runnerSettings(reloadSettings(), type).nicknames : runner.nicknames;

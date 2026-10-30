@@ -4,17 +4,42 @@ All notable changes to this plugin are documented here. Format loosely follows [
 
 ## [Unreleased]
 
+## [0.15.1] - 2026-10-30
+
+### Security
+
+- **Opening a repository that contains its own `codex.cmd` or `agy.cmd` no longer runs it.** On Windows consult looked CLIs up with a search that tried the current folder (your project) before PATH, so a repository's own `codex.cmd` or `agy.cmd` could run at session start and on every call. It now looks CLIs up on PATH and in their install folders only, and ignores any hit inside the project. A CLI it finds only inside the project is reported as such ("found only inside the project folder"), not as not installed. consult's CLIs and their children no longer look up bare program names (`where`, `node`) in the project folder on Windows, and it works the same when Claude Code starts in your home folder or a drive root.
+- **CLI paths are always quoted** (so `&`, `(`, `)`, `^`, `|`, `<`, `>`, `!`, `,`, `;` and `=` in a folder name cannot act as commands) when consult starts a CLI, so a folder like `C:\Tools\A&B` can no longer run part of its own name as a command. A path containing a quote or `%` is refused with a clear message.
+- **The session-start check never contacts a local-model runner that is off this machine.** A project's `.claude/consult.local.md` could name a remote `local_base_url`, and the check would send it a request at every session start. It now skips any address that is not on this machine, as the health check already did.
+- **`local_setup` with a new address sends the saved key only when you name its variable again.** Giving a new `url` without `key_env` used to send the key saved for the old address to the new port, even in a preview. The new address now gets no key, and the write removes the old `key_env` line.
+- **After a save, the Local models tab tells Claude only a fixed sentence.** It used to repeat the runner's model names in a message Claude reads as coming from you, so a model named like an instruction could steer it. The message now says only that local model settings changed and to call `local_status`.
+
+### Fixed
+
+- **On macOS and Linux a timed-out or cancelled call now stops the CLI's own child processes too.** Before, only the CLI itself was killed, so a wrapper's child could keep running (and spending tokens) and hold the call open past its timeout.
+- **`agy_generate_image` keeps agy's original images when copying them to the output folder fails** (disk full, permissions). Before, agy's conversation was deleted anyway and the originals were lost; now they stay, and the error names the folder that holds them.
+- **A delegated agy task whose answer arrived is no longer reported as failed when agy's connection drops afterwards.** agy can finish its answer and then end with an error (such as a stream idle timeout); the task now ends done (or held) with that error as a warning, and `delegate_result` returns the answer. An answer cut off mid-stream still fails, and a usage-limit error still pauses the task.
+- **At session start, a `codex` or `agy` found only inside the project is reported as such** ("found only inside the project folder") instead of "not found - install it or fix PATH". A delegated task whose worker program lies inside its project or its copy now fails with the same message instead of running it.
+- **On macOS and Linux, closing the terminal or stopping the host stops the CLIs a call is waiting on.** Since each CLI got its own process group, they no longer received the terminal's hang-up; the server now stops them when it exits, is terminated or interrupted, or its connection closes.
+- **A CLI path that cmd.exe cannot take safely is reported as a failed start** (`spawn_error`) rather than a plain error.
+- **A delegated agy task's warning from the end of a run is scrubbed of secrets and shortened** like its other messages.
+- **A follow-up that fails no longer shows the previous run's answer as its own.** `delegate_result` returns the final message only when the latest run wrote one, and a new run clears the old one when it starts.
+- **The Local models tab's Save writes only what the preview showed.** When the runner could not be reached, typing its address made the pickers appear but the preview had been built without them, so Save could write nicknames the diff never listed. The preview now runs again with the pickers filled, and Save waits for it.
+
+### Changed
+
+- **The README, slash commands and skill match what the code does.** Desktop gets 17 tools, not 16; `/consult:codex` passes images and says Codex is read-only by default (`codex_sandbox` can change that); `/consult:chat` passes `--timeout`; `/consult:delegate` may list and cancel tasks without asking; images are attached with `images` rather than refused as binary files; and local models are described as running on this machine while Claude still writes the prompt and reads the answer.
+- **Installs from GitHub need no `npm install`.** The MCP SDK, the server's only npm dependency, is bundled into `mcp/vendor/mcp-sdk.js` by `npm run build:vendor` (esbuild 0.28.2), with the licences of the bundled packages in `mcp/vendor/THIRD_PARTY_LICENSES.md`. The SDK and esbuild are dev dependencies now, needed only for the tests and the build; a unit test fails if the bundle wasn't rebuilt from the locked SDK or imports anything but Node built-ins. The `.mcpb` no longer packs `node_modules`. `npm audit fix` moved zod to 4.6.7 and fast-uri to 3.1.9 first, so the bundle carries no known advisories.
+- **Install from the `nocritics` marketplace:** `/plugin marketplace add NoCritics/consult-plugin`, then `/plugin install consult@nocritics`.
+
+## [0.15.0] - 2026-10-29
+
 ### Added
 
 - **`codex_generate_image`: GPT images through Codex.** Makes images with OpenAI's image generation under the user's ChatGPT plan (no API key) and saves them as PNG. consult collects them from Codex's generated-images folder, copies them to the output folder (`output_dir`, else the new `codex_image_dir` setting, else `consult-images/` in the project, else `~/Pictures/consult-images`), removes its own leftovers from Codex's folder, and returns path, type, size and dimensions with Codex's reply re-pointed at the copies.
   - Options: `aspect_ratio` (default from `codex_image_aspect_ratio`, else `1:1`; followed only approximately), `transparent_background` (real alpha), `count` 1-4, `exact_prompt`, up to 5 reference `images`.
   - Timeout: `codex_image_timeout_ms`, default 300000, plus 2 minutes per extra image, up to 30; Codex's 10-minute floor does not apply. `timeout_s` overrides.
   - The band shows and times it like `agy_generate_image`. agy stays the default image tool; Claude picks this one when you name GPT, OpenAI, Codex or ChatGPT, or need a transparent background. It spends Codex usage quota.
-
-### Changed
-
-- **Installs from GitHub need no `npm install`.** The MCP SDK, the server's only npm dependency, is bundled into `mcp/vendor/mcp-sdk.js` by `npm run build:vendor` (esbuild 0.28.2), with the licences of the bundled packages in `mcp/vendor/THIRD_PARTY_LICENSES.md`. The SDK and esbuild are dev dependencies now, needed only for the tests and the build; a unit test fails if the bundle wasn't rebuilt from the locked SDK or imports anything but Node built-ins. The `.mcpb` no longer packs `node_modules`. `npm audit fix` moved zod to 4.6.7 and fast-uri to 3.1.9 first, so the bundle carries no known advisories.
-- **Install from the `nocritics` marketplace:** `/plugin marketplace add NoCritics/consult-plugin`, then `/plugin install consult@nocritics`.
 
 ### Fixed
 

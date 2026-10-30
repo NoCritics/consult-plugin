@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { randomBytes } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 
 import { scrubPii, readHead, walkAndDelete } from './lib/util.js';
 import { loadSettings, parseFrontmatter, sanitize, frontmatterWarnings, runnerSettings, localConfigured, KNOWN_KEYS } from './lib/settings.js';
@@ -18,12 +19,12 @@ import { classifyError } from './lib/gemini.js';
 import { validateAgyEffort, isPartialOutput, describeDeniedActions, parseAgyErrorLine, agyWritePosture, AGY_ANSWER_ONLY_PREAMBLE, AGY_EFFORTS } from './lib/agy.js';
 import { validateReasoningEffort, REASONING_EFFORTS } from './lib/util.js';
 import { buildClaudeArgs, CLAUDE_COMMON_ARGS } from './lib/claude.js';
-import { shellSafeArgs, runCli } from './lib/spawn-cli.js';
+import { shellSafeArgs, runCli, cliSpawnOptions, killTree, killAllCliChildren, liveCliChildCount, spawnableCmdOrError } from './lib/spawn-cli.js';
 import { callContext } from './lib/util.js';
-import { SPAWN_OPTS, EMPTY_ARG, ensureCmd } from './lib/resolve-cmd.js';
+import { SPAWN_OPTS, EMPTY_ARG, ensureCmd, isInsideFolder, pickWindowsHit, spawnableCmd, whereCommand, refusedWindowsHits, missingMessage } from './lib/resolve-cmd.js';
 import { codexTimeoutMs, CODEX_TIMEOUT_FLOOR_MS, hookArgs, codexRunHooks, parseCodexJsonl, codexTimeoutError, configuredCodex, rolloutTurn, codexDefaultLabel } from './lib/codex.js';
 import { incompleteError, PARTIAL_CAP_CHARS, timeoutMsFromSeconds, timeoutRetryHint } from './lib/util.js';
-import { parseAgyResult, agyFailure, conversationIdFrom, agyImageOutputDir, findGeneratedImages, copyImagesTo, retargetPaths, agySubagentIds, finishImageCall, hostAppDirs, AGY_IMAGE_PREAMBLE } from './lib/agy.js';
+import { parseAgyResult, agyFailure, conversationIdFrom, agyImageOutputDir, findGeneratedImages, copyImagesTo, retargetPaths, agySubagentIds, finishImageCall, saveConversationImages, finishConversation, hostAppDirs, AGY_IMAGE_PREAMBLE } from './lib/agy.js';
 import { imageOptions, imageSettingsBlock, agyImageTimeoutMs, agyGenerateImage, AGY_IMAGE_ASPECT_RATIOS, AGY_IMAGE_TIERS } from './lib/agy.js';
 import { DEFAULTS } from './lib/settings.js';
 import { CODEX_IMAGE_ASPECT_RATIOS, codexImageOptions, shapeSentence, codexImageBrief, codexImageArgs, codexImageTimeoutMs, codexGenerateImage } from './lib/codex-image.js';
@@ -603,6 +604,77 @@ eq('codexRunHooks: missing settings -> off', codexRunHooks(undefined, undefined)
   eq('runCli: already-cancelled call does not start', preKind, 'cancelled');
 }
 
+// --- shutdown: the server stops the CLIs a call is still waiting on ---
+{
+  const pending = runCli({ cmd: 'node', args: ['-e', 'setInterval(Date.now,1000)'], timeout_ms: 30000, label: 'idle node' });
+  await new Promise((resolve) => setTimeout(resolve, 400));
+  eq('killAllCliChildren: a running call is tracked', liveCliChildCount(), 1);
+  const seen = [];
+  killAllCliChildren((child, options) => { seen.push([typeof child.pid, options]); });
+  eq('killAllCliChildren: kills each live child as a process group', seen, [['number', { group: true, evenIfExited: true }]]);
+  killAllCliChildren();
+  let shutdownKind = null;
+  try { await pending; } catch (e) { shutdownKind = e.kind; }
+  truthy('killAllCliChildren: the call ends', shutdownKind !== null);
+  eq('killAllCliChildren: nothing is tracked once the call has ended', liveCliChildCount(), 0);
+}
+if (SPAWN_OPTS.shell) {
+  let refusal = null;
+  try { spawnableCmdOrError('C:\\Tools\\%PATH%\\codex.cmd', 'Codex'); } catch (e) { refusal = e; }
+  eq('runCli: a program path cmd.exe cannot take is a spawn_error', [refusal?.kind, /Codex CLI failed to start/.test(refusal?.message ?? '')], ['spawn_error', true]);
+} else {
+  console.log('PASS-SKIP runCli: unsafe program path (Windows only)');
+}
+
+// --- POSIX: a timeout or Cancel stops the CLI's own children too (process groups) ---
+eq('runCli: CLIs get their own process group on linux', cliSpawnOptions('linux').detached, true);
+eq('runCli: CLIs get their own process group on darwin', cliSpawnOptions('darwin').detached, true);
+truthy('runCli: Windows CLIs are not detached', cliSpawnOptions('win32').detached !== true);
+{
+  // The delegate supervisor calls killTree(child, { group: true }) after every run: for an exited worker it must do nothing.
+  const realKill = process.kill;
+  let killCalls = 0;
+  process.kill = () => { killCalls++; };
+  try {
+    killTree({ pid: 424242, exitCode: 0, kill: () => { killCalls++; } }, { group: true });
+  } finally { process.kill = realKill; }
+  eq('killTree: group mode does nothing for an exited child', killCalls, 0);
+}
+if (process.platform === 'win32') {
+  console.log('PASS-SKIP runCli: a timeout ends a child that holds stdout (POSIX only)');
+} else {
+  const started = Date.now();
+  let timeoutError = null;
+  let groupExistedBeforeTimeout = false;
+  // The shell prints its pid (it leads the group), then waits on a background sleep that holds stdout.
+  const pending = runCli({ cmd: 'sh', args: ['-c', 'echo $$; sleep 30 & wait'], timeout_ms: 1500, label: 'sleeper' });
+  let pgrepMissing = false;
+  // Poll for the shell (up to ~1s, under the 1500ms timeout); pgrep exits 1 while nothing matches yet.
+  for (let attempt = 0; attempt < 20 && !groupExistedBeforeTimeout && !pgrepMissing; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    let pgrepOutput = '';
+    try { pgrepOutput = execFileSync('pgrep', ['-f', 'sleep 30 & wait']).toString(); } catch (e) { if (e.code === 'ENOENT') pgrepMissing = true; }
+    for (const line of pgrepOutput.split('\n')) {
+      const candidate = Number.parseInt(line, 10);
+      if (!Number.isInteger(candidate)) continue;
+      try { process.kill(-candidate, 0); groupExistedBeforeTimeout = true; } catch (_) { /* not a group leader */ }
+    }
+  }
+  try { await pending; } catch (e) { timeoutError = e; }
+  eq('runCli: a timeout on a child that holds stdout reports timeout', timeoutError?.kind, 'timeout');
+  truthy('runCli: the timeout settles within 3s', Date.now() - started < 3000);
+  if (pgrepMissing) console.log('PASS-SKIP runCli: the CLI led its own process group before the timeout (pgrep not installed)');
+  else truthy('runCli: the CLI led its own process group before the timeout', groupExistedBeforeTimeout);
+  const leaderPid = Number.parseInt(String(timeoutError?.stdout).trim(), 10);
+  // The killed sleep may linger briefly as a zombie that still counts for the group.
+  let groupGone = false;
+  for (let attempt = 0; attempt < 20 && !groupGone; attempt++) {
+    try { process.kill(-leaderPid, 0); } catch (_) { groupGone = true; }
+    if (!groupGone) await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  truthy('runCli: the whole process group is gone after a timeout', Number.isInteger(leaderPid) && groupGone);
+}
+
 // --- codex model and effort in results ---
 eq('configuredCodex: top-level keys', configuredCodex('model = "gpt-6-astra"\nmodel_reasoning_effort = "xhigh"\n[projects.\'C:\\x\']\ntrust_level = "trusted"\n'), { model: 'gpt-6-astra', reasoning_effort: 'xhigh' });
 eq('configuredCodex: keys inside another table are not defaults', configuredCodex('[tui]\nmodel = "nope"\nmodel_reasoning_effort = "low"\n'), { model: null, reasoning_effort: null });
@@ -722,6 +794,37 @@ eq('codexDefaultLabel: unknown', codexDefaultLabel(undefined, null), '(codex def
   } finally {
     fs.rmSync(brain, { recursive: true, force: true });
     fs.rmSync(out, { recursive: true, force: true });
+  }
+  {
+    // agy image: a failed copy keeps the conversation and names where the originals are
+    const keptBrain = fs.mkdtempSync(path.join(os.tmpdir(), 'consult-keptbrain-'));
+    const blocker = path.join(keptBrain, 'not-a-folder');
+    fs.writeFileSync(path.join(keptBrain, 'cat_1.png'), png(64, 64, 4));
+    fs.writeFileSync(blocker, 'a file where the output folder should be');
+    try {
+      const failed = saveConversationImages({ brainDir: keptBrain, referenceHashes: new Set(), outDir: path.join(blocker, 'out') });
+      truthy('saveConversationImages: a failed copy records the error and asks to keep the originals', failed.copyError && failed.keepOriginals === true && failed.copied.length === 0);
+      let message = '';
+      try { finishImageCall({ ...failed, outDir: '/out', parsed: { response: 'ok' } }); } catch (e) { message = e.message; }
+      truthy('finishImageCall: a failed copy names the folder that still holds the originals', message.includes('The originals are still in ' + keptBrain));
+      const good = saveConversationImages({ brainDir: keptBrain, referenceHashes: new Set(), outDir: path.join(keptBrain, 'fine') });
+      truthy('saveConversationImages: a good copy lets the conversation be discarded', !good.copyError && good.keepOriginals === false && good.copied.length === 1);
+    } finally {
+      fs.rmSync(keptBrain, { recursive: true, force: true });
+    }
+  }
+  {
+    const envelope = JSON.stringify({ conversation_id: '13047bc5-43bb-43e7-a77e-45e2191bba28', status: 'SUCCESS' });
+    const discardsFor = async (options) => {
+      let discards = 0;
+      await finishConversation({ stdout: envelope, discardConversation: true, discard: async () => { discards++; }, ...options });
+      return discards;
+    };
+    eq('finishConversation: beforeDiscard returning true keeps the conversation', await discardsFor({ beforeDiscard: async () => true }), 0);
+    eq('finishConversation: beforeDiscard returning false discards', await discardsFor({ beforeDiscard: async () => false }), 1);
+    eq('finishConversation: beforeDiscard returning nothing discards', await discardsFor({ beforeDiscard: async () => undefined }), 1);
+    eq('finishConversation: no beforeDiscard discards', await discardsFor({}), 1);
+    eq('finishConversation: discard not requested -> never discards', await discardsFor({ discardConversation: false }), 0);
   }
   truthy('AGY_IMAGE_PREAMBLE asks for the image tool and no other files', /image generation tool/.test(AGY_IMAGE_PREAMBLE) && /Do not create, modify or delete any other files/.test(AGY_IMAGE_PREAMBLE));
   {
@@ -1590,11 +1693,58 @@ const llamaSwapFixture = (name) => JSON.parse(fs.readFileSync(new URL(`../tests/
     const hook = fileURLToPath(new URL('../hooks/scripts/auth-check.js', import.meta.url));
     const ran = spawnSync(process.execPath, [hook], { input: '{}', cwd: hookHome, encoding: 'utf8', timeout: 60000, env: { ...process.env, HOME: hookHome, USERPROFILE: hookHome } });
     truthy('review 1: auth-check.js runs without a syntax error', ran.status === 0 && !/SyntaxError/.test(ran.stderr));
+    // The guard resolves real paths: a hook path spelled with another drive-letter case still runs.
+    if (process.platform === 'win32') {
+      fs.mkdirSync(path.join(hookHome, '.claude'), { recursive: true });
+      fs.writeFileSync(path.join(hookHome, '.claude', 'consult.local.md'), '---\nnot_a_setting: 1\n---\n');
+      const flipped = hook[0] === hook[0].toLowerCase() ? hook[0].toUpperCase() + hook.slice(1) : hook[0].toLowerCase() + hook.slice(1);
+      const ranFlipped = spawnSync(process.execPath, [flipped], { input: '{}', cwd: hookHome, encoding: 'utf8', timeout: 60000, env: { ...process.env, HOME: hookHome, USERPROFILE: hookHome } });
+      truthy('review 1: auth-check.js runs through a path with another drive-letter case', ranFlipped.status === 0 && /\[consult\] settings:/.test(ranFlipped.stderr));
+    } else {
+      truthy('review 1: auth-check.js runs through a path with another drive-letter case', true);
+    }
     const health = fileURLToPath(new URL('../hooks/scripts/health.js', import.meta.url));
     const checked = spawnSync(process.execPath, [health, hookHome], { cwd: os.tmpdir(), encoding: 'utf8', timeout: 30000, env: { ...process.env, HOME: hookHome, USERPROFILE: hookHome } });
     truthy('review 1: health.js runs too', checked.status === 0 && !/SyntaxError/.test(checked.stderr));
   } finally {
     fs.rmSync(hookHome, { recursive: true, force: true });
+  }
+
+  // The hook reports a CLI found only inside the project as such, not as "not installed".
+  const { missingCliWarning } = await import('../hooks/scripts/auth-check.js');
+  truthy('auth-check: a project-only hit is reported as such',
+    missingCliWarning('codex', { found: false, refused: 'C:\\proj\\codex.cmd' }, 'FALLBACK').includes('only inside the project folder (C:\\proj\\codex.cmd)'));
+  eq('auth-check: a CLI that is simply missing keeps the install wording', missingCliWarning('agy', { found: false, refused: null }, 'FALLBACK'), 'FALLBACK');
+  if (process.platform === 'win32') {
+    const projectFolder = fs.mkdtempSync(path.join(os.tmpdir(), 'consult-hookproj-'));
+    const emptyHome = fs.mkdtempSync(path.join(os.tmpdir(), 'consult-hookhome-'));
+    try {
+      fs.writeFileSync(path.join(projectFolder, 'codex.cmd'), '@echo off');
+      const system32 = path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32');
+      const hook = fileURLToPath(new URL('../hooks/scripts/auth-check.js', import.meta.url));
+      const ran = spawnSync(process.execPath, [hook], {
+        input: '{}', cwd: projectFolder, encoding: 'utf8', timeout: 60000,
+        env: { ...process.env, PATH: `${projectFolder};${system32}`, Path: undefined, HOME: emptyHome, USERPROFILE: emptyHome, LOCALAPPDATA: emptyHome, APPDATA: emptyHome }
+      });
+      truthy('auth-check: at session start a codex.cmd found only in the project is named as such', /codex only inside the project folder|Found codex only inside the project folder/.test(ran.stderr) && !/codex CLI not found/.test(ran.stderr));
+    } finally {
+      fs.rmSync(projectFolder, { recursive: true, force: true });
+      fs.rmSync(emptyHome, { recursive: true, force: true });
+    }
+  } else {
+    console.log('PASS-SKIP auth-check: project-only codex.cmd at session start (Windows only)');
+  }
+
+  // L-b: a project file can name a runner off this machine; the session-start check never contacts it.
+  const { checkLocal } = await import('../hooks/scripts/auth-check.js');
+  const realFetch = globalThis.fetch;
+  const fetchedUrls = [];
+  globalThis.fetch = async (url) => { fetchedUrls.push(String(url)); throw new Error('no network in this test'); };
+  try {
+    const offMachine = await checkLocal({ local_model: 'm', local_base_url: 'http://203.0.113.5:11434/v1' }, 1000);
+    eq('auth-check: a runner off this machine is never contacted at session start', [offMachine, fetchedUrls], [null, []]);
+  } finally {
+    globalThis.fetch = realFetch;
   }
 
   // 2: addresses compare normalised; an unknown loaded state never crashes setup.
@@ -1718,6 +1868,48 @@ function settingsIn(home) {
     try { await setupIn(swapHome, { runner: 'llama-swap', key_env: 'sk-abc.def 123', preview: true }); } catch (error) { badName = error.message; }
     truthy('setupLocal: a key_env that is not a variable name is refused', typeof badName === 'string' && badName.includes('not a variable name'));
     truthy('setupLocal: the refusal does not repeat what was typed', typeof badName === 'string' && !badName.includes('sk-abc'));
+
+    // C3: a saved key goes only to the address it was saved for. A new address
+    // gets it back only when the call names the variable again.
+    process.env.CONSULT_C3_KEY = KEY_MARKER;
+    const addressB = await fakeServer({
+      'GET /v1/models': () => ({ json: llamaSwapFixture('models.json') }),
+      'GET /running': () => ({ json: { running: [] } })
+    });
+    try {
+      const keyedHome = homeWith(`---\nllama-swap.url: ${swap.url}\nllama-swap.key_env: CONSULT_C3_KEY\n---\n`);
+      const moved = await setupIn(keyedHome, { runner: 'llama-swap', url: addressB.url, preview: true });
+      const keyedWithoutName = addressB.requests.filter(request => request.headers.authorization !== undefined).length;
+      truthy('local_setup: moving to a new url drops the saved key_env from the write', /^- \d+: llama-swap\.key_env: CONSULT_C3_KEY/m.test((moved.preview?.diff ?? []).join('\n')));
+      eq('local_setup: a new url gets no key unless key_env is given again', [addressB.requests.length > 0, keyedWithoutName], [true, 0]);
+      await setupIn(keyedHome, { runner: 'llama-swap', url: addressB.url, key_env: 'CONSULT_C3_KEY', preview: true });
+      const keyedWithName = addressB.requests.filter(request => request.headers.authorization === `Bearer ${KEY_MARKER}`).length;
+      truthy('local_setup: a new url gets the key when key_env is given again', keyedWithName > 0);
+    } finally {
+      delete process.env.CONSULT_C3_KEY;
+      await addressB.close();
+    }
+
+    // A key variable discovered on a standard port stays with that port.
+    process.env.LLAMA_SWAP_API_KEY = KEY_MARKER;
+    const standardPort = await fakeServer({
+      'GET /v1/models': (request) => (request.headers.authorization === `Bearer ${KEY_MARKER}` ? { json: llamaSwapFixture('models.json') } : { status: 401, json: { src: 'llama-swap', error: { message: 'unauthorized' } } }),
+      'GET /running': () => ({ json: { running: [] } })
+    });
+    const otherPort = await fakeServer({
+      'GET /v1/models': () => ({ json: llamaSwapFixture('models.json') }),
+      'GET /running': () => ({ json: { running: [] } })
+    });
+    try {
+      const discoveredHome = homeWith('---\ntimeout_ms: 600000\n---\n');
+      const discoveredShown = await setupLocal({ runner: 'llama-swap', url: otherPort.url, preview: true }, settingsIn(discoveredHome), { home: discoveredHome, reloadSettings: () => settingsIn(discoveredHome), probeUrls: [standardPort.url] });
+      const keyedOther = otherPort.requests.filter(request => request.headers.authorization !== undefined).length;
+      eq('local_setup: a key variable found on a standard port is not sent to a new url', [otherPort.requests.length > 0, keyedOther, /key_env/.test((discoveredShown.preview?.diff ?? []).join('\n'))], [true, 0, false]);
+    } finally {
+      delete process.env.LLAMA_SWAP_API_KEY;
+      await standardPort.close();
+      await otherPort.close();
+    }
 
     // Review 5: a runner that passes names through gets the five rows, with what is saved.
     const passthrough = await fakeServer({ 'GET /v1/models': () => ({ json: { data: [{ id: 'm-one' }, { id: 'm-two' }] } }) });
@@ -2324,6 +2516,61 @@ const lmstudioFixture = (name) => JSON.parse(fs.readFileSync(new URL(`../tests/f
     return { fake: async () => ({ stdout: '{"type":"thread.started","thread_id":".."}\n', stderr: '', code: 0, latency_ms: 5 }) };
   });
   truthy('codexGenerateImage: a thread id that is a path collects and deletes nothing', traversal.homeEntries.includes('keep.txt') && traversal.error && traversal.error.message.includes('without saving'));
+}
+
+// --- resolve-cmd: a CLI file inside the project is never run (Windows lookup) ---
+eq("resolve: a project's own codex.cmd is never picked",
+  pickWindowsHit(['C:\\proj\\codex.cmd', 'C:\\Users\\me\\AppData\\Roaming\\npm\\codex.cmd'], 'C:\\proj'),
+  'C:\\Users\\me\\AppData\\Roaming\\npm\\codex.cmd');
+eq('resolve: a hit inside the project is refused even when PATH lists it',
+  pickWindowsHit(['C:\\proj\\node_modules\\.bin\\codex.cmd'], 'c:/PROJ'), null);
+eq('resolve: a relative hit is refused', pickWindowsHit(['codex.cmd'], 'C:\\proj'), null);
+eq('resolve: a sibling folder sharing the project name prefix is not the project',
+  pickWindowsHit(['C:\\proj-tools\\codex.cmd'], 'C:\\proj'), 'C:\\proj-tools\\codex.cmd');
+if (process.platform === 'win32') {
+  const homeNpmShim = path.join(os.homedir(), 'AppData', 'Roaming', 'npm', 'codex.cmd');
+  eq('resolve: from the home folder the npm install is still found', pickWindowsHit([homeNpmShim], os.homedir()), homeNpmShim);
+  eq('resolve: from a parent of the home folder the install is still found', pickWindowsHit([homeNpmShim], path.dirname(os.homedir())), homeNpmShim);
+  eq('resolve: from a drive root the install is still found',
+    pickWindowsHit(['C:\\Program Files\\x\\codex.exe'], 'C:\\'), 'C:\\Program Files\\x\\codex.exe');
+  eq('resolve: a relative hit is still refused from the home folder', pickWindowsHit(['codex.cmd'], os.homedir()), null);
+  eq('resolve: whereCommand uses the System32 where.exe and $PATH:<name>',
+    [whereCommand('codex').file.toLowerCase().endsWith('\\system32\\where.exe'), path.isAbsolute(whereCommand('codex').file) || process.platform !== 'win32', whereCommand('codex').args],
+    [true, true, ['$PATH:codex']]);
+}
+eq('resolve: isInsideFolder sees a program in the project, not beside it',
+  [isInsideFolder('C:\\proj\\bin\\agy.cmd', 'C:\\proj'), isInsideFolder('C:\\proj-tools\\agy.cmd', 'C:\\proj'), isInsideFolder('agy', 'C:\\proj')], [true, false, false]);
+eq('resolve: isInsideFolder exempts a drive root', isInsideFolder('C:\\Program Files\\agy.exe', 'C:\\'), false);
+{
+  const { refuseProgramInsideProject } = await import('./lib/delegate-supervisor.js');
+  let refusal = '';
+  try { refuseProgramInsideProject('C:\\proj\\agy.cmd', 'agy', ['C:\\other', 'C:\\proj']); } catch (e) { refusal = e.message; }
+  truthy('delegate: a worker program inside the project is refused with the project-folder message', refusal.includes('only inside the project folder (C:\\proj\\agy.cmd)'));
+  let outside = null;
+  try { refuseProgramInsideProject('C:\\tools\\agy.cmd', 'agy', ['C:\\proj', null, undefined]); } catch (e) { outside = e; }
+  eq('delegate: a worker program outside the project is allowed', outside, null);
+}
+eq('resolve: refusedWindowsHits lists what was skipped', refusedWindowsHits(['C:\\proj\\codex.cmd', 'C:\\n\\codex.cmd'], 'C:\\proj'), ['C:\\proj\\codex.cmd']);
+truthy('resolve: a project-only hit is reported as such, not as not installed',
+  missingMessage('codex', 'C:\\proj\\codex.cmd').includes('only inside the project folder (C:\\proj\\codex.cmd)') && !/not installed/.test(missingMessage('codex', 'x')));
+eq('resolve: .cmd is still preferred outside the project',
+  pickWindowsHit(['C:\\a\\codex.exe', 'C:\\b\\codex.cmd'], 'C:\\proj'), 'C:\\b\\codex.cmd');
+eq('resolve: .exe beats .bat, and the first line is the last resort',
+  [pickWindowsHit(['C:\\a\\x.bat', 'C:\\b\\x.exe'], 'C:\\proj'), pickWindowsHit(['C:\\a\\x.ps1'], 'C:\\proj')],
+  ['C:\\b\\x.exe', 'C:\\a\\x.ps1']);
+if (SPAWN_OPTS.shell) {
+  for (const character of ['&', '(', ')', '^', '|', '<', '>', '!']) {
+    const risky = `C:\\Tools\\A${character}B\\codex.cmd`;
+    eq(`spawnableCmd: a path with ${character} is quoted`, spawnableCmd(risky), `"${risky}"`);
+  }
+  eq('spawnableCmd: a plain path is quoted too (cmd also splits at , ; =)', spawnableCmd('C:\\Tools\\a,b\\codex.cmd'), '"C:\\Tools\\a,b\\codex.cmd"');
+  eq('spawnableCmd: no folder trick needed, plain path quoted', spawnableCmd('C:\\Tools\\codex.cmd'), '"C:\\Tools\\codex.cmd"');
+  eq('resolve: the server sets NoDefaultCurrentDirectoryInExePath', process.env.NoDefaultCurrentDirectoryInExePath, '1');
+  for (const unsafe of ['C:\\Tools\\a"b\\codex.cmd', 'C:\\Tools\\%PATH%\\codex.cmd']) {
+    let message = '';
+    try { spawnableCmd(unsafe); } catch (e) { message = e.message; }
+    truthy(`spawnableCmd: ${unsafe} is refused and named`, message.includes(unsafe));
+  }
 }
 
 console.log('\n' + (failed === 0 ? 'ALL PASSED' : `${failed} FAIL(S)`));

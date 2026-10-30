@@ -16,12 +16,24 @@ import path from 'node:path';
 
 export const SPAWN_OPTS = Object.freeze({ shell: process.platform === 'win32' });
 
+// cmd.exe and CreateProcess look in the current folder (the project) before PATH
+// for a bare program name, and the npm shims call a bare `node`. With this set,
+// every child of this process skips the current folder.
+if (process.platform === 'win32') process.env.NoDefaultCurrentDirectoryInExePath = '1';
+
 // The executable as spawn should receive it. Under shell:true cmd.exe splits an
 // unquoted path at its first space, so a CLI in `C:\Program Files\...` or a
 // profile like `C:\Users\Jane Doe\...` failed to start ("'C:\Program' is not
-// recognized").
+// recognized"); it also splits at `,` `;` `=`, and runs an unquoted `&`, `|` or
+// `^` as cmd syntax, so `C:\Tools\A&ver&B\codex.cmd` would run `ver`. The path
+// is therefore always quoted. `%VAR%` expands even inside quotes and a quote
+// cannot be escaped, so such a path is refused.
 export function spawnableCmd(binPath) {
-  return SPAWN_OPTS.shell && /\s/.test(binPath) ? `"${binPath}"` : binPath;
+  if (!SPAWN_OPTS.shell) return binPath;
+  if (/["%]/.test(binPath)) {
+    throw new Error(`Refusing to run ${binPath}: a path with a quote or percent sign cannot be passed safely to cmd.exe. Move the CLI to a folder without them.`);
+  }
+  return `"${binPath}"`;
 }
 
 // An EMPTY argv element does not survive shell:true -- Node concatenates args
@@ -72,29 +84,94 @@ function firstExisting(candidates) {
   return null;
 }
 
+// A CLI file is trusted only as an absolute path outside the project: `where`
+// and cmd.exe look in the current folder first, so a repository that ships its
+// own codex.cmd or agy.cmd would otherwise run it on the user's machine.
+function windowsPathKey(file) {
+  return path.win32.normalize(file).toLowerCase().replace(/\\+$/, '');
+}
+
+// Started from the home folder, one of its parents or a drive root, "inside the
+// project" would cover every trusted install (%APPDATA%\npm, Program Files), so
+// only the absolute-path rule applies there.
+function isBroadFolder(projectKey) {
+  const homeKey = windowsPathKey(os.homedir());
+  return /^[a-z]:$/.test(projectKey) || homeKey === projectKey || homeKey.startsWith(projectKey + '\\');
+}
+
+function isOutsideProject(file, projectFolder) {
+  if (!path.win32.isAbsolute(file)) return false;
+  const fileKey = windowsPathKey(file);
+  const projectKey = windowsPathKey(projectFolder);
+  if (isBroadFolder(projectKey)) return true;
+  return fileKey !== projectKey && !fileKey.startsWith(projectKey + '\\');
+}
+
+// True when a resolved program is an absolute Windows path inside this folder.
+// The supervisor runs from the task folder, so resolveCmd's own filter (which
+// compares with process.cwd()) cannot see the project; it asks this instead.
+// The same home-folder and drive-root exemption applies.
+export function isInsideFolder(file, folder) {
+  return path.win32.isAbsolute(file) && !isOutsideProject(file, folder);
+}
+
+// Prefer .cmd first - npm-installed CLIs ship as .cmd shims on Windows.
+// A coexisting .exe with the same name is more likely to be an unrelated
+// tool (or stale install) than the npm shim we want.
+export function pickWindowsHit(lines, projectFolder) {
+  const trusted = [];
+  for (const line of lines) {
+    if (isOutsideProject(line, projectFolder)) trusted.push(line);
+  }
+  const ranked = (ext) => trusted.find(l => l.toLowerCase().endsWith(ext));
+  return ranked('.cmd') || ranked('.exe') || ranked('.bat') || trusted[0] || null;
+}
+
+// The hits `pickWindowsHit` skips, so the user can be told why a CLI that
+// `where` found is not used.
+export function refusedWindowsHits(lines, projectFolder) {
+  const refused = [];
+  for (const line of lines) {
+    if (!isOutsideProject(line, projectFolder)) refused.push(line);
+  }
+  return refused;
+}
+
+// `$PATH:<name>` searches the PATH directories only; a bare name would search
+// the current folder (the project) first. where.exe is called by its System32
+// path because libuv would otherwise run a where.exe planted in the project.
+export function whereCommand(name) {
+  return { file: path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'where.exe'), args: [`$PATH:${name}`] };
+}
+
 export function resolveCmd(name) {
   if (cache.has(name)) return cache.get(name);
 
   let entry = { path: name, found: true };
   if (process.platform === 'win32') {
     let found = null;
+    let refused = null;
     try {
-      const out = execFileSync('where', [name], {
+      const where = whereCommand(name);
+      const out = execFileSync(where.file, where.args, {
         stdio: ['ignore', 'pipe', 'ignore'],
         encoding: 'utf8',
         windowsHide: true
       });
       const lines = out.trim().split(/\r?\n/).filter(Boolean);
-      // Prefer .cmd first - npm-installed CLIs ship as .cmd shims on Windows.
-      // A coexisting .exe with the same name is more likely to be an unrelated
-      // tool (or stale install) than the npm shim we want.
-      const ranked = (ext) => lines.find(l => l.toLowerCase().endsWith(ext));
-      found = ranked('.cmd') || ranked('.exe') || ranked('.bat') || lines[0] || null;
+      found = pickWindowsHit(lines, process.cwd());
+      refused = refusedWindowsHits(lines, process.cwd())[0] ?? null;
     } catch (_) { /* not on PATH -- fall through to the known-location probe */ }
 
     // PATH lost the race with the installer; look where it would have landed.
-    if (!found) found = firstExisting(knownLocations(name));
-    entry = found ? { path: found, found: true } : { path: `${name}.cmd`, found: false };
+    if (!found) {
+      const candidates = [];
+      for (const candidate of knownLocations(name)) {
+        if (isOutsideProject(candidate, process.cwd())) candidates.push(candidate);
+      }
+      found = firstExisting(candidates);
+    }
+    entry = found ? { path: found, found: true } : { path: `${name}.cmd`, found: false, refused };
   } else {
     // POSIX: spawn resolves PATH itself, so only step in when it would fail.
     try {
@@ -118,8 +195,20 @@ const INSTALL_HINTS = {
   claude: 'see https://claude.com/claude-code'
 };
 
+// Said when the only hit for a CLI sits in the project folder, which consult
+// never runs: it is not "not installed", and PATH is not what needs fixing.
+export function missingMessage(name, refusedPath) {
+  return `Found ${name} only inside the project folder (${refusedPath}); consult won't run it. ` +
+    `Install ${name} outside the project, or put its folder on PATH.`;
+}
+
 export function ensureCmd(name) {
   const r = resolveCmd(name);
+  if (!r.found && r.refused) {
+    const err = new Error(missingMessage(name, r.refused));
+    err.kind = 'spawn_error';
+    throw err;
+  }
   if (!r.found) {
     const install = INSTALL_HINTS[name] ? ` Install it: ${INSTALL_HINTS[name]}.` : '';
     // The new-terminal note matters for installers that write the user PATH

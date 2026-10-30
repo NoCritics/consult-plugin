@@ -11,7 +11,8 @@
 //   3. Tree-kill: on Windows with shell:true (required for .cmd shims, see
 //      resolve-cmd.js), child.kill('SIGKILL') only kills cmd.exe, leaving the
 //      real CLI grandchild running. We use `taskkill /T /F` to tear down the
-//      whole subtree.
+//      whole subtree. On POSIX each CLI leads its own process group (detached)
+//      and the group is killed, so a wrapper's own children stop too.
 //
 // Returns { stdout, stderr, code, latency_ms } on success. Throws CliError
 // with `kind` in: timeout | buffer_overflow | spawn_error | nonzero_exit.
@@ -60,22 +61,60 @@ export function killPidTree(pid) {
 }
 
 // `group: true` is for a child spawned `detached` on POSIX, where it leads its
-// own process group: the whole group is killed, not just the child.
-export function killTree(child, { group = false } = {}) {
-  if (!child || child.exitCode !== null) return;
+// own process group: the whole group is killed, not just the child. An exited
+// child is left alone unless `evenIfExited` is also set (runCli only: a wrapper
+// that exited can leave a grandchild holding stdout open, so its 'close' never
+// fires; the delegate supervisor must not kill a finished worker's survivors).
+export function killTree(child, { group = false, evenIfExited = false } = {}) {
+  if (!child) return;
+  const groupKill = group && process.platform !== 'win32' && child.pid;
+  if (child.exitCode !== null && !(groupKill && evenIfExited)) return;
   if (process.platform === 'win32' && child.pid) {
     try {
       killPidTree(child.pid);
       return;
     } catch (_) { /* fall through to SIGKILL */ }
   }
-  if (group && process.platform !== 'win32' && child.pid) {
+  if (groupKill) {
     try {
       process.kill(-child.pid, 'SIGKILL');
       return;
     } catch (_) { /* fall through to SIGKILL on the child alone */ }
   }
+  if (child.exitCode !== null) return;
   try { child.kill('SIGKILL'); } catch (_) {}
+}
+
+// On POSIX each CLI leads its own process group so a timeout or Cancel can kill
+// the wrapper's children too (killTree with `group: true`). Windows keeps the
+// shell:true + taskkill /T path and is not detached.
+export function cliSpawnOptions(platform) {
+  if (platform === 'win32') return {};
+  return { detached: true };
+}
+
+// Every runCli child still running. On POSIX the children are detached, so the
+// terminal's SIGHUP/SIGINT no longer reach them; the server kills them itself.
+const liveCliChildren = new Set();
+
+export function liveCliChildCount() {
+  return liveCliChildren.size;
+}
+
+// Stops every CLI a call is still waiting on (server shutdown). `kill` is
+// injectable for tests.
+export function killAllCliChildren(kill = killTree) {
+  for (const child of [...liveCliChildren]) kill(child, { group: true, evenIfExited: true });
+}
+
+// spawnableCmd refuses a path cmd.exe cannot take safely; callers test for
+// kind 'spawn_error', so the refusal is raised as one.
+export function spawnableCmdOrError(bin, label) {
+  try {
+    return spawnableCmd(bin);
+  } catch (e) {
+    throw new CliError(scrubPii(`${label} CLI failed to start: ${e.message}`), 'spawn_error', { label });
+  }
 }
 
 export async function runCli({
@@ -99,7 +138,9 @@ export async function runCli({
   // The child inherits the MCP server's cwd. None of the providers need to
   // relocate it -- prompts carry their own context (files are inlined by the
   // orchestrator before the tool call).
-  const child = spawn(spawnableCmd(bin), shellSafeArgs(args), { stdio: ['pipe', 'pipe', 'pipe'], ...SPAWN_OPTS });
+  const child = spawn(spawnableCmdOrError(bin, label), shellSafeArgs(args), { stdio: ['pipe', 'pipe', 'pipe'], ...SPAWN_OPTS, ...cliSpawnOptions(process.platform) });
+
+  liveCliChildren.add(child);
 
   // EPIPE safety -- attach BEFORE the first write. If the child exits before
   // consuming stdin, the write triggers an error event; without a listener
@@ -115,7 +156,7 @@ export async function runCli({
     const current = which === 'stdout' ? stdout : stderr;
     if (current.length >= bufferCap) {
       bufferOverflow = true;
-      killTree(child);
+      killTree(child, { group: true, evenIfExited: true });
       return;
     }
     const text = chunk.toString('utf8');
@@ -127,11 +168,11 @@ export async function runCli({
 
   const timer = setTimeout(() => {
     timedOut = true;
-    killTree(child);
+    killTree(child, { group: true, evenIfExited: true });
   }, timeout_ms);
   const onAbort = () => {
     cancelled = true;
-    killTree(child);
+    killTree(child, { group: true, evenIfExited: true });
   };
   signal?.addEventListener('abort', onAbort, { once: true });
 
@@ -144,6 +185,7 @@ export async function runCli({
     child.on('close', resolve);
     child.on('error', (err) => { spawnErr = err; resolve(127); });
   });
+  liveCliChildren.delete(child);
   clearTimeout(timer);
   signal?.removeEventListener('abort', onAbort);
 

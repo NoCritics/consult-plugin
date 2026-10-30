@@ -1,7 +1,7 @@
 ---
 description: Hand a background task to Codex, agy or a local model instead of a Claude subagent
 argument-hint: "[codex | agy | local | local:<nickname>] <the task>"
-allowed-tools: ["mcp__plugin_consult_consult__delegate", "mcp__plugin_consult_consult__delegate_status", "mcp__plugin_consult_consult__delegate_result", "mcp__plugin_consult_consult__delegate_wait"]
+allowed-tools: ["mcp__plugin_consult_consult__delegate", "mcp__plugin_consult_consult__delegate_status", "mcp__plugin_consult_consult__delegate_result", "mcp__plugin_consult_consult__delegate_wait", "mcp__plugin_consult_consult__delegate_list", "mcp__plugin_consult_consult__delegate_cancel"]
 ---
 
 # /consult:delegate

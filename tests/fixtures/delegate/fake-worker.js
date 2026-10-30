@@ -3,7 +3,7 @@
 // does; every scenario reads its stdin to the end first and, unless it says
 // hang, exits on its own.
 //
-//   ok          a codex stream, writes worker-output.txt in its folder, exits 0
+//   ok          a codex stream, writes worker-output.txt in its folder, exits 0 (FAKE_ANSWER_TAG, FAKE_NO_MESSAGE: see below)
 //   fail        starts, writes to stderr, exits 1
 //   limit       a codex "usage limit" failure (thread FAKE_THREAD_ID), exits 1
 //   early       a codex stream with no terminal event, exits 0
@@ -19,6 +19,7 @@
 //   slow        a complete codex stream after FAKE_RUN_MS (default 8000) of silence, exits 0
 //   agy-edit    an agy stream that writes FAKE_WRITE_FILE and deletes FAKE_DELETE_FILE first, exits 0
 //   agy-denied  an agy stream that writes FAKE_WRITE_FILE (if set), then ends with an empty response and one denied RunCommand, exits 0
+//   agy-replay  prints the lines of the file FAKE_STREAM_FILE as they are, then exits with FAKE_EXIT_CODE (default 0)
 //   pi          a pi stream (session from --session-id), exits 0
 //
 // FAKE_START_LOG: a line with the pid is appended to this file at every start.
@@ -77,7 +78,9 @@ if (scenario === 'ok') {
   emit({ type: 'thread.started', thread_id: threadId });
   emit({ type: 'turn.started' });
   fs.writeFileSync('worker-output.txt', 'written by the fake worker\n');
-  emit({ type: 'item.completed', item: { id: 'item_0', type: 'agent_message', text: '## Summary\nCreated worker-output.txt in the folder.\nSecond line of the message.\n' } });
+  // FAKE_ANSWER_TAG makes this run's message distinct; FAKE_NO_MESSAGE=1 ends the run without one.
+  const answerTag = process.env.FAKE_ANSWER_TAG ? `Tag: ${process.env.FAKE_ANSWER_TAG}\n` : '';
+  if (process.env.FAKE_NO_MESSAGE !== '1') emit({ type: 'item.completed', item: { id: 'item_0', type: 'agent_message', text: `## Summary\nCreated worker-output.txt in the folder.\n${answerTag}Second line of the message.\n` } });
   emit({ type: 'turn.completed', usage: { input_tokens: 1, output_tokens: 1 } });
 } else if (scenario === 'fail') {
   emit({ type: 'thread.started', thread_id: threadId });
@@ -164,6 +167,10 @@ if (scenario === 'ok') {
   emit({ event: 'init', conversation_id: threadId });
   if (process.env.FAKE_WRITE_FILE) fs.writeFileSync(process.env.FAKE_WRITE_FILE, 'written by the fake worker\n');
   emit({ event: 'result', result: { conversation_id: threadId, status: 'SUCCESS', response: '', denied_actions: [{ action: 'command', display_name: 'RunCommand' }] } });
+} else if (scenario === 'agy-replay') {
+  // A recorded agy stream, printed unchanged; agy 1.2.10+ exits 3 after an ERROR result.
+  process.stdout.write(fs.readFileSync(process.env.FAKE_STREAM_FILE, 'utf8'));
+  process.exitCode = Number(process.env.FAKE_EXIT_CODE || 0);
 } else if (scenario === 'pi') {
   const sessionId = args[args.indexOf('--session-id') + 1];
   emit({ type: 'session', version: 3, id: sessionId });

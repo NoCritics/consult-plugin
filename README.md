@@ -159,7 +159,7 @@ The server also installs as a Claude Desktop extension, so Chat and Cowork can u
 
 **Runtime:** leave *Use built-in Node.js for MCP* on; no Node install is needed. The CLIs are not bundled: codex and agy must be installed and signed in, as for the plugin.
 
-**What Desktop gets:** the 16 tools the extension's manifest lists. The slash commands, the skill and the SessionStart check are Claude Code only, so in Desktop ask for a model by name ("ask codex …"). **The Desktop extension doesn't include delegate in this release** (its tools aren't listed there): delegate needs the pane, the wake-up and a project folder, none of which Desktop has. Use it from Claude Code.
+**What Desktop gets:** the 17 tools the extension's manifest lists. The slash commands, the skill and the SessionStart check are Claude Code only, so in Desktop ask for a model by name ("ask codex …"). **The Desktop extension doesn't include delegate in this release** (its tools aren't listed there): delegate needs the pane, the wake-up and a project folder, none of which Desktop has. Use it from Claude Code.
 
 **Settings** come from `~/.claude/consult.local.md`; Desktop doesn't start the server in a project.
 
@@ -297,7 +297,7 @@ If one model fails to generate, the tournament continues 2-way with `degraded: t
 
 ## Notes & caveats
 
-- **Codex runs read-only and leaves no trace.** `-s read-only` blocks writes, and one-shot asks pass `--ephemeral`. Chat sessions persist until `consult_chat_end`, which removes them with `codex delete --force` (rollout file and state-DB row).
+- **Codex runs read-only by default and leaves no trace.** `-s read-only` blocks writes (`codex_sandbox` can grant `workspace-write` or `danger-full-access`), and one-shot asks pass `--ephemeral`. Chat sessions persist until `consult_chat_end`, which removes them with `codex delete --force` (rollout file and state-DB row).
 - **Codex results name the model and effort that ran**, e.g. `gpt-6-astra (codex default)` when codex chose. Codex 0.161 made `gpt-6.1-sol` the bundled default, but a `model` line in your `config.toml` (which the Codex app writes when you pick a model) still wins. Chats read them from the session record. One-shot asks leave none, so they read `~/.codex/config.toml` (or `$CODEX_HOME`), including the active profile. Each chat turn keeps the model and effort the chat started with; consult passes them back, because `codex exec resume` would otherwise switch to the config defaults.
 - **Your codex hooks don't run on consult calls.** consult passes `--disable hooks`: hooks in `~/.codex/hooks.json` are written for interactive sessions, and a Stop hook that blocks the stop keeps codex working after its answer, racing the timeout. Turn them on per call (Claude passes `run_hooks: true` to `ask_codex`, chat start/send or `council_vote`; just ask) or by default with `codex_hooks: true`. Every codex result says `hooks_ran`.
 - **Timeouts return what arrived, marked INCOMPLETE.** Codex gets at least 10 minutes (`codex_timeout_ms`), since image reviews at high effort run long; Claude Code backgrounds MCP calls after 120 s, so this doesn't block you. A timed-out call returns an error starting `INCOMPLETE:` with the partial output between `BEGIN/END PARTIAL <PROVIDER> OUTPUT` markers. For agy that is the answer cut off mid-stream. Codex doesn't stream text, so its partial is the last *complete* message, which may be the answer or only a progress note. The message suggests a longer per-call limit (below); for a lasting change raise `agy_timeout_ms` or `codex_timeout_ms`.

@@ -21,14 +21,14 @@ Participants: `codex`, `agy` (default Google provider), `gemini` (legacy, needs 
 
 2. **For Start**:
    - Detect file references in the message and inline them (see "File handling" below).
-   - Call `mcp__plugin_consult_consult__consult_chat_start` with `{ participant, prompt }`.
+   - Call `mcp__plugin_consult_consult__consult_chat_start` with `{ participant, prompt }`, plus `timeout_s` when `--timeout` was given.
    - Show the response with the format below, AND tell the user the session id explicitly so they know we're in a chat.
 
 3. **For Continue**:
    - Look up the most recent chat tool call in this conversation. Use its `session_id` and `participant`.
    - If you can't find one, ask the user: "I don't see an active chat session in this conversation. Use `/consult:chat codex <message>` or `/consult:chat agy <message>` to start one."
    - Detect file references and inline them.
-   - Call `mcp__plugin_consult_consult__consult_chat_send` with `{ participant, session_id, prompt }`.
+   - Call `mcp__plugin_consult_consult__consult_chat_send` with `{ participant, session_id, prompt }`, plus `timeout_s` when `--timeout` was given.
 
 4. **For End**: call `consult_chat_end` with the participant + session_id from the most recent chat tool result. The tool returns `{ deleted, note, ... }`. Format as a one-line confirmation: `Session <id> deleted (N file(s) removed).` If `deleted=0`, surface the `note` field instead so the user understands why.
 

@@ -8,7 +8,7 @@ allowed-tools: ["mcp__plugin_consult_consult__ask_local", "mcp__plugin_consult_c
 
 Send a prompt to a model running on this machine via the `consult` MCP server and show the clean response to the user.
 
-Free — inference is local, no API tokens are spent and nothing leaves the machine.
+Free — inference is local, the model runs on this machine and no API tokens are spent. Claude (a cloud model) still writes the prompt and reads the answer.
 
 ## Steps
 

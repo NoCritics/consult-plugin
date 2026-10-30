@@ -2080,6 +2080,61 @@ try {
         eq('supervisor limit: the rollout\'s windows are kept as they are', [paused.limit?.primary?.used_percent, paused.limit?.secondary?.used_percent], [100, 41]);
       } });
 
+      // agy's answer arrived in full, then its result line said ERROR (agy 1.2.10+ exits 3 on that).
+      const replayAfterAnswer = (name, change) => {
+        const lines = fs.readFileSync(path.join(fixtureRoot, 'agy-error-after-answer.jsonl'), 'utf8').split(/\r?\n/).filter(Boolean);
+        const changed = change(lines);
+        const file = path.join(scratch, name);
+        fs.writeFileSync(file, changed.join('\n') + '\n');
+        return { FAKE_SCENARIO: 'agy-replay', FAKE_STREAM_FILE: file, FAKE_EXIT_CODE: '3' };
+      };
+
+      scenarios.push({ name: 'agy error after a complete answer', run: async () => {
+        const task = newTask({ worker: 'agy', mode: 'read' });
+        launchWith(task, replayAfterAnswer('agy-answer-then-error.jsonl', (lines) => lines));
+        const done = await waitForTask(task.id, hasEnded);
+        eq('agy: an error after a complete answer ends the task done with a warning', [done.state, done.summary, done.warning.includes('stream idle timeout')], ['done', 'The review found one issue.', true]);
+        eq('agy: the answer is kept as the final message', fs.readFileSync(path.join(taskFolder(task.id), 'final.md'), 'utf8'), '### Findings\nThe review found one issue.\n');
+        const held = newTask({ worker: 'agy', mode: 'read', hold: true });
+        launchWith(held, replayAfterAnswer('agy-answer-then-error-hold.jsonl', (lines) => lines));
+        eq('agy: the same on a task that asked for hold is held', (await waitForTask(held.id, hasEnded)).state, 'held');
+      } });
+
+      scenarios.push({ name: 'agy answer cut off mid-stream', run: async () => {
+        const task = newTask({ worker: 'agy', mode: 'read' });
+        launchWith(task, replayAfterAnswer('agy-cut-off.jsonl', (lines) => {
+          const cutOff = [];
+          for (const line of lines) cutOff.push(line.includes('"state":"DONE","step_type":"agent_response"') ? line.replace('"state":"DONE"', '"state":"ACTIVE"') : line);
+          return cutOff;
+        }));
+        const failed = await waitForTask(task.id, hasEnded);
+        eq('agy: an answer cut off mid-stream stays failed', [failed.state, failed.summary.includes('stream idle timeout'), (failed.warning ?? '').includes('stream idle timeout')], ['failed', true, false]);
+      } });
+
+      scenarios.push({ name: 'agy warning is scrubbed and capped', run: async () => {
+        const task = newTask({ worker: 'agy', mode: 'read' });
+        const longError = `key sk-abcdefghijklmnopqrstuvwxyz0123456789 ${'x'.repeat(20000)}`;
+        launchWith(task, replayAfterAnswer('agy-answer-then-long-error.jsonl', (lines) => {
+          const longer = [];
+          for (const line of lines) longer.push(line.replace('API error (attempt 1): request failed: stream idle timeout (5m0s): context deadline exceeded', longError));
+          return longer;
+        }));
+        const done = await waitForTask(task.id, hasEnded);
+        const warning = done.warning ?? '';
+        eq('agy: a warning carrying a key and 20 KB of text is stored scrubbed and capped', [done.state, warning.includes('sk-abcdefghijklmnopqrstuvwxyz'), warning.length > 0 && warning.length <= 600], ['done', false, true]);
+      } });
+
+      scenarios.push({ name: 'agy limit error after an answer', run: async () => {
+        const task = newTask({ worker: 'agy', mode: 'read' });
+        launchWith(task, replayAfterAnswer('agy-answer-then-limit.jsonl', (lines) => {
+          const limited = [];
+          for (const line of lines) limited.push(line.replace('API error (attempt 1): request failed: stream idle timeout (5m0s): context deadline exceeded', "You've hit your usage limit."));
+          return limited;
+        }));
+        const paused = await waitForTask(task.id, hasEnded);
+        eq('agy: a limit error after an answer still pauses', [paused.state, paused.limit?.kind], ['paused-limit', 'exhausted']);
+      } });
+
       scenarios.push({ name: 'watchdog', run: async () => {
         const task = newTask();
         launchWith(task, { FAKE_SCENARIO: 'hang', CONSULT_DELEGATE_WATCHDOG_MS: '1000' });
@@ -2547,6 +2602,20 @@ try {
         launchWith(task, { CONSULT_DELEGATE_TEST_BIN: '', PATH: searchPath, Path: undefined, LOCALAPPDATA: emptyFolder, APPDATA: emptyFolder });
         const failedTask = await waitForTask(task.id, hasEnded, 20000);
         eq('supervisor missing CLI: a failed task whose summary names the CLI', [failedTask.state, failedTask.summary.includes('agy CLI not found')], ['failed', true]);
+      } });
+
+      scenarios.push({ name: 'a worker that is found only inside the task project', run: async () => {
+        if (process.platform !== 'win32') { console.log('PASS-SKIP supervisor project filter: Windows lookup only'); return; }
+        const plantedProject = path.join(scratch, 'planted project');
+        fs.mkdirSync(plantedProject, { recursive: true });
+        fs.writeFileSync(path.join(plantedProject, 'agy.cmd'), '@echo off');
+        const emptyFolder = path.join(scratch, 'no tools here either');
+        fs.mkdirSync(emptyFolder, { recursive: true });
+        const task = newTask({ worker: 'agy', project: plantedProject });
+        const searchPath = plantedProject + ';' + path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32');
+        launchWith(task, { CONSULT_DELEGATE_TEST_BIN: '', PATH: searchPath, Path: undefined, LOCALAPPDATA: emptyFolder, APPDATA: emptyFolder });
+        const failedTask = await waitForTask(task.id, hasEnded, 20000);
+        eq('supervisor project filter: a worker found only in the project is not run', [failedTask.state, failedTask.summary.includes('only inside the project folder')], ['failed', true]);
       } });
 
       await runInPool(scenarios, 4);
@@ -4790,6 +4859,48 @@ try {
           truthy('delegate_send: the worker was resumed with the recorded session', secondReport.args.includes('resume') && secondReport.args.includes('5eed5eed-0000-4000-8000-000000000001'));
           eq('delegate_send: the follow-up text is what the worker was given', secondReport.promptStart, 'Please also add tests.');
           eq('delegate_send: the second run ran in the same copy', fs.realpathSync.native(secondReport.cwd).toLowerCase(), fs.realpathSync.native(done.worktree).toLowerCase());
+        });
+
+        // A follow-up's result is its own: the previous run's final.md does not stand in for it.
+        await guardedAsync('delegate_result: follow-ups', async () => {
+          const repo = makeRepo('Имя git repo followup', { 'readme.txt': 'hello\n' });
+          beat('instance-a');
+          const supervisorEnvFor = (scenario, extra = {}) => ({
+            ...process.env, CONSULT_DELEGATE_TEST_BIN: fakeWorkerPath, CODEX_HOME: toolsCodexHome, CONSULT_NO_USER_ENV: '1',
+            USERPROFILE: fakeUserHome, HOME: fakeUserHome, CONSULT_DELEGATE_WATCHDOG_MS: '600000', CONSULT_DELEGATE_POLL_MS: '200',
+            FAKE_SCENARIO: scenario, ...extra
+          });
+          const realLaunch = (taskId, options) => {
+            const pid = launchSupervisor(taskId, options);
+            realLaunchedPids.push(pid);
+            return pid;
+          };
+          const started = await call('delegate', briefArgs(), contextFor(repo, { launch: realLaunch, supervisorEnv: supervisorEnvFor('ok') }));
+          const first = await waitForTask(started.value.id, (task) => task.state === 'done');
+          truthy('follow-up: the first run wrote its answer', (await call('delegate_result', { id: first.id }, contextFor(repo))).value.final_message.includes('Created worker-output.txt'));
+
+          await call('delegate_send', { id: first.id, message: 'Now fail.' }, contextFor(repo, { launch: realLaunch, supervisorEnv: supervisorEnvFor('fail') }));
+          const failed = await waitForTask(first.id, (task) => task.state === 'failed');
+          const failedResult = await call('delegate_result', { id: first.id }, contextFor(repo));
+          eq('follow-up: a failed follow-up does not show the previous answer', [failed.state, failedResult.value.final_message], ['failed', null]);
+
+          await call('delegate_send', { id: first.id, message: 'Try again.' }, contextFor(repo, { launch: realLaunch, supervisorEnv: supervisorEnvFor('ok', { FAKE_ANSWER_TAG: 'third run' }) }));
+          const third = await waitForTask(first.id, (task) => task.state === 'done' && task.ended_at > failed.ended_at);
+          eq('follow-up: a successful follow-up shows its own answer', [third.state, (await call('delegate_result', { id: first.id }, contextFor(repo))).value.final_message], ['done', '## Summary\nCreated worker-output.txt in the folder.\nTag: third run\nSecond line of the message.\n']);
+
+          // A run that finishes without any message shows none, not the third run's.
+          await call('delegate_send', { id: first.id, message: 'Say nothing.' }, contextFor(repo, { launch: realLaunch, supervisorEnv: supervisorEnvFor('ok', { FAKE_NO_MESSAGE: '1' }) }));
+          const silent = await waitForTask(first.id, (task) => task.state === 'done' && task.ended_at > third.ended_at);
+          eq('follow-up: a follow-up that ends with no message shows none', [silent.state, (await call('delegate_result', { id: first.id }, contextFor(repo))).value.final_message], ['done', null]);
+
+          // A follow-up cancelled while it is still queued shows no answer from the earlier run either.
+          const queuedOnly = await call('delegate', briefArgs(), contextFor(repo, { launch: realLaunch, supervisorEnv: supervisorEnvFor('ok') }));
+          const finishedOnce = await waitForTask(queuedOnly.value.id, (task) => task.state === 'done');
+          await call('delegate_send', { id: finishedOnce.id, message: 'Never runs.' }, contextFor(repo, { launch: () => 4242 }));
+          const stillQueued = readTask(finishedOnce.id);
+          eq('follow-up: a queued follow-up has no earlier answer on file', [stillQueued.state, stillQueued.final_path, fs.existsSync(path.join(taskFolder(finishedOnce.id), 'final.md'))], ['queued', null, false]);
+          await call('delegate_cancel', { id: finishedOnce.id }, contextFor(repo));
+          eq('follow-up: a follow-up cancelled while queued shows no previous answer', [(await call('delegate_result', { id: finishedOnce.id }, contextFor(repo))).value.final_message], [null]);
         });
       }
 

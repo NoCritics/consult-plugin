@@ -305,10 +305,12 @@ export function deniedNames(denied) {
 }
 
 function parseAgyStream(events, stderr) {
-  const result = { finalMessage: null, session: null, limit: null, limitHit: null, error: null, denied: [], complete: false, refusedOnly: false };
+  const result = { finalMessage: null, session: null, limit: null, limitHit: null, error: null, warning: null, denied: [], complete: false, refusedOnly: false };
   let envelope = null;
+  let lastStep = null;
   for (const event of events) {
     if (event.event === 'init' && typeof event.conversation_id === 'string') result.session = event.conversation_id;
+    if (event.event === 'step_update' && event.step_update && typeof event.step_update === 'object') lastStep = event.step_update;
     if (event.event === 'result' && event.result && typeof event.result === 'object') envelope = event.result;
   }
   const failures = [];
@@ -337,6 +339,16 @@ function parseAgyStream(events, stderr) {
     if (result.limitHit === null) result.limitHit = limitFromMessage(failure);
   }
   result.refusedOnly = refusal !== null && failures.length === 0;
+  // agy can finish its answer and then report ERROR (its connection dropped
+  // afterwards). When the last step is the answer, done, and the result line is
+  // the only failure, the answer stands and the error is only a warning.
+  // Residual risk: a model that narrates text before tool calls and then stalls has that text accepted;
+  // the rule relies on the last step being the DONE agent_response.
+  const answerArrived = lastStep !== null && lastStep.step_type === 'agent_response' && lastStep.state === 'DONE' && result.finalMessage !== null;
+  if (answerArrived && result.limitHit === null && refusal === null && agyError === null && failures.length === 1 && envelope.status !== 'SUCCESS' && !isPartialOutput(stderr)) {
+    result.warning = `agy's answer arrived in full, then it reported an error: ${failures[0]}`;
+    return result;
+  }
   // A limit hit wins over every error; otherwise a refusal keeps priority and
   // carries any other failure after it.
   if (result.limitHit === null) {

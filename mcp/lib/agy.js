@@ -246,7 +246,9 @@ function withImagePaths(prompt, loaded) {
 // call killed before agy printed one (timeout, cancel) still leaves its files.
 // `beforeDiscard(conversationId)` runs while the conversation's files still
 // exist, on success and failure alike (a print-timeout can come after images
-// were saved); image generation copies its results out there. It must not throw.
+// were saved); image generation copies its results out there. It must not
+// throw. Returning true keeps the conversation: a failed copy leaves the
+// originals as the only copy of paid-for images.
 async function runAgy({ args, prompt, timeout_ms, label, discardConversation = false, preamble = AGY_ANSWER_ONLY_PREAMBLE, beforeDiscard }) {
   let stdout = '';
   try {
@@ -262,12 +264,20 @@ async function runAgy({ args, prompt, timeout_ms, label, discardConversation = f
     if (!stdout && typeof e?.stdout === 'string') stdout = e.stdout;
     throw e;
   } finally {
-    if (beforeDiscard) {
-      const id = conversationIdFrom(stdout);
-      if (id) await beforeDiscard(id);
-    }
-    if (discardConversation) await discardAgyConversation(stdout);
+    await finishConversation({ stdout, beforeDiscard, discardConversation, discard: discardAgyConversation });
   }
+}
+
+// What runAgy does with the conversation once the call is over: let
+// beforeDiscard copy results out, then delete the conversation unless
+// beforeDiscard returned true to keep it. `discard` is injectable for tests.
+export async function finishConversation({ stdout, beforeDiscard, discardConversation, discard }) {
+  let keepConversation = false;
+  if (beforeDiscard) {
+    const id = conversationIdFrom(stdout);
+    if (id) keepConversation = await beforeDiscard(id) === true;
+  }
+  if (discardConversation && !keepConversation) await discard(stdout);
 }
 
 export function conversationIdFrom(stdout) {
@@ -485,6 +495,7 @@ export async function agyGenerateImage({ prompt, model, effort, images, output_d
 
   let copied = [];
   let copyError = null;
+  let originalsDir = null;
   let run = null;
   let failure = null;
   try {
@@ -496,16 +507,29 @@ export async function agyGenerateImage({ prompt, model, effort, images, output_d
       label: 'agy image',
       discardConversation: true,
       beforeDiscard: (id) => {
-        try {
-          const found = findGeneratedImages(path.join(agyStoreRoot(), 'brain', id), referenceHashes);
-          if (found.length) copied = copyImagesTo(found, outDir);
-        } catch (e) { copyError = e; }
+        const saved = saveConversationImages({ brainDir: path.join(agyStoreRoot(), 'brain', id), referenceHashes, outDir });
+        ({ copied, copyError, originalsDir } = saved);
+        return saved.keepOriginals;
       }
     });
   } catch (e) {
     failure = e;
   }
-  return finishImageCall({ copied, copyError, failure, parsed: run?.parsed, latency_ms: run?.latency_ms, model, outDir, requested });
+  return finishImageCall({ copied, copyError, originalsDir, failure, parsed: run?.parsed, latency_ms: run?.latency_ms, model, outDir, requested });
+}
+
+// Copies a conversation's generated images out before it is discarded. A copy
+// error is returned, not thrown, with keepOriginals set so the caller leaves
+// the conversation in place and can say where the images still are.
+export function saveConversationImages({ brainDir, referenceHashes, outDir }) {
+  let copied = [];
+  try {
+    const found = findGeneratedImages(brainDir, referenceHashes);
+    if (found.length) copied = copyImagesTo(found, outDir);
+  } catch (copyError) {
+    return { copied, copyError, originalsDir: brainDir, keepOriginals: true };
+  }
+  return { copied, copyError: null, originalsDir: brainDir, keepOriginals: false };
 }
 
 // The result of an image call, decided from what was copied out and how agy
@@ -513,9 +537,9 @@ export async function agyGenerateImage({ prompt, model, effort, images, output_d
 // and returned with a warning, rather than lost behind the error.
 // `requested` (the call's image options) is echoed back, and a count agy fell
 // short of is a warning: a retry or a smaller ask may be what is needed.
-export function finishImageCall({ copied, copyError, failure, parsed, latency_ms, model, outDir, requested }) {
+export function finishImageCall({ copied, copyError, originalsDir, failure, parsed, latency_ms, model, outDir, requested }) {
   if (copyError && !copied.length) {
-    throw new Error(`agy made images but copying them to ${outDir} failed: ${copyError.code || copyError.message}`);
+    throw new Error(`agy made images but copying them to ${outDir} failed: ${copyError.code || copyError.message}. The originals are still in ${originalsDir}`);
   }
   const images = copied.map(({ source, ...image }) => image);
   const asked = requested ? { aspect_ratio: requested.aspect_ratio, tier: requested.tier, count: requested.count } : {};

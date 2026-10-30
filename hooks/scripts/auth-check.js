@@ -18,14 +18,20 @@ process.on('warning', (warning) => {
 });
 
 import { spawn } from 'node:child_process';
-import { resolveCmd, SPAWN_OPTS, spawnableCmd } from '../../mcp/lib/resolve-cmd.js';
+import fs from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { resolveCmd, missingMessage, SPAWN_OPTS, spawnableCmd } from '../../mcp/lib/resolve-cmd.js';
 import { loadSettings, runnerSettings, localConfigured } from '../../mcp/lib/settings.js';
+import { isLoopback } from '../../mcp/lib/local.js';
 import { fetchTags, modelFacts, resolveModel, savedNicknames } from '../../mcp/lib/local-models.js';
 import { runnerKey, swapStatus, resolveSwapModel, asOllamaSettings } from '../../mcp/lib/local-runners.js';
 
 function check(binPath, args, timeoutMs) {
   return new Promise((resolve) => {
-    const child = spawn(spawnableCmd(binPath), args, { stdio: ['ignore', 'pipe', 'pipe'], ...SPAWN_OPTS });
+    let child;
+    // spawnableCmd refuses a path cmd.exe cannot take safely; report it as a failed run.
+    try { child = spawn(spawnableCmd(binPath), args, { stdio: ['ignore', 'pipe', 'pipe'], ...SPAWN_OPTS }); }
+    catch (e) { resolve({ exit: 127, out: '', err: e.message }); return; }
     let out = '', err = '';
     child.stdout.on('data', d => { out += d.toString('utf8'); });
     child.stderr.on('data', d => { err += d.toString('utf8'); });
@@ -35,11 +41,21 @@ function check(binPath, args, timeoutMs) {
   });
 }
 
+// A CLI found only inside the project is not "not installed": say so, as
+// ensureCmd does for a tool call. `fallback` is the not-installed wording.
+export function missingCliWarning(name, resolved, fallback) {
+  if (resolved.refused) return `[consult] ${missingMessage(name, resolved.refused)}`;
+  return fallback;
+}
+
 // Only called when a local runner (or 0.11.0's local_model) is configured --
 // otherwise everyone without a local setup would get a warning every session
 // for a feature they don't use. Says what to do in one line.
-async function checkLocal(settings, timeoutMs) {
+export async function checkLocal(settings, timeoutMs) {
   const runner = runnerSettings(settings);
+  // A project file can name any address; the session start never contacts one
+  // off this machine (health.js guards the same way).
+  if (!isLoopback(runner.url)) return null;
   const label = runner.type ?? 'local runner';
   let key;
   try { key = await runnerKey(runner); }
@@ -116,12 +132,12 @@ async function main() {
     warnings.push(`[consult] settings: ${settingsWarnings[0]}${settingsWarnings.length > 1 ? ` (and ${settingsWarnings.length - 1} more; local_status lists them)` : ''}`);
   }
   if (!codex) {
-    warnings.push('[consult] codex CLI not found - install it or fix PATH to enable ask_codex.');
+    warnings.push(missingCliWarning('codex', codexBin, '[consult] codex CLI not found - install it or fix PATH to enable ask_codex.'));
   } else if (codex.exit !== 0 || /not\s+logged\s+in|signed\s+out/i.test(codex.out + codex.err)) {
     warnings.push('[consult] codex not authenticated - call MCP tool `codex_login_start` or run `codex login` in a terminal.');
   }
   if (!agy) {
-    warnings.push('[consult] agy (Antigravity) CLI not found - install from https://antigravity.google to enable ask_agy. If you just installed it, open a NEW terminal and start Claude Code from there: a terminal keeps the PATH it started with.');
+    warnings.push(missingCliWarning('agy', agyBin, '[consult] agy (Antigravity) CLI not found - install from https://antigravity.google to enable ask_agy. If you just installed it, open a NEW terminal and start Claude Code from there: a terminal keeps the PATH it started with.'));
   } else if (agy.exit !== 0) {
     warnings.push('[consult] agy CLI invocation failed - run `agy --version` to diagnose.');
   }
@@ -131,4 +147,22 @@ async function main() {
   process.exitCode = 0;
 }
 
-main().catch((e) => { try { process.stderr.write(`[consult] auth-check error: ${e.message}\n`); } catch (_) {} process.exitCode = 0; });
+// Run only when executed as the hook, so tests can import checkLocal. Both
+// paths go through realpath so a drive-letter case, an 8.3 short name or a
+// symlink in the hook's path cannot make the check silently never run.
+function runsAsScript() {
+  if (!process.argv[1]) return false;
+  try {
+    let invoked = fs.realpathSync.native(process.argv[1]);
+    let thisFile = fs.realpathSync.native(fileURLToPath(import.meta.url));
+    if (process.platform === 'win32') { invoked = invoked.toLowerCase(); thisFile = thisFile.toLowerCase(); }
+    return invoked === thisFile;
+  } catch (_) {
+    return false;
+  }
+}
+
+if (runsAsScript()) {
+  main().catch((e) => { try { process.stderr.write(`[consult] auth-check error: ${e.message}
+`); } catch (_) {} process.exitCode = 0; });
+}

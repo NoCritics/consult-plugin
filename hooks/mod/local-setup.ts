@@ -99,25 +99,16 @@ export function previewArgs(view: LocalSetupView): Record<string, unknown> | nul
   return changed ? args : null
 }
 
-// The line Claude reads (and the person sees as a toast) after a save.
-// `inUse` is the runner in use before the save; nicknames saved for another
-// runner are named with it, so nobody mistakes them for the ones in use.
-export function noteText(runner: string, written: Record<string, unknown>, inUse: string | null): string {
-  const madeInUse = 'local_runner' in written
-  const parts: string[] = []
-  for (const role of LOCAL_ROLES) {
-    const key = `${runner}.${role}`
-    if (!(key in written)) continue
-    const model = written[key]
-    const name = role === 'vision_best' ? 'vision-best' : role
-    const owner = madeInUse || inUse === runner ? '' : `${runner} `
-    parts.push(`${owner}${name} ${typeof model === 'string' ? model : 'none'}`)
-  }
-  let head: string
-  if (madeInUse) head = `consult: local runner now ${runner}`
-  else if (inUse === null) head = 'consult: no local runner in use'
-  else head = `consult: local runner still ${inUse}`
-  return parts.length === 0 ? head : `${head}; ${parts.join(', ')}`
+// The line Claude reads (and the person sees as a toast) after a save. Claude
+// gets it as a user-role row with no frame around it, so it is fixed text:
+// nothing the runner supplied (a model name, a nickname value) is repeated.
+// Only a runner type from this list is named. The other parameters are kept so
+// callers do not change; the text no longer uses them.
+const KNOWN_RUNNERS = ['llama-swap', 'ollama', 'lmstudio', 'llama-server', 'openai']
+
+export function noteText(runner: string, _written: Record<string, unknown>, _inUse: string | null): string {
+  const named = KNOWN_RUNNERS.includes(runner) ? runner : 'a local runner'
+  return `consult: local model settings were changed in the /consult pane (${named}). Call local_status to see the current models.`
 }
 
 // Takes in what the script showed: the runner and, where unset, each picker's start.
@@ -177,6 +168,7 @@ async function previewNow($: EngineInterface): Promise<void> {
   }
   await update($, localAtom, current => ({ ...current, previewing: true }))
   const answer = await runSetlocal($, ['preview', JSON.stringify(args)], PREVIEW_LIMIT_MS)
+  let pickersFilled = false
   await update($, localAtom, current => {
     if (current.changeSeq !== seq) return current
     if ('error' in answer) return { ...current, previewing: false, diff: null, error: answer.error }
@@ -184,8 +176,16 @@ async function previewNow($: EngineInterface): Promise<void> {
     // A preview answers with everything show does: an address or key
     // variable just typed may have made the runner's models readable.
     const next = Array.isArray(answer.json.probe) ? withShown(current, answer.json as unknown as LocalShow) : current
+    for (const role of LOCAL_ROLES) {
+      if (current.picks[role] === '' && next.picks[role] !== '') pickersFilled = true
+    }
+    // The args this preview was built from had no picks, so its diff lacks
+    // the nicknames Save would now write: it goes, and the preview runs again.
+    if (pickersFilled) return { ...next, changeSeq: current.changeSeq + 1, error: null, diff: null }
     return { ...next, previewing: false, error: null, diff: preview?.diff ?? [] }
   })
+  // Once only: the picks are filled now, so the second answer cannot fill them again.
+  if (pickersFilled) await previewNow($)
 }
 
 let previewTimer: { cancel: () => void } | null = null

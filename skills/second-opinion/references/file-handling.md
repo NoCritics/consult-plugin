@@ -146,9 +146,9 @@ Tell the user immediately. Don't guess at a corrected path. Example:
 
 ### Binary file
 
-Reading binary files yields garbage that breaks the prompt. Detect via extension (`.png`, `.jpg`, `.pdf`, `.zip`, `.so`, `.dll`, `.exe`, `.bin`, etc.) OR via Read failure on a file that isn't valid UTF-8. Tell the user:
+Reading binary files yields garbage that breaks the prompt. Detect via extension (`.pdf`, `.zip`, `.so`, `.dll`, `.exe`, `.bin`, etc.) OR via Read failure on a file that isn't valid UTF-8. Images (`.png .jpg .jpeg .gif .webp`) are not inlined as text: pass them in `images` for codex, agy and local. For other binary files, tell the user:
 
-> `assets/logo.png` is a binary file - I can't inline it as text. What should I extract from it (e.g., dimensions, metadata)? Or did you mean a different file?
+> `assets/data.bin` is a binary file - I can't inline it as text. What should I extract from it (e.g., dimensions, metadata)? Or did you mean a different file?
 
 ### Size thresholds
 

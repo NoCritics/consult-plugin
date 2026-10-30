@@ -258,7 +258,10 @@ export function needsAttention(task) {
   return task.reported_at === null && task.state !== 'merged' && task.state !== 'cancelled';
 }
 
+// final.md counts only when the task's latest run recorded it: a run that failed
+// leaves final_path null, and an older run's answer is not its own.
 function readFinalMessage(task) {
+  if (!task.final_path) return null;
   try {
     return fs.readFileSync(path.join(taskFolder(task.id), 'final.md'), 'utf8');
   } catch (_) {
@@ -744,6 +747,8 @@ async function sendTool(args, context) {
       followup: message, state: 'queued', supervisor_pid: null, supervisor_beat_at: null, queued_at: queuedAt, reported_at: null,
       merge_result: null, owner_instance: context.instanceId ?? null, owner_session: context.sessionId ?? null,
       queue_waiting_long: false, skipped_by: 0, relaunched: false,
+      // The follow-up has no answer yet: a run that ends before the worker starts must not show the old one.
+      final_path: null,
       // A clear whose mark expired must not finish on a task that is running again.
       clearing: false, clearing_at: null, clearing_token: null
     };
@@ -757,10 +762,15 @@ async function sendTool(args, context) {
   let cancelText = null;
   try { cancelText = fs.readFileSync(cancelPath, 'utf8'); } catch (_) { /* no cancel file */ }
   fs.rmSync(cancelPath, { force: true });
+  const finalPath = path.join(taskFolder(task.id), 'final.md');
+  let finalText = null;
+  try { finalText = fs.readFileSync(finalPath, 'utf8'); } catch (_) { /* no earlier answer */ }
+  fs.rmSync(finalPath, { force: true });
   try {
     launch(context, task.id);
   } catch (error) {
     updateTask(task.id, previous);
+    if (finalText !== null) fs.writeFileSync(finalPath, finalText);
     if (cancelText !== null) fs.writeFileSync(cancelPath, cancelText);
     throw new Error(`Could not start the task's supervisor: ${error.message}`);
   }

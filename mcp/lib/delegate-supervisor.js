@@ -17,7 +17,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn, execFile, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { ensureCmd, SPAWN_OPTS, spawnableCmd } from './resolve-cmd.js';
+import { ensureCmd, isInsideFolder, missingMessage, SPAWN_OPTS, spawnableCmd } from './resolve-cmd.js';
 import { shellSafeArgs, killTree, killPidTree } from './spawn-cli.js';
 import { scrubPii, oneLine } from './util.js';
 import { loadSettings, runnerSettings } from './settings.js';
@@ -397,6 +397,8 @@ async function recordEnd(context, outcome) {
     if (outcome.limitHit) changes.limit_hit = outcome.limitHit;
     if (context.killAbandoned) summary += ` The worker (pid ${context.workerPid}) may still be running.`;
     if (outcome.denied && outcome.denied.length > 0) changes.denied = outcome.denied;
+    // agy's own error text: scrubbed and capped like a failure summary.
+    if (outcome.warning) addWarning(oneLine(scrubPii(context.redact(outcome.warning)), FAILURE_SUMMARY_MAX_CHARS));
     if (outcome.finalMessage) {
       try {
         const finalPath = path.join(context.folder, 'final.md');
@@ -417,7 +419,7 @@ async function recordEnd(context, outcome) {
       const settled = await settleUnfinished(context, current, outcome, changes.end_commit);
       changes.state = settled.state;
       if (settled.summary !== undefined) summary = settled.summary;
-      if (settled.warning !== undefined) addWarning(settled.warning);
+      if (settled.warning !== undefined) addWarning(oneLine(scrubPii(context.redact(settled.warning)), FAILURE_SUMMARY_MAX_CHARS));
       if (settled.problem !== undefined) summary += settled.problem;
     }
     if (context.recordingProblem !== null) summary += ` (log problem: ${oneLine(context.recordingProblem, 80)})`;
@@ -483,11 +485,15 @@ function outcomeOfRun(context, exit, parsed, rolloutLimits) {
       state: 'paused-limit', summary: `Paused: ${task.worker} ${what}${resets}.`
     };
   }
-  const base = { session: parsed.session, limit: windows, denied: parsed.denied, finalMessage: parsed.finalMessage, limitHit: rolloutLimits.limitHit };
+  const base = { session: parsed.session, limit: windows, denied: parsed.denied, finalMessage: parsed.finalMessage, limitHit: rolloutLimits.limitHit, warning: parsed.warning ?? null };
   if (parsed.error !== null) {
     // An agy run that exited 0 with no summary, only refused commands: recordEnd settles it once the copy is looked at.
     const onlyRefused = parsed.refusedOnly === true && exit.code === 0 && parsed.finalMessage === null;
     return { ...base, state: onlyRefused ? 'unfinished' : 'failed', summary: oneLine(parsed.error, FAILURE_SUMMARY_MAX_CHARS) };
+  }
+  // agy 1.2.10+ exits 3 on its ERROR result, so a complete answer with a warning is done whatever the code.
+  if (parsed.warning && parsed.finalMessage !== null) {
+    return { ...base, state: task.hold ? 'held' : 'done', summary: summaryLine(parsed.finalMessage) ?? 'Finished with no final message.' };
   }
   if (exit.code === 0 && parsed.complete) {
     const line = parsed.finalMessage === null ? null : summaryLine(parsed.finalMessage);
@@ -512,6 +518,15 @@ function childEnvironment(command, key) {
   return environment;
 }
 
+// Throws when the worker's program lies inside one of the task's folders.
+export function refuseProgramInsideProject(program, name, folders) {
+  for (const folder of folders) {
+    if (typeof folder === 'string' && folder !== '' && isInsideFolder(program, folder)) {
+      throw new Error(missingMessage(name, program));
+    }
+  }
+}
+
 // Spawns the worker as spawn-cli.js does. CONSULT_DELEGATE_TEST_BIN (the
 // supervisor's own environment only) swaps the worker's binary for a script
 // run by node, or for any other program.
@@ -525,6 +540,9 @@ function spawnWorker(task, command, environment) {
     args = isScript ? [testBin, ...command.args] : command.args;
   } else {
     program = ensureCmd(CLI_NAMES[task.worker]);
+    // resolveCmd filtered against this process's cwd (the task folder); the
+    // project and its copy are what a planted CLI would sit in.
+    refuseProgramInsideProject(program, CLI_NAMES[task.worker], [task.project, task.worktree]);
     args = command.args;
   }
   return spawn(spawnableCmd(program), shellSafeArgs(args), {
@@ -561,6 +579,8 @@ async function runWorker(context, command, childEnvironmentValues) {
   context.spawnedAtWall = Date.now();
   context.startedAt = context.now();
   context.lastOutputAt = context.startedAt;
+  // The previous run's answer goes too: delegate_result reads final.md only when this run wrote one.
+  attempt(() => io.removeFile(path.join(context.folder, 'final.md')));
   // The run's own fields start clean: nothing an earlier run (a follow-up has
   // one) recorded about its outcome carries over. worker_session stays: it is
   // what a follow-up resumes.
@@ -755,7 +775,7 @@ export async function runSupervisor(taskId, options = {}) {
     sawOutput: false, realWorkerSearched: false, preRunBeat: null, readOnlyEdits: [], survivorWarning: null,
     timeLimitMs: DEFAULT_TIME_LIMIT_MS,
     now: options.now ?? Date.now,
-    io: { updateTask, appendFile: fs.appendFileSync, killTree, rolloutLimits: codexRolloutLimits, recordLimit, recordLimitHit, ...options.io },
+    io: { updateTask, appendFile: fs.appendFileSync, removeFile: (file) => fs.rmSync(file, { force: true }), killTree, rolloutLimits: codexRolloutLimits, recordLimit, recordLimitHit, ...options.io },
     watchdogMs: timingValue(options.watchdogMs, 'CONSULT_DELEGATE_WATCHDOG_MS', WATCHDOG_MS, MIN_WATCHDOG_MS),
     pollMs: timingValue(options.pollMs, 'CONSULT_DELEGATE_POLL_MS', POLL_MS, MIN_POLL_MS),
     killGiveUpMs: options.killGiveUpMs ?? KILL_GIVE_UP_MS,

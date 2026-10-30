@@ -16,7 +16,7 @@ Send a prompt to Codex (OpenAI) via the `consult` MCP server and show the clean 
 2. If `$ARGUMENTS` is empty, ask: "What should I ask Codex?" and stop. Do not invent a prompt.
 
 3. **Detect any file references in `$ARGUMENTS` and inline them.** See the "File handling" section below. Build the final prompt with file blocks first, the user's question last.
-4. Call `mcp__plugin_consult_consult__ask_codex` with `{ prompt: <built prompt> }`, plus `timeout_s` when `--timeout` was given.
+4. Call `mcp__plugin_consult_consult__ask_codex` with `{ prompt: <built prompt> }`, plus `images` when step 1 collected any and `timeout_s` when `--timeout` was given.
 5. Format the result for the user as:
 
 ```
@@ -40,6 +40,6 @@ Codex (the subprocess) has no access to your filesystem. Inline any file the use
 
 ## Notes
 
-- Codex runs in read-only sandbox - it cannot touch the filesystem (which is why inlining files is mandatory).
+- Codex runs in a read-only sandbox by default - it cannot touch the filesystem (which is why inlining files is mandatory). The `codex_sandbox` setting can grant `workspace-write` or `danger-full-access`.
 - Long prompts are fine; they're piped via stdin.
 - Do NOT pass a `model` argument unless the user explicitly named one.

@@ -33,6 +33,7 @@ import { codexGenerateImage } from './lib/codex-image.js';
 import { CODEX_IMAGE_ASPECT_RATIOS } from './lib/image.js';
 import { askAgy, agyChatStart, agyChatSend, agyChatEnd, agyStatus, agyGenerateImage, AGY_EFFORTS, AGY_IMAGE_ASPECT_RATIOS, AGY_IMAGE_TIERS } from './lib/agy.js';
 import { askLocal, localStatus } from './lib/local.js';
+import { killAllCliChildren } from './lib/spawn-cli.js';
 import { liveFacts, savedNicknames, resolveModel } from './lib/local-models.js';
 import {
   RUNNER_TYPES, runnerKey, runnerInventory, prepareRunnerCall, checkDoubleLoad, forgetCachedKey, swapStatus,
@@ -875,6 +876,19 @@ process.stderr.write(
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
+
+// POSIX CLI children are detached (own process group), so a closed terminal or
+// a stopped host no longer reaches them: stop them here. The signals also end
+// the server, which Node would otherwise do on its own.
+process.on('exit', () => killAllCliChildren());
+for (const signalName of ['SIGTERM', 'SIGINT', 'SIGHUP']) {
+  process.on(signalName, () => {
+    killAllCliChildren();
+    process.exit(0);
+  });
+}
+// The MCP transport closing (the host went away) is stdin ending.
+process.stdin.on('end', () => killAllCliChildren());
 
 // The heartbeat tells a delegate supervisor that this session is alive; the
 // sweeps run once now and then every minute. Each is guarded, none can crash the
