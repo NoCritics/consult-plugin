@@ -262,8 +262,10 @@ export function leftoverRoots(shellPid, workerRealPid) {
 // supervisor, explorer, an editor started before the run) is not listed: it is
 // the person's. A process that does not name the folder (a launcher that was
 // given a relative path) is found only through one that does.
-// The folder comes in CONSULT_ORPHAN_FOLDER, never in the script's text: PowerShell
-// ends a quoted string at ' and at the curly quotes too. Pids and times are numbers.
+// The folder comes in CONSULT_ORPHAN_FOLDER (and its real long path, when it
+// differs, in CONSULT_ORPHAN_FOLDER_REAL; see orphanFolderEnv), never in the
+// script's text: PowerShell ends a quoted string at ' and at the curly quotes
+// too. Pids and times are numbers.
 export function orphanScript(startedAtMs, workerTreePids = []) {
   const treePids = [];
   for (const pid of workerTreePids) {
@@ -272,8 +274,9 @@ export function orphanScript(startedAtMs, workerTreePids = []) {
   return (
     `$start = [DateTimeOffset]::FromUnixTimeMilliseconds(${Math.floor(startedAtMs)}).LocalDateTime; ` +
     `$tree = @(${treePids.join(',')}); ` +
-    '$folder = $env:CONSULT_ORPHAN_FOLDER; ' +
-    String.raw`$pattern = '(?i)' + [regex]::Escape($folder) + '(?=$|[/"''\s\\])'; ` +
+    '$folders = @($env:CONSULT_ORPHAN_FOLDER); if ($env:CONSULT_ORPHAN_FOLDER_REAL) { $folders += $env:CONSULT_ORPHAN_FOLDER_REAL }; ' +
+    '$escaped = foreach ($folder in $folders) { [regex]::Escape($folder) }; ' +
+    String.raw`$pattern = '(?i)(?:' + ($escaped -join '|') + ')(?=$|[/"''\s\\])'; ` +
     '$all = Get-CimInstance Win32_Process; $byId = @{}; foreach ($p in $all) { $byId[[int]$p.ProcessId] = $p }; ' +
     '$tops = @{}; ' +
     // Windows' own shell hosts (explorer restarted mid-run is newer than the
@@ -293,6 +296,17 @@ export function orphanScript(startedAtMs, workerTreePids = []) {
   );
 }
 
+// A launcher names the folder as consult has it or by its real long path (the
+// folder reached through an 8.3 short name or a junction): both are looked for.
+export function orphanFolderEnv(folder) {
+  const env = { CONSULT_ORPHAN_FOLDER: folder };
+  try {
+    const real = fs.realpathSync.native(folder);
+    if (real.toLowerCase() !== folder.toLowerCase()) env.CONSULT_ORPHAN_FOLDER_REAL = real;
+  } catch (_) { /* a folder that is gone is looked for as written */ }
+  return env;
+}
+
 export function parseProcessRows(output) {
   const rows = [];
   for (const line of output.split(/\r?\n/)) {
@@ -310,7 +324,7 @@ function handleOrphans(context, task, folder, shellPid) {
   if (process.platform !== 'win32' || context.spawnedAtWall === null) return;
   let rows;
   try {
-    rows = parseProcessRows(runPowerShellSync(orphanScript(context.spawnedAtWall, [shellPid, context.workerRealPid]), { timeoutMs: POWERSHELL_TIMEOUT_MS, extraEnv: { CONSULT_ORPHAN_FOLDER: folder } }));
+    rows = parseProcessRows(runPowerShellSync(orphanScript(context.spawnedAtWall, [shellPid, context.workerRealPid]), { timeoutMs: POWERSHELL_TIMEOUT_MS, extraEnv: orphanFolderEnv(folder) }));
   } catch (_) {
     return; // could not look; the task's record is still written
   }

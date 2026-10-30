@@ -11,7 +11,9 @@ All notable changes to this plugin are documented here. Format loosely follows [
 ### Fixed
 
 - **A home folder reached through a link is still the home folder.** When the home folder was reached through a symlink or junction (macOS's `/var` is `/private/var`), starting in it read `~/.claude/consult.local.md` as a project file and warned about it.
-- The tests now pass on Linux and macOS. The mod's tests resolved their Windows-style paths there, and the git-hook test scripts weren't executable.
+- **On macOS, a worker left running by a supervisor that died is now stopped.** The start-up sweep checked the worker's age with `ps -o etimes`, which macOS's `ps` doesn't have, so it never stopped the worker. It now uses `etime`, which Linux and macOS both have.
+- **On Windows, a delegate's leftover process is found even when its command line names the task folder by its real long path.** A dev server a copy task left behind is stopped (an in-place task's is named in a warning) whether the folder was written with an 8.3 short name, through a junction or in full.
+- The tests now pass on Linux and macOS. The mod's tests resolved their Windows-style paths there, the git-hook test scripts weren't executable, the fake worker's grandchild left the worker's process group, and three checks relied on Windows timings.
 
 ### Added
 

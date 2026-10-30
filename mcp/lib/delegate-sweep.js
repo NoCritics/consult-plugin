@@ -15,7 +15,7 @@ import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { scanTasks, indexRows, updateTaskWhen, isProcessAlive, isAlive, beat, projectKey, dataHome, ACTIVE_STATES, refreshIndex } from './delegate-store.js';
 import { gitState, endSnapshot, pruneOrphans } from './delegate-git.js';
-import { launchSupervisor, descendantScript, parsePids, orphanScript, parseProcessRows, runPowerShell } from './delegate-supervisor.js';
+import { launchSupervisor, descendantScript, parsePids, orphanScript, orphanFolderEnv, parseProcessRows, runPowerShell } from './delegate-supervisor.js';
 
 // A supervisor beats at least every 10 s; over this long without a beat, a pid
 // that is alive may be someone else's (the pid was reused).
@@ -110,6 +110,17 @@ async function killProcess(pid) {
   await capture('taskkill', ['/PID', String(pid), '/F']);
 }
 
+// A process's age from `ps -o etime=` ([[dd-]hh:]mm:ss), in seconds, or null.
+// etime is the elapsed-time field both procps (Linux) and BSD ps (macOS) have;
+// etimes is Linux's alone.
+export function elapsedSeconds(text) {
+  const match = /^\s*(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)\s*$/.exec(text ?? '');
+  if (match === null) return null;
+  const days = Number(match[1] ?? 0);
+  const hours = Number(match[2] ?? 0);
+  return ((days * 24 + hours) * 60 + Number(match[3])) * 60 + Number(match[4]);
+}
+
 // Kills what a dead supervisor left running: the worker (the shell, and the real
 // worker found under it) and everything that descends from them since the run
 // started, each by pid from a list worked out here. On Windows a recorded pid is
@@ -120,10 +131,9 @@ async function killOrphanedWorker(task, now) {
   if (typeof task.started_at !== 'number') return;
   if (process.platform !== 'win32') {
     if (typeof task.worker_pid !== 'number') return;
-    const elapsed = await capture('ps', ['-p', String(task.worker_pid), '-o', 'etimes=']);
-    const processAgeSeconds = Number(elapsed);
+    const processAgeSeconds = elapsedSeconds(await capture('ps', ['-p', String(task.worker_pid), '-o', 'etime=']));
     const runAgeSeconds = (now - task.started_at) / 1000;
-    if (elapsed === null || !Number.isFinite(processAgeSeconds) || processAgeSeconds < runAgeSeconds - WORKER_STARTED_BEFORE_MS / 1000) return;
+    if (processAgeSeconds === null || processAgeSeconds < runAgeSeconds - WORKER_STARTED_BEFORE_MS / 1000) return;
     try { process.kill(-task.worker_pid, 'SIGKILL'); } catch (_) { /* no group left */ }
     return;
   }
@@ -149,7 +159,7 @@ async function killRecordedTree(task, recordedRoots) {
 }
 
 async function killCopyLeftovers(task, recordedRoots) {
-  const output = await powershell(orphanScript(task.started_at - DESCENDANT_STARTED_BEFORE_MS, recordedRoots), { CONSULT_ORPHAN_FOLDER: task.worktree });
+  const output = await powershell(orphanScript(task.started_at - DESCENDANT_STARTED_BEFORE_MS, recordedRoots), orphanFolderEnv(task.worktree));
   if (output === null) return;
   for (const row of parseProcessRows(output)) await capture('taskkill', ['/PID', String(row.pid), '/T', '/F']);
 }

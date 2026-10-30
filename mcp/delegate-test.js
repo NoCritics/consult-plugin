@@ -248,7 +248,11 @@ try {
     const exited = new Promise(resolve => reader.on('close', resolve));
     const startedAt = Date.now();
     while (!output.includes('ready') && Date.now() - startedAt < 10000) await new Promise(resolve => setTimeout(resolve, 20));
-    for (let count = 0; count < 50; count++) updateTask(task.id, { summary: `update ${count}`, last_output_at: count });
+    // Spread over about half a second, so a slow machine's reader still reads many times while they land.
+    for (let count = 0; count < 50; count++) {
+      updateTask(task.id, { summary: `update ${count}`, last_output_at: count });
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
     await new Promise(resolve => setTimeout(resolve, 100));
     fs.writeFileSync(stopFile, '');
     await exited;
@@ -4050,6 +4054,20 @@ try {
         }
       });
 
+      guarded('supervisor: orphanFolderEnv gives the real path too', () => {
+        const realFolder = fs.mkdtempSync(path.join(scratch, 'orphan-real-'));
+        const linkedFolder = `${realFolder}-link`;
+        fs.symlinkSync(realFolder, linkedFolder, process.platform === 'win32' ? 'junction' : 'dir');
+        try {
+          const realKey = fs.realpathSync.native(realFolder);
+          eq('orphanFolderEnv: a folder through a link is looked for by both paths', supervisorModule.orphanFolderEnv(linkedFolder), { CONSULT_ORPHAN_FOLDER: linkedFolder, CONSULT_ORPHAN_FOLDER_REAL: realKey });
+          eq('orphanFolderEnv: a folder that is its own real path is given once', supervisorModule.orphanFolderEnv(realKey), { CONSULT_ORPHAN_FOLDER: realKey });
+          eq('orphanFolderEnv: a folder that is gone is looked for as written', supervisorModule.orphanFolderEnv(path.join(scratch, 'no such folder')), { CONSULT_ORPHAN_FOLDER: path.join(scratch, 'no such folder') });
+        } finally {
+          if (process.platform === 'win32') fs.rmdirSync(linkedFolder); else fs.unlinkSync(linkedFolder);
+        }
+      });
+
       guarded('supervisor: exports the sweep reuses', () => {
         eq('descendantScript, parsePids and copyWorkFolder are exported', [typeof supervisorModule.descendantScript, typeof supervisorModule.parsePids, typeof supervisorModule.copyWorkFolder], ['function', 'function', 'function']);
         if (typeof supervisorModule.parsePids === 'function') eq('parsePids: the numeric rows only', supervisorModule.parsePids('12\r\nabc\n 34 \n'), [12, 34]);
@@ -4912,6 +4930,13 @@ try {
 
       // ---- dead supervisors and the startup sweeps ----
       if (sweepModule !== null) {
+        await guardedAsync('sweep: elapsedSeconds reads ps etime, which macOS has and etimes is not', async () => {
+          eq('elapsedSeconds: mm:ss, hh:mm:ss and dd-hh:mm:ss',
+            [sweepModule.elapsedSeconds('   00:05\n'), sweepModule.elapsedSeconds('01:02:03'), sweepModule.elapsedSeconds('2-01:02:03')],
+            [5, 3723, 2 * 86400 + 3723]);
+          eq('elapsedSeconds: nothing readable is null', [sweepModule.elapsedSeconds(null), sweepModule.elapsedSeconds(''), sweepModule.elapsedSeconds('12345')], [null, null, null]);
+        });
+
         // The sweeps look at every task in the data folder: each section has its own. The
         // bookkeeping cases use a process lookup that is injected (io); the real
         // PowerShell lookups are exercised by one kill test and one command-line check.
