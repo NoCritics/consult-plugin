@@ -4063,6 +4063,10 @@ try {
           eq('orphanFolderEnv: a folder through a link is looked for by both paths', supervisorModule.orphanFolderEnv(linkedFolder), { CONSULT_ORPHAN_FOLDER: linkedFolder, CONSULT_ORPHAN_FOLDER_REAL: realKey });
           eq('orphanFolderEnv: a folder that is its own real path is given once', supervisorModule.orphanFolderEnv(realKey), { CONSULT_ORPHAN_FOLDER: realKey });
           eq('orphanFolderEnv: a folder that is gone is looked for as written', supervisorModule.orphanFolderEnv(path.join(scratch, 'no such folder')), { CONSULT_ORPHAN_FOLDER: path.join(scratch, 'no such folder') });
+          // A worker that swapped its copy for a link to another folder must not point the cleanup there.
+          eq('orphanFolderEnv: a real path still inside the copies folder is looked for', supervisorModule.orphanFolderEnv(linkedFolder, { within: scratch }), { CONSULT_ORPHAN_FOLDER: linkedFolder, CONSULT_ORPHAN_FOLDER_REAL: realKey });
+          const elsewhere = fs.mkdtempSync(path.join(scratch, 'copies-root-'));
+          eq('orphanFolderEnv: a real path that leaves the copies folder is not', supervisorModule.orphanFolderEnv(linkedFolder, { within: elsewhere }), { CONSULT_ORPHAN_FOLDER: linkedFolder });
         } finally {
           if (process.platform === 'win32') fs.rmdirSync(linkedFolder); else fs.unlinkSync(linkedFolder);
         }

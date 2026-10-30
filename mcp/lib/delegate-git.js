@@ -266,7 +266,7 @@ export async function endSnapshot(worktree, project, startCommit) {
   return snapshotOf(worktree, await trustedWorktreeLocation(project, worktree), startCommit);
 }
 
-function worktreesRoot() {
+export function worktreesRoot() {
   return path.join(dataHome(), 'worktrees');
 }
 

@@ -23,7 +23,7 @@ import { scrubPii, oneLine } from './util.js';
 import { loadSettings, runnerSettings } from './settings.js';
 import { readKey, runnerInventory } from './local-runners.js';
 import { workerCommand, parseWorkerStream, noteStepEvent, codexRolloutLimits, deniedNames } from './delegate-workers.js';
-import { gitState, endSnapshot, changedFiles, watchFolder, diffWatch } from './delegate-git.js';
+import { gitState, endSnapshot, changedFiles, watchFolder, diffWatch, isOutside, worktreesRoot } from './delegate-git.js';
 import { recordLimit, recordLimitHit, hitKindOf } from './delegate-limits.js';
 import { readTask, updateTask, updateTaskWhen, taskFolder, isAlive, isSessionAlive, isProcessAlive, isSupervisorLive, unmergedBase } from './delegate-store.js';
 
@@ -298,11 +298,16 @@ export function orphanScript(startedAtMs, workerTreePids = []) {
 
 // A launcher names the folder as consult has it or by its real long path (the
 // folder reached through an 8.3 short name or a junction): both are looked for.
-export function orphanFolderEnv(folder) {
+// With `within` (consult's copies folder, for a copy task) the real path counts
+// only while it is still inside it: a worker that swapped its copy for a link
+// to another folder must not point the cleanup there.
+export function orphanFolderEnv(folder, { within = null } = {}) {
   const env = { CONSULT_ORPHAN_FOLDER: folder };
   try {
     const real = fs.realpathSync.native(folder);
-    if (real.toLowerCase() !== folder.toLowerCase()) env.CONSULT_ORPHAN_FOLDER_REAL = real;
+    if (real.toLowerCase() === folder.toLowerCase()) return env;
+    if (within !== null && isOutside(fs.realpathSync.native(within), real)) return env;
+    env.CONSULT_ORPHAN_FOLDER_REAL = real;
   } catch (_) { /* a folder that is gone is looked for as written */ }
   return env;
 }
@@ -324,7 +329,7 @@ function handleOrphans(context, task, folder, shellPid) {
   if (process.platform !== 'win32' || context.spawnedAtWall === null) return;
   let rows;
   try {
-    rows = parseProcessRows(runPowerShellSync(orphanScript(context.spawnedAtWall, [shellPid, context.workerRealPid]), { timeoutMs: POWERSHELL_TIMEOUT_MS, extraEnv: orphanFolderEnv(folder) }));
+    rows = parseProcessRows(runPowerShellSync(orphanScript(context.spawnedAtWall, [shellPid, context.workerRealPid]), { timeoutMs: POWERSHELL_TIMEOUT_MS, extraEnv: orphanFolderEnv(folder, { within: task.location === 'copy' ? worktreesRoot() : null }) }));
   } catch (_) {
     return; // could not look; the task's record is still written
   }

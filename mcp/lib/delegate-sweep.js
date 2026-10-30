@@ -14,7 +14,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { scanTasks, indexRows, updateTaskWhen, isProcessAlive, isAlive, beat, projectKey, dataHome, ACTIVE_STATES, refreshIndex } from './delegate-store.js';
-import { gitState, endSnapshot, pruneOrphans } from './delegate-git.js';
+import { gitState, endSnapshot, pruneOrphans, worktreesRoot } from './delegate-git.js';
 import { launchSupervisor, descendantScript, parsePids, orphanScript, orphanFolderEnv, parseProcessRows, runPowerShell } from './delegate-supervisor.js';
 
 // A supervisor beats at least every 10 s; over this long without a beat, a pid
@@ -159,7 +159,7 @@ async function killRecordedTree(task, recordedRoots) {
 }
 
 async function killCopyLeftovers(task, recordedRoots) {
-  const output = await powershell(orphanScript(task.started_at - DESCENDANT_STARTED_BEFORE_MS, recordedRoots), orphanFolderEnv(task.worktree));
+  const output = await powershell(orphanScript(task.started_at - DESCENDANT_STARTED_BEFORE_MS, recordedRoots), orphanFolderEnv(task.worktree, { within: worktreesRoot() }));
   if (output === null) return;
   for (const row of parseProcessRows(output)) await capture('taskkill', ['/PID', String(row.pid), '/T', '/F']);
 }
