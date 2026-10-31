@@ -69,7 +69,7 @@ function indexReads(w: World): number {
 }
 
 function watch(w: World): DelegateWatch {
-  return (w.state.delegate as DelegateWatch | undefined) ?? { owned: [], elsewhere: [], earlierSessions: [] }
+  return (w.state.delegate as DelegateWatch | undefined) ?? { owned: [], elsewhere: [], earlierSessions: [], band: [] }
 }
 
 function doneText(id: string): string {

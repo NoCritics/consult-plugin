@@ -197,10 +197,16 @@ export type HistoryEntry = Omit<CallRecord, 'limitMs'> & { sessionId: string; du
 // own to report it: the Delegated tab says "open a session there to merge".
 export type DelegateElsewhere = { id: string; project: string; worker: string; title: string; state: string }
 
+// An owned task as the band shows it: queued or running, or ended while the
+// band showed it (until the person's next prompt). startedAt is null while
+// it is queued; limitMs is null in an index row from before 0.15.4.
+export type BandTask = { id: string; worker: string; model: string | null; state: string; startedAt: number | null; endedAt: number | null; limitMs: number | null }
+
 // What the delegate watcher keeps: the ids of the tasks this session owns (the
-// ones it started, and orphans it picked up; oldest first, at most 200), and
-// the other projects' ended tasks.
-export type DelegateWatch = { owned: string[]; elsewhere: DelegateElsewhere[]; earlierSessions: string[] }
+// ones it started, and orphans it picked up; oldest first, at most 200), the
+// other projects' ended tasks, and the owned tasks the band shows (absent in
+// a session's state from before 0.15.4).
+export type DelegateWatch = { owned: string[]; elsewhere: DelegateElsewhere[]; earlierSessions: string[]; band?: BandTask[] }
 
 declare module 'claude-code' {
   interface PluginState {

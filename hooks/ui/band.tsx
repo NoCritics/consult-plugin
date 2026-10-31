@@ -1,51 +1,149 @@
 import { atom, read } from 'claude-code'
-import type { On } from 'claude-code'
+import type { EngineInterface, On } from 'claude-code'
 
-import type { CallRecord } from '../../types'
+import type { BandTask, CallRecord } from '../../types'
 import { cancelCall } from '../mod/calls'
-import { barColor, fitText, formatClock, formatDuration, progressBar } from '../mod/format'
+import { cancelTaskFromBand, isActiveState } from '../mod/delegated'
+import { barColor, fitText, formatClock, formatDuration, formatElapsed, progressBar } from '../mod/format'
+import { kindOfTool } from '../mod/outcome'
+import { INITIAL_DELEGATE } from '../mod/state'
 import { openPaneOn } from './pane'
 
-// The band above the prompt: one row per running consult call with its bar
-// and Cancel, then the Answers button; after the last one ends, one slim row
-// until the next prompt. With nothing to show, the engine's own band.
+// The band above the prompt: one row per running consult call and per running
+// delegated task, with its bar and Cancel, then the Answers button; after the
+// last one ends, one slim row until the next prompt. With nothing to show, the
+// engine's own band.
 
 const callsAtom = atom({ plugin: 'consult', key: 'calls' } as const, [] as CallRecord[])
 const finishedAtom = atom({ plugin: 'consult', key: 'finished' } as const, [] as string[])
 const tickAtom = atom({ plugin: 'consult', key: 'tick' } as const, 0)
+const watchAtom = atom({ plugin: 'consult', key: 'delegate' } as const, INITIAL_DELEGATE)
 
-const LABEL_WIDTH = 28
+const LABEL_WIDTH = 32
 const BAR_WIDTH = 15
+const SHORT_LABEL_WIDTH = 16
+const MIN_LABEL_WIDTH = 10
+const MIN_BAR_WIDTH = 5
 const BUTTONS_WIDTH = 12
+const PREFIX = 'consult  '
+const CLOCK_WIDTH = 13
+// A running row around its label and bar: the prefix, the space after the
+// label, the clock with a space before and two after, and `[ Cancel ]`.
+const ROW_FIXED_WIDTH = PREFIX.length + 1 + (1 + CLOCK_WIDTH + 2) + '[ Cancel ]'.length
 // The rounded grey frame, as compact-view's band: two border columns and one
 // column of padding on each side.
 const FRAME_COLOR = 'inactive'
 const FRAME_WIDTH = 4
 
+// How an ended task reads in the finished row, and whether it is a ✓.
+const TASK_ENDINGS: Record<string, { text: string; isGood: boolean }> = {
+  done: { text: 'finished', isGood: true },
+  held: { text: 'finished, held for review', isGood: true },
+  merged: { text: 'merged', isGood: true },
+  failed: { text: 'failed', isGood: false },
+  stopped: { text: 'stopped', isGood: false },
+  conflict: { text: 'merge conflict', isGood: false },
+  'paused-limit': { text: 'paused at its usage limit', isGood: false },
+  cancelled: { text: 'cancelled', isGood: false },
+}
+
+// fraction is null for a task with no limit: its row has no bar.
+type RunningRow = { key: string; label: string; fraction: number | null; clock: string; cancel: () => Promise<void> }
+type FinishedItem = { isGood: boolean; isTask: boolean; head: string; tail: string }
+
+// A call's kind, provider and model, as both its rows start.
+function callParts(call: CallRecord): string[] {
+  const parts = [call.provider, call.model ?? 'default']
+  const kind = kindOfTool(call.tool)
+  if (kind !== null) parts.unshift(kind)
+  return parts
+}
+
 function callLabel(call: CallRecord): string {
   if (call.provider === 'council') return `council · ${call.members.join(' ')}`
-  const parts = [call.provider, call.model ?? 'default']
+  const parts = callParts(call)
   if (call.effort !== null) parts.push(call.effort)
   return parts.join(' · ')
 }
 
-function finishedLine(done: CallRecord[], width: number): string {
-  if (done.length === 1) {
-    const call = done[0] as CallRecord
-    const mark = call.status === 'answered' ? '✓' : '✗'
-    const duration = formatDuration((call.endedAt ?? call.startedAt) - call.startedAt)
-    const head = `${mark} ${call.provider} · ${call.model ?? 'default'} · ${duration}`
-    return fitText(`${head} — "${call.summary}"`, width)
+function taskParts(task: BandTask): string[] {
+  return ['delegate', task.worker, task.model ?? 'default']
+}
+
+function callRow($: EngineInterface, call: CallRecord, now: number): RunningRow {
+  const elapsed = Math.max(0, now - call.startedAt)
+  return {
+    key: `cancel:${call.id}`,
+    label: callLabel(call),
+    fraction: call.limitMs > 0 ? elapsed / call.limitMs : 0,
+    clock: call.provider === 'council' && elapsed > call.limitMs ? 'judge retry' : `${formatClock(elapsed)} / ${formatClock(call.limitMs)}`,
+    cancel: () => cancelCall($, call.id),
+  }
+}
+
+// A task's clock is in minutes and hours ('12m / 3h00m'): it can run for hours.
+// Under a limit of ten hours or more the clock would not fit: the time alone.
+function taskRow($: EngineInterface, task: BandTask, now: number): RunningRow {
+  const elapsed = task.startedAt === null ? 0 : Math.max(0, now - task.startedAt)
+  let clock = 'queued'
+  if (task.startedAt !== null) {
+    const withLimit = task.limitMs === null ? '' : `${formatElapsed(elapsed)} / ${formatElapsed(task.limitMs)}`
+    clock = withLimit !== '' && withLimit.length <= CLOCK_WIDTH ? withLimit : formatElapsed(elapsed)
+  }
+  return {
+    key: `cancel-task:${task.id}`,
+    label: taskParts(task).join(' · '),
+    fraction: task.limitMs === null ? null : elapsed / task.limitMs,
+    clock,
+    cancel: () => cancelTaskFromBand($, task.id),
+  }
+}
+
+function callItem(call: CallRecord): FinishedItem {
+  const parts = callParts(call)
+  parts.push(formatDuration((call.endedAt ?? call.startedAt) - call.startedAt))
+  return { isGood: call.status === 'answered', isTask: false, head: parts.join(' · '), tail: `"${call.summary}"` }
+}
+
+function taskItem(task: BandTask): FinishedItem {
+  const parts = taskParts(task)
+  if (task.startedAt !== null && task.endedAt !== null) parts.push(formatElapsed(task.endedAt - task.startedAt))
+  const ending = TASK_ENDINGS[task.state] ?? { text: task.state, isGood: false }
+  return { isGood: ending.isGood, isTask: true, head: parts.join(' · '), tail: ending.text }
+}
+
+// The label and bar widths that fit the band, so a band narrowed by a docked
+// pane does not wrap: the bar shrinks first, then the label, then the bar goes
+// (the clock still says how far the call is), then the label shrinks again.
+function rowWidths(bodyColumns: number): { label: number; bar: number } {
+  const room = bodyColumns - FRAME_WIDTH - ROW_FIXED_WIDTH
+  if (room >= LABEL_WIDTH + MIN_BAR_WIDTH) return { label: LABEL_WIDTH, bar: Math.min(BAR_WIDTH, room - LABEL_WIDTH) }
+  if (room >= SHORT_LABEL_WIDTH + MIN_BAR_WIDTH) return { label: room - MIN_BAR_WIDTH, bar: MIN_BAR_WIDTH }
+  return { label: Math.max(MIN_LABEL_WIDTH, room), bar: 0 }
+}
+
+function plural(count: number, word: string): string {
+  return `${count} ${word}${count === 1 ? '' : 's'}`
+}
+
+function finishedLine(items: FinishedItem[], width: number): string {
+  if (items.length === 1) {
+    const item = items[0] as FinishedItem
+    return fitText(`${item.isGood ? '✓' : '✗'} ${item.head} — ${item.tail}`, width)
   }
   let answers = 0
+  let tasks = 0
   let errors = 0
-  for (const call of done) {
-    if (call.status === 'answered') answers += 1
-    else errors += 1
+  for (const item of items) {
+    if (!item.isGood) errors += 1
+    else if (item.isTask) tasks += 1
+    else answers += 1
   }
-  let line = `✓ ${answers} answer${answers === 1 ? '' : 's'}`
-  if (errors > 0) line += ` · ${errors} error${errors === 1 ? '' : 's'}`
-  return line
+  const parts: string[] = []
+  if (answers > 0) parts.push(plural(answers, 'answer'))
+  if (tasks > 0) parts.push(`${plural(tasks, 'task')} done`)
+  if (errors > 0) parts.push(plural(errors, 'error'))
+  return fitText(`${answers + tasks > 0 ? '✓' : '✗'} ${parts.join(' · ')}`, width)
 }
 
 export function registerBand(on: On): void {
@@ -53,53 +151,63 @@ export function registerBand(on: On): void {
     if (e.props.hasSurvey) return next(e)
     const calls = await read($, callsAtom)
     const finishedIds = await read($, finishedAtom)
-    // Read so the drawing redraws every second while calls run.
+    const tasks = (await read($, watchAtom)).band ?? []
+    // Read so the drawing redraws every second while calls or tasks run.
     await read($, tickAtom)
 
-    const running: CallRecord[] = []
-    const done: CallRecord[] = []
+    const now = await $.clock.now()
+    const running: RunningRow[] = []
+    const finished: FinishedItem[] = []
     for (const call of calls) {
-      if (call.status === 'running') running.push(call)
-      else if (finishedIds.includes(call.id)) done.push(call)
+      if (call.status === 'running') running.push(callRow($, call, now))
+      else if (finishedIds.includes(call.id)) finished.push(callItem(call))
     }
-    if (running.length === 0 && done.length === 0) return next(e)
+    for (const task of tasks) {
+      if (isActiveState(task.state)) running.push(taskRow($, task, now))
+      else finished.push(taskItem(task))
+    }
+    if (running.length === 0 && finished.length === 0) return next(e)
 
     const { Box, Button, Text } = $.ui.resolve(e)
-    const openAnswers = () => openPaneOn($, 'answers')
+    // With no call among the rows, the button opens the Delegated tab: Answers lists no task.
+    let hasCall = false
+    for (const call of calls) {
+      if (call.status === 'running' || finishedIds.includes(call.id)) hasCall = true
+    }
+    const pane = hasCall
+      ? <Button key="answers" label="Answers" onPress={() => openPaneOn($, 'answers')} />
+      : <Button key="tasks" label="Tasks" onPress={() => openPaneOn($, 'delegated')} />
 
     if (running.length === 0) {
       const width = Math.max(10, e.props.bodyColumns - 10 - BUTTONS_WIDTH - FRAME_WIDTH)
       return (
         <Box flexDirection="row" borderStyle="round" borderColor={FRAME_COLOR} paddingX={1}>
-          <Text bold>consult  </Text>
-          <Text>{finishedLine(done, width)}  </Text>
-          <Button key="answers" label="Answers" onPress={openAnswers} />
+          <Text bold>{PREFIX}</Text>
+          <Text>{finishedLine(finished, width)}  </Text>
+          {pane}
         </Box>
       )
     }
 
-    const now = await $.clock.now()
+    const widths = rowWidths(e.props.bodyColumns)
     return (
       <Box flexDirection="column" borderStyle="round" borderColor={FRAME_COLOR} paddingX={1}>
-        {running.map((call, index) => {
-          const elapsed = Math.max(0, now - call.startedAt)
-          const fraction = call.limitMs > 0 ? elapsed / call.limitMs : 0
-          const isOver = call.provider === 'council' && elapsed > call.limitMs
-          const clock = isOver ? 'over: judge retry' : `${formatClock(elapsed)} / ${formatClock(call.limitMs)}`
-          return (
-            <Box flexDirection="row">
-              <Text bold>{index === 0 ? 'consult  ' : '         '}</Text>
-              <Text wrap="truncate">{fitText(callLabel(call), LABEL_WIDTH).padEnd(LABEL_WIDTH)} </Text>
-              <Text color={barColor(fraction)}>
-                {progressBar(fraction, BAR_WIDTH)}
+        {running.map((row, index) => (
+          <Box flexDirection="row">
+            <Text bold>{index === 0 ? PREFIX : ' '.repeat(PREFIX.length)}</Text>
+            <Text wrap="truncate">{fitText(row.label, widths.label).padEnd(widths.label)} </Text>
+            {widths.bar > 0 && row.fraction !== null ? (
+              <Text color={barColor(row.fraction)}>
+                {progressBar(row.fraction, widths.bar)}
               </Text>
-              <Text> {clock.padStart(13)}  </Text>
-              <Button key={`cancel:${call.id}`} label="Cancel" onPress={() => cancelCall($, call.id)} />
-            </Box>
-          )
-        })}
+            ) : null}
+            {widths.bar > 0 && row.fraction === null ? <Text>{' '.repeat(widths.bar)}</Text> : null}
+            <Text> {row.clock.padStart(CLOCK_WIDTH)}  </Text>
+            <Button key={row.key} label="Cancel" onPress={row.cancel} />
+          </Box>
+        ))}
         <Box flexDirection="row" justifyContent="flex-end">
-          <Button key="answers" label="Answers" onPress={openAnswers} />
+          {pane}
         </Box>
       </Box>
     )

@@ -23,6 +23,14 @@ export function shortToolName(full: string): string | null {
   return full.startsWith(TOOL_PREFIX) ? full.slice(TOOL_PREFIX.length) : null
 }
 
+// What kind of call a tool makes, as the band's rows start; a council names itself.
+export function kindOfTool(tool: string): 'ask' | 'chat' | 'image' | null {
+  if (tool.startsWith('ask_')) return 'ask'
+  if (tool === 'consult_chat_start' || tool === 'consult_chat_send') return 'chat'
+  if (tool === 'agy_generate_image' || tool === 'codex_generate_image') return 'image'
+  return null
+}
+
 export function providerOf(tool: string, args: Record<string, unknown>): { provider: string; members: string[] } {
   if (tool === 'ask_codex' || tool === 'codex_generate_image') return { provider: 'codex', members: [] }
   if (tool === 'ask_agy' || tool === 'agy_generate_image') return { provider: 'agy', members: [] }

@@ -1,9 +1,11 @@
 import type { On } from 'claude-code'
 import { describe, expect, test } from 'claude-code/testing'
+import type { Engine } from 'claude-code/testing'
 
 import type { CallRecord } from '../types'
 import * as fixtures from './fixtures/results'
-import { CONSULT, PLUGIN, answerConsult, world } from './world'
+import { CONSULT, PLUGIN, answerConsult, beatInstance, delegateRow, setDelegateIndex, world } from './world'
+import type { World, WorldOptions } from './world'
 
 const DENY = 'Cancelled by the user from the consult band.'
 
@@ -30,6 +32,22 @@ function engineBand(on: On) {
   on('ui.render', { component: 'AbovePrompt' }, () => ({ type: 'Text', props: {}, children: ['engine band'] }) as never)
 }
 
+const START = { cwd: 'C:/proj', surface: 'terminal', isInteractive: true } as const
+const TASK = 'd3f9a1'
+
+// A session of C:/proj whose index holds `rows`; the default row is a running
+// codex task this session owns, started at the clock's start.
+async function withTasks($: Engine, on: On, rows: Record<string, unknown>[], options: WorldOptions = {}, before?: (w: World) => void): Promise<World> {
+  const w = world(on, options)
+  engineBand(on)
+  before?.(w)
+  beatInstance(w, 'inst-1', w.clock.now())
+  setDelegateIndex(w, rows)
+  await $.session.start(START)
+  await w.clock.settle()
+  return w
+}
+
 describe('band', () => {
   test('nothing running and nothing finished draws the engine band', async ($, on) => {
     world(on)
@@ -48,7 +66,7 @@ describe('band', () => {
     await clock.settle()
     await clock.advance(242000)
     const ui = await $.ui.mount(BAND)
-    expect(await ui.find({ text: /codex · gpt-6-astra · high/ })).toBeDefined()
+    expect(await ui.find({ text: /ask · codex · gpt-6-astra · high/ })).toBeDefined()
     expect(await ui.find({ text: /4:02 \/ 10:00/ })).toBeDefined()
     expect(await ui.find({ key: 'cancel:call-1' })).toBeDefined()
     expect(await ui.find({ key: 'answers' })).toBeDefined()
@@ -60,6 +78,30 @@ describe('band', () => {
     await clock.advance(1000)
     expect(await ui.find({ text: /4:03 \/ 10:00/ })).toBeDefined()
     await ui.unmount()
+    await clock.advance(400000)
+    await pending
+    await clock.settle()
+  })
+
+  test('a running row fits a band narrowed by the docked pane', { timeoutMs: 20000 }, async ($, on) => {
+    const { clock } = world(on)
+    engineBand(on)
+    answerConsult(on, clock, fixtures.CODEX_ANSWER, { afterMs: 600000 })
+    const pending = $.tool.call({ tool: `${CONSULT}ask_codex`, tool_use_id: 'call-1', prompt: 'x', model: 'gpt-6-astra', reasoning_effort: 'high' })
+    await clock.settle()
+    await clock.advance(242000)
+    for (const bodyColumns of [80, 64, 52]) {
+      const ui = await $.ui.mount({ ...BAND, props: { ...BAND.props, bodyColumns } })
+      let row: Found | undefined
+      for (const box of await ui.findAll({ type: 'Box' })) {
+        if (box.props.flexDirection === 'row' && box.text.includes('4:02 / 10:00')) row = box
+      }
+      // The terminal draws the Cancel label as `[ Cancel ]`, and the frame takes four columns.
+      const drawnWidth = (row?.text.length ?? 0) + '[  ]'.length + 4
+      expect(drawnWidth <= bodyColumns).toBe(true)
+      expect(row?.text).toContain('codex')
+      await ui.unmount()
+    }
     await clock.advance(400000)
     await pending
     await clock.settle()
@@ -217,13 +259,13 @@ describe('band', () => {
     await pending
     await clock.settle()
     const ui = await $.ui.mount(BAND)
-    const row = await ui.find({ text: /✓ codex/ })
+    const row = await ui.find({ text: /✓ ask · codex/ })
     expect(row?.text).toContain('42 s')
-    expect(row?.text).toContain('Use a tagged union')
+    expect(row?.text).toContain('Use a tagged')
     expect(await ui.find({ key: 'answers' })).toBeDefined()
     const frames = await roundBoxes(ui)
     expect(frames.length).toBe(1)
-    expect(frames[0]?.text).toContain('✓ codex')
+    expect(frames[0]?.text).toContain('✓ ask · codex')
     expect(await ui.find({ key: 'cancel:call-1' })).toBeUndefined()
     await ui.unmount()
   })
@@ -273,6 +315,147 @@ describe('band', () => {
     const ui = await $.ui.mount(BAND)
     await ui.press({ key: 'answers' })
     expect(seen.opened).toEqual(['consult'])
+    await ui.unmount()
+  })
+
+  test('a running delegated task draws its row, its clock against its limit and Cancel', async ($, on) => {
+    const w = await withTasks($, on, [delegateRow({ model: 'gpt-6-astra', time_limit_ms: 180 * 60000 })], { delegate: args => (args[0] === 'show' ? { error: 'no show in this test' } : { cancelling: true }) })
+    await w.clock.advance(12 * 60000)
+    const ui = await $.ui.mount(BAND)
+    expect(await ui.find({ text: /delegate · codex · gpt-6-astra/ })).toBeDefined()
+    expect(await ui.find({ text: /12m \/ 3h00m/ })).toBeDefined()
+    expect(await ui.find({ key: 'answers' })).toBeUndefined()
+    await ui.press({ key: 'tasks' })
+    expect(w.seen.opened).toEqual(['consult'])
+    expect(w.state.pane).toEqual(expect.objectContaining({ tab: 'delegated' }))
+    await ui.press({ key: `cancel-task:${TASK}` })
+    await w.clock.settle()
+    const commands: string[] = []
+    for (const run of w.seen.delegateRuns) commands.push(run.argv.slice(3).join(' '))
+    expect(commands).toContain(`cancel ${TASK}`)
+    await ui.unmount()
+  })
+
+  test('a queued task says so, and a row with no limit shows its clock alone, with no bar', async ($, on) => {
+    const w = await withTasks($, on, [delegateRow({ state: 'queued', started_at: null })])
+    const ui = await $.ui.mount(BAND)
+    expect(await ui.find({ text: /delegate · codex · default/ })).toBeDefined()
+    expect(await ui.find({ text: /queued/ })).toBeDefined()
+    setDelegateIndex(w, [delegateRow({ started_at: w.clock.now() })])
+    await w.clock.advance(5000)
+    expect(await ui.find({ text: /^ +5s  $/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^[█▌░]+$/ })).toBeUndefined()
+    await ui.unmount()
+  })
+
+  test('an ask and a task share one frame, the ask first', async ($, on) => {
+    const { clock } = await withTasks($, on, [delegateRow()], {}, w => answerConsult(on, w.clock, fixtures.CODEX_ANSWER, { afterMs: 60000 }))
+    const pending = $.tool.call({ tool: `${CONSULT}ask_agy`, tool_use_id: 'call-1', prompt: 'x' })
+    await clock.settle()
+    const ui = await $.ui.mount(BAND)
+    const frames = await roundBoxes(ui)
+    expect(frames.length).toBe(1)
+    const text = frames[0]?.text ?? ''
+    expect(text.indexOf('ask · agy') >= 0 && text.indexOf('ask · agy') < text.indexOf('delegate · codex')).toBe(true)
+    expect(text.split('consult').length - 1).toBe(1)
+    await ui.unmount()
+    await clock.advance(60000)
+    await pending
+    await clock.settle()
+  })
+
+  test('a task that ends joins the finished row until the person types', async ($, on) => {
+    const w = await withTasks($, on, [delegateRow()])
+    await w.clock.advance(5000)
+    setDelegateIndex(w, [delegateRow({ state: 'done', ended_at: 1_000_000 + 42 * 60000 })])
+    await w.clock.advance(5000)
+    await w.clock.settle()
+    const ui = await $.ui.mount(BAND)
+    const row = await ui.find({ text: /✓ delegate · codex · default/ })
+    expect(row?.text).toContain('finished')
+    expect(await ui.find({ key: `cancel-task:${TASK}` })).toBeUndefined()
+    // The wake notice is the mod's own prompt: the row stays.
+    expect(w.seen.submitted.length).toBe(1)
+    expect(await ui.find({ text: /✓ delegate/ })).toBeDefined()
+    await $.prompt.submit({ text: 'next', wait: false, origin: { kind: 'composer' } })
+    await w.clock.settle()
+    expect(await ui.find({ text: /engine band/ })).toBeDefined()
+    await w.clock.advance(10000)
+    expect(await ui.find({ text: /engine band/ })).toBeDefined()
+    await ui.unmount()
+  })
+
+  test('a task that had ended before the band saw it, and a failed one, are drawn as they should be', async ($, on) => {
+    const w = await withTasks($, on, [delegateRow({ state: 'done', ended_at: 1_000_000, reported_at: 1_000_000 }), delegateRow({ id: 'aaaaaa' })])
+    await w.clock.advance(5000)
+    setDelegateIndex(w, [delegateRow({ state: 'done', ended_at: 1_000_000, reported_at: 1_000_000 }), delegateRow({ id: 'aaaaaa', state: 'failed', ended_at: w.clock.now() })])
+    await w.clock.advance(5000)
+    await w.clock.settle()
+    const ui = await $.ui.mount(BAND)
+    const row = await ui.find({ text: /✗ delegate · codex/ })
+    expect(row?.text).toContain('failed')
+    await ui.unmount()
+  })
+
+  test('a Cancel the delegate script refuses says so in a toast', async ($, on) => {
+    const w = await withTasks($, on, [delegateRow()], { delegate: () => ({ error: 'task d3f9a1 has already ended' }) })
+    const ui = await $.ui.mount(BAND)
+    await ui.press({ key: `cancel-task:${TASK}` })
+    await w.clock.settle()
+    expect(w.seen.toasts).toEqual([`consult: could not cancel task ${TASK} (task d3f9a1 has already ended)`])
+    await ui.unmount()
+  })
+
+  test('under a limit of ten hours or more the clock shows the time alone, and the row still fits', async ($, on) => {
+    const now = 100_000_000
+    await withTasks($, on, [delegateRow({ time_limit_ms: 24 * 60 * 60000, started_at: now - (10 * 60 + 5) * 60000 })], { now })
+    const ui = await $.ui.mount({ ...BAND, props: { ...BAND.props, bodyColumns: 52 } })
+    let row: Found | undefined
+    for (const box of await ui.findAll({ type: 'Box' })) {
+      if (box.props.flexDirection === 'row' && box.text.includes('delegate')) row = box
+    }
+    expect(row?.text).toContain('10h05m')
+    expect(row?.text).not.toContain('24h00m')
+    expect((row?.text.length ?? 0) + '[  ]'.length + 4 <= 52).toBe(true)
+    await ui.unmount()
+  })
+
+  test('a row with no bar keeps its clock and Cancel in line with the rows above', async ($, on) => {
+    const w = await withTasks($, on, [delegateRow({ id: 'aaaaaa', time_limit_ms: 180 * 60000 }), delegateRow({ id: 'bbbbbb' })])
+    await w.clock.advance(5000)
+    const ui = await $.ui.mount(BAND)
+    const rows: Found[] = []
+    for (const box of await ui.findAll({ type: 'Box' })) {
+      if (box.props.flexDirection === 'row' && box.text.includes('delegate')) rows.push(box)
+    }
+    expect(rows.length).toBe(2)
+    expect(rows[0]?.text.indexOf('Cancel')).toBe(rows[1]?.text.indexOf('Cancel'))
+    await ui.unmount()
+  })
+
+  test('a task that ended in the queue has no run time, and a model name is drawn on one line', async ($, on) => {
+    const w = await withTasks($, on, [delegateRow({ state: 'queued', started_at: null, model: 'qwen\n3.5\u001b[2J' })])
+    await w.clock.advance(5000)
+    setDelegateIndex(w, [delegateRow({ state: 'cancelled', started_at: null, ended_at: w.clock.now() + 20 * 60000, model: 'qwen\n3.5\u001b[2J' })])
+    await w.clock.advance(5000)
+    const ui = await $.ui.mount(BAND)
+    const row = await ui.find({ text: /✗ delegate/ })
+    expect(row?.text).toContain('delegate · codex · qwen 3.5 [2J — cancelled')
+    await ui.unmount()
+  })
+
+  test('several finished items fit a narrow band', async ($, on) => {
+    const w = await withTasks($, on, [delegateRow({ id: 'aaaaaa' }), delegateRow({ id: 'bbbbbb' })], {}, world => answerConsult(on, world.clock, fixtures.CODEX_NOT_SIGNED_IN, { afterMs: 1000 }))
+    const pending = $.tool.call({ tool: `${CONSULT}ask_codex`, tool_use_id: 'call-1', prompt: 'x' })
+    await w.clock.advance(1000)
+    await pending
+    setDelegateIndex(w, [delegateRow({ id: 'aaaaaa', state: 'done', ended_at: w.clock.now() }), delegateRow({ id: 'bbbbbb', state: 'held', ended_at: w.clock.now() })])
+    await w.clock.advance(5000)
+    await w.clock.settle()
+    const ui = await $.ui.mount({ ...BAND, props: { ...BAND.props, bodyColumns: 40 } })
+    const frames = await roundBoxes(ui)
+    expect(frames[0]?.text).toContain('✓ 2 tasks')
+    expect((frames[0]?.text.length ?? 0) + '[  ]'.length + 4 <= 40).toBe(true)
     await ui.unmount()
   })
 })

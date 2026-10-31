@@ -4,6 +4,17 @@ All notable changes to this plugin are documented here. Format loosely follows [
 
 ## [Unreleased]
 
+## [0.15.4] - 2026-10-31
+
+### Added
+
+- **The band shows background tasks.** A task this session delegated gets a `delegate · <worker> · <model>` row above the prompt for as long as it is queued or running: its time against the task's own limit (`12m / 3h00m`) and a Cancel that cancels the task. When it ends it joins the short finished row (`✓ delegate · codex · gpt-5.5 · 42m — finished`) until your next prompt. With only tasks in the band, its button opens the Delegated tab instead of Answers. A Cancel that fails says why in a toast. The task index now carries each task's `time_limit_ms` for this.
+- **Each band row says what kind of call it is:** `ask`, `chat`, `image` or `delegate`, then the provider and model, in the running rows and the finished row alike. A council row already named itself.
+
+### Fixed
+
+- **The band no longer wraps when the `/consult` pane is docked.** Its running rows were a fixed 83 columns wide and ignored the band's real width, which the docked pane narrows. They now fit it: the bar shrinks first, then the model label, then the bar goes (the clock still shows the time against the limit), down to about 50 columns.
+
 ## [0.15.3] - 2026-10-31
 
 ### Fixed

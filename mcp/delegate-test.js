@@ -155,7 +155,7 @@ try {
     eq('index: row fields', Object.keys(index.tasks[0]).sort(), [
       'id', 'worker', 'model', 'title', 'project', 'state', 'location', 'mode', 'summary', 'fenced',
       'started_at', 'ended_at', 'stop_reason', 'limit', 'queue_model', 'owner_instance', 'reported_at',
-      'queue_waiting_long', 'keep_running', 'hold', 'owner_session', 'created_at', 'queued_at'
+      'queue_waiting_long', 'keep_running', 'hold', 'owner_session', 'created_at', 'queued_at', 'time_limit_ms'
     ].sort());
     eq('index: hold is carried', index.tasks[0].hold, true);
     eq('index: no brief text in the index', JSON.stringify(index).includes('Add retries to the fetcher'), false);

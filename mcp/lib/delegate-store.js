@@ -50,7 +50,7 @@ const RENAME_RETRY_MS = 5;
 const INDEX_FIELDS = [
   'id', 'worker', 'model', 'title', 'project', 'state', 'location', 'mode', 'summary', 'fenced',
   'started_at', 'ended_at', 'stop_reason', 'limit', 'queue_model', 'owner_instance', 'reported_at',
-  'queue_waiting_long', 'keep_running', 'hold', 'owner_session', 'created_at', 'queued_at', 'read_only_edits'
+  'queue_waiting_long', 'keep_running', 'hold', 'owner_session', 'created_at', 'queued_at', 'read_only_edits', 'time_limit_ms'
 ];
 
 export function dataHome(env = process.env) {

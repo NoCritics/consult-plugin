@@ -1,9 +1,9 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, On } from 'claude-code'
 
-import type { DelegateElsewhere } from '../../types'
+import type { BandTask, DelegateElsewhere } from '../../types'
 import { dataHome, platformOf } from './files'
-import { refreshDelegatedIfShown } from './delegated'
+import { isActiveState, refreshDelegatedIfShown } from './delegated'
 import { parseObject, shortToolName, textOf } from './outcome'
 import type { Ran } from './outcome'
 import { INITIAL_DELEGATE } from './state'
@@ -20,6 +20,7 @@ import { INITIAL_DELEGATE } from './state'
 // already sent live in $.store, which sessions share.
 
 const watchAtom = atom({ plugin: 'consult', key: 'delegate' } as const, INITIAL_DELEGATE)
+const tickAtom = atom({ plugin: 'consult', key: 'tick' } as const, 0)
 
 const TICK_MS = 5000
 // With no task to watch the index is read about once a minute; a tick lands
@@ -69,7 +70,10 @@ type TaskRow = {
   createdAt: number | null
   // When the task last began waiting (a follow-up requeues it); null in a row from before the field.
   queuedAt: number | null
+  startedAt: number | null
   endedAt: number | null
+  // The task's own limit, null in a row from before the field.
+  timeLimitMs: number | null
   // Files a read-only task changed anyway (agy cannot be fenced); empty when none. Only the count reaches
   // a notice: the names come from a worker that is not fenced, and a notice is submitted with the user's authority.
   editedFiles: string[]
@@ -132,7 +136,9 @@ function toRow(value: unknown): TaskRow | null {
     queueWaitingLong: raw.queue_waiting_long === true,
     createdAt: typeof raw.created_at === 'number' ? raw.created_at : null,
     queuedAt: typeof raw.queued_at === 'number' ? raw.queued_at : null,
+    startedAt: typeof raw.started_at === 'number' ? raw.started_at : null,
     endedAt: typeof raw.ended_at === 'number' ? raw.ended_at : null,
+    timeLimitMs: typeof raw.time_limit_ms === 'number' && raw.time_limit_ms > 0 ? raw.time_limit_ms : null,
     editedFiles: stringList(raw.read_only_edits),
   }
 }
@@ -415,6 +421,45 @@ function awayItem(row: TaskRow): string {
   return `${plainTask(row)}: ${workerWord(row)} ${outcome.away(row)}`
 }
 
+function bandTaskOf(row: TaskRow): BandTask {
+  return {
+    id: row.id,
+    worker: row.worker,
+    // A worker that is not fenced can rewrite its model: one line, no control characters, at most 40.
+    model: row.model === null ? null : oneLine(row.model.replace(/[\u0000-\u001f\u007f-\u009f]/g, ' '), 40),
+    state: row.state,
+    // null for a task that never started, even one that ended in the queue
+    startedAt: row.state === 'queued' ? null : row.startedAt,
+    endedAt: row.endedAt,
+    limitMs: row.timeLimitMs,
+  }
+}
+
+// The owned tasks the band shows, in the index's order: the queued and running
+// ones, and the ones that ended while it showed them, kept until the person's
+// next prompt.
+function nextBand(shown: BandTask[], seen: BandTask[]): BandTask[] {
+  const shownIds: string[] = []
+  for (const task of shown) shownIds.push(task.id)
+  const next: BandTask[] = []
+  for (const task of seen) {
+    if (isActiveState(task.state) || shownIds.includes(task.id)) next.push(task)
+  }
+  return next
+}
+
+// The person's prompt: the tasks that ended leave the band, as the finished calls do.
+export async function dropEndedTasks($: EngineInterface): Promise<void> {
+  await update($, watchAtom, w => {
+    const band = w.band ?? []
+    const kept: BandTask[] = []
+    for (const task of band) {
+      if (isActiveState(task.state)) kept.push(task)
+    }
+    return kept.length === band.length ? w : { ...w, band: kept }
+  })
+}
+
 async function scan($: EngineInterface, now: number): Promise<void> {
   lastReadAt = now
   if (dataHomeFound === null) dataHomeFound = await dataHome($)
@@ -446,6 +491,7 @@ async function scan($: EngineInterface, now: number): Promise<void> {
   const elsewhere: DelegateElsewhere[] = []
   const awayRows: TaskRow[] = []
   const notices: Notice[] = []
+  const seenTasks: BandTask[] = []
   let notified: string[] | null = null
   let isOwnedTaskActive = false
 
@@ -482,8 +528,9 @@ async function scan($: EngineInterface, now: number): Promise<void> {
       isOrphan = true
     }
     if (!isOwned) continue
+    seenTasks.push(bandTaskOf(row))
 
-    if (row.state === 'queued' || row.state === 'running') isOwnedTaskActive = true
+    if (isActiveState(row.state)) isOwnedTaskActive = true
     // Reported (delegate_result, delegate_merge): Claude has dealt with it.
     // delegate_send resets the mark when the task runs anew.
     if (!isUnreported) continue
@@ -512,8 +559,9 @@ async function scan($: EngineInterface, now: number): Promise<void> {
   }
 
   const sameElsewhere = JSON.stringify(elsewhere) === JSON.stringify(watched.elsewhere)
-  if (claimed.length > 0 || !sameElsewhere) {
-    await update($, watchAtom, w => ({ ...w, owned: addOwned(w.owned, claimed), elsewhere }))
+  if (claimed.length > 0 || !sameElsewhere || JSON.stringify(nextBand(watched.band ?? [], seenTasks)) !== JSON.stringify(watched.band ?? [])) {
+    // The band is worked out again inside the write: a prompt may have dropped ended tasks since the read.
+    await update($, watchAtom, w => ({ ...w, owned: addOwned(w.owned, claimed), elsewhere, band: nextBand(w.band ?? [], seenTasks) }))
   }
 
   if (awayRows.length === 0 && notices.length === 0) return
@@ -549,6 +597,8 @@ async function tick($: EngineInterface): Promise<void> {
   try {
     const now = await $.clock.now()
     if (isSweepPending || isFast || now - lastReadAt >= SLOW_READ_DUE_MS) await scan($, now)
+    // The band redraws a running task's clock on this tick: every 5 s is plenty for a task of hours.
+    if (isFast) await update($, tickAtom, n => n + 1)
   } finally {
     isTicking = false
   }

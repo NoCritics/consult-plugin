@@ -18,6 +18,10 @@ const paneAtom = atom({ plugin: 'consult', key: 'pane' } as const, INITIAL_PANE)
 export const TABLE_ROWS = ['code', 'research_review', 'private'] as const
 const ACTIVE_STATES = ['queued', 'running']
 
+export function isActiveState(state: string): boolean {
+  return ACTIVE_STATES.includes(state)
+}
+
 const SCRIPT_LIMIT_MS = 10000
 // Removing a big copy can take a while, and a kill would leave it half removed.
 const CLEAR_LIMIT_MS = 60000
@@ -295,6 +299,14 @@ export async function selectRow($: EngineInterface, id: string): Promise<void> {
 
 export async function cancelTask($: EngineInterface, id: string): Promise<void> {
   await runAndRefresh($, id, 'cancel', ['cancel', id])
+}
+
+// The band's Cancel: a refusal is told in a toast, since the tab that shows
+// the errors may not be open.
+export async function cancelTaskFromBand($: EngineInterface, id: string): Promise<void> {
+  const answer = await runDelegate($, ['cancel', id])
+  if ('error' in answer) $.ui.toast(`consult: could not cancel task ${id} (${answer.error.slice(0, 160)})`)
+  await refreshDelegatedIfShown($)
 }
 
 // The Clear button: a plain clear sends at once; an unmerged in-place task asks first.

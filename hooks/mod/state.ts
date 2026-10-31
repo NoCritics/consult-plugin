@@ -19,7 +19,7 @@ export const INITIAL_HEALTH: Health = {
 
 export const INITIAL_PANE: PaneView = { tab: 'answers', expandedId: null, sessionShown: 10, earlierShown: 10 }
 
-export const INITIAL_DELEGATE: DelegateWatch = { owned: [], elsewhere: [], earlierSessions: [] }
+export const INITIAL_DELEGATE: DelegateWatch = { owned: [], elsewhere: [], earlierSessions: [], band: [] }
 
 export const INITIAL_DELEGATED: DelegatedView = {
   status: 'idle',

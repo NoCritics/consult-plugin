@@ -3,6 +3,7 @@ import type { EngineInterface } from 'claude-code'
 
 import type { Health, ServiceHealth, ServiceName } from '../../types'
 import { loadConsultSettings, localConfigured } from './settings'
+import { dropEndedTasks } from './delegate'
 import { INITIAL_HEALTH } from './state'
 
 // consult's health in the status line: once at the start of a session (until
@@ -158,6 +159,7 @@ export async function notePrompt($: EngineInterface, isMeta: boolean, originKind
   if (isPerson) {
     await update($, healthAtom, h => ({ ...h, showStartLine: false }))
     await update($, finishedAtom, () => [])
+    await dropEndedTasks($)
     $.ui.status(statusLine(await read($, healthAtom)))
   }
 }
