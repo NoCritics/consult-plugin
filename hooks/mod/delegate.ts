@@ -438,12 +438,22 @@ function bandTaskOf(row: TaskRow): BandTask {
 // The owned tasks the band shows, in the index's order: the queued and running
 // ones, and the ones that ended while it showed them, kept until the person's
 // next prompt.
+// A task's time limit never changes, so one the band already knows is kept
+// when a row comes without it: a consult server older than 0.15.4, still
+// running in another session, rewrites the shared index without the field.
 function nextBand(shown: BandTask[], seen: BandTask[]): BandTask[] {
-  const shownIds: string[] = []
-  for (const task of shown) shownIds.push(task.id)
   const next: BandTask[] = []
   for (const task of seen) {
-    if (isActiveState(task.state) || shownIds.includes(task.id)) next.push(task)
+    let shownBefore: BandTask | null = null
+    for (const shownTask of shown) {
+      if (shownTask.id === task.id) shownBefore = shownTask
+    }
+    if (!isActiveState(task.state) && shownBefore === null) continue
+    if (task.limitMs === null && shownBefore !== null && shownBefore.limitMs !== null) {
+      next.push({ ...task, limitMs: shownBefore.limitMs })
+    } else {
+      next.push(task)
+    }
   }
   return next
 }

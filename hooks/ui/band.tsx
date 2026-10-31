@@ -10,9 +10,10 @@ import { INITIAL_DELEGATE } from '../mod/state'
 import { openPaneOn } from './pane'
 
 // The band above the prompt: one row per running consult call and per running
-// delegated task, with its bar and Cancel, then the Answers button; after the
-// last one ends, one slim row until the next prompt. With nothing to show, the
-// engine's own band.
+// delegated task, with its bar and Cancel, then the Answers button. A row that
+// ends while others run becomes its result line in place; after the last one
+// ends, one slim row until the next prompt. With nothing to show, the engine's
+// own band.
 
 const callsAtom = atom({ plugin: 'consult', key: 'calls' } as const, [] as CallRecord[])
 const finishedAtom = atom({ plugin: 'consult', key: 'finished' } as const, [] as string[])
@@ -50,6 +51,8 @@ const TASK_ENDINGS: Record<string, { text: string; isGood: boolean }> = {
 // fraction is null for a task with no limit: its row has no bar.
 type RunningRow = { key: string; label: string; fraction: number | null; clock: string; cancel: () => Promise<void> }
 type FinishedItem = { isGood: boolean; isTask: boolean; head: string; tail: string }
+// One row of the frame: running, or ended while others still run.
+type BandRow = { running: RunningRow; finished: null } | { running: null; finished: FinishedItem }
 
 // A call's kind, provider and model, as both its rows start.
 function callParts(call: CallRecord): string[] {
@@ -156,17 +159,32 @@ export function registerBand(on: On): void {
     await read($, tickAtom)
 
     const now = await $.clock.now()
-    const running: RunningRow[] = []
+    // Every row in its place: one that ended while others run stays where it
+    // was, as its result line, until the next prompt.
+    const rows: BandRow[] = []
     const finished: FinishedItem[] = []
+    let runningCount = 0
     for (const call of calls) {
-      if (call.status === 'running') running.push(callRow($, call, now))
-      else if (finishedIds.includes(call.id)) finished.push(callItem(call))
+      if (call.status === 'running') {
+        rows.push({ running: callRow($, call, now), finished: null })
+        runningCount += 1
+      } else if (finishedIds.includes(call.id)) {
+        const item = callItem(call)
+        rows.push({ running: null, finished: item })
+        finished.push(item)
+      }
     }
     for (const task of tasks) {
-      if (isActiveState(task.state)) running.push(taskRow($, task, now))
-      else finished.push(taskItem(task))
+      if (isActiveState(task.state)) {
+        rows.push({ running: taskRow($, task, now), finished: null })
+        runningCount += 1
+      } else {
+        const item = taskItem(task)
+        rows.push({ running: null, finished: item })
+        finished.push(item)
+      }
     }
-    if (running.length === 0 && finished.length === 0) return next(e)
+    if (rows.length === 0) return next(e)
 
     const { Box, Button, Text } = $.ui.resolve(e)
     // With no call among the rows, the button opens the Delegated tab: Answers lists no task.
@@ -178,7 +196,7 @@ export function registerBand(on: On): void {
       ? <Button key="answers" label="Answers" onPress={() => openPaneOn($, 'answers')} />
       : <Button key="tasks" label="Tasks" onPress={() => openPaneOn($, 'delegated')} />
 
-    if (running.length === 0) {
+    if (runningCount === 0) {
       const width = Math.max(10, e.props.bodyColumns - 10 - BUTTONS_WIDTH - FRAME_WIDTH)
       return (
         <Box flexDirection="row" borderStyle="round" borderColor={FRAME_COLOR} paddingX={1}>
@@ -190,22 +208,37 @@ export function registerBand(on: On): void {
     }
 
     const widths = rowWidths(e.props.bodyColumns)
+    // An ended row's line spans what a running row's label, bar, clock and Cancel take.
+    const endedWidth = widths.label + widths.bar + ROW_FIXED_WIDTH - PREFIX.length
     return (
       <Box flexDirection="column" borderStyle="round" borderColor={FRAME_COLOR} paddingX={1}>
-        {running.map((row, index) => (
-          <Box flexDirection="row">
-            <Text bold>{index === 0 ? PREFIX : ' '.repeat(PREFIX.length)}</Text>
-            <Text wrap="truncate">{fitText(row.label, widths.label).padEnd(widths.label)} </Text>
-            {widths.bar > 0 && row.fraction !== null ? (
-              <Text color={barColor(row.fraction)}>
-                {progressBar(row.fraction, widths.bar)}
-              </Text>
-            ) : null}
-            {widths.bar > 0 && row.fraction === null ? <Text>{' '.repeat(widths.bar)}</Text> : null}
-            <Text> {row.clock.padStart(CLOCK_WIDTH)}  </Text>
-            <Button key={row.key} label="Cancel" onPress={row.cancel} />
-          </Box>
-        ))}
+        {rows.map((bandRow, index) => {
+          const prefix = <Text bold>{index === 0 ? PREFIX : ' '.repeat(PREFIX.length)}</Text>
+          const row = bandRow.running
+          if (row === null) {
+            const item = bandRow.finished as FinishedItem
+            return (
+              <Box flexDirection="row">
+                {prefix}
+                <Text wrap="truncate">{finishedLine([item], endedWidth)}</Text>
+              </Box>
+            )
+          }
+          return (
+            <Box flexDirection="row">
+              {prefix}
+              <Text wrap="truncate">{fitText(row.label, widths.label).padEnd(widths.label)} </Text>
+              {widths.bar > 0 && row.fraction !== null ? (
+                <Text color={barColor(row.fraction)}>
+                  {progressBar(row.fraction, widths.bar)}
+                </Text>
+              ) : null}
+              {widths.bar > 0 && row.fraction === null ? <Text>{' '.repeat(widths.bar)}</Text> : null}
+              <Text> {row.clock.padStart(CLOCK_WIDTH)}  </Text>
+              <Button key={row.key} label="Cancel" onPress={row.cancel} />
+            </Box>
+          )
+        })}
         <Box flexDirection="row" justifyContent="flex-end">
           {pane}
         </Box>

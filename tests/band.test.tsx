@@ -336,6 +336,17 @@ describe('band', () => {
     await ui.unmount()
   })
 
+  test('a row an older server rewrote without its limit keeps the limit the band knew', async ($, on) => {
+    const w = await withTasks($, on, [delegateRow({ time_limit_ms: 180 * 60000 })])
+    await w.clock.advance(5000)
+    const withoutLimit = delegateRow()
+    setDelegateIndex(w, [withoutLimit])
+    await w.clock.advance(5 * 60000)
+    const ui = await $.ui.mount(BAND)
+    expect(await ui.find({ text: /5m05s \/ 3h00m/ })).toBeDefined()
+    await ui.unmount()
+  })
+
   test('a queued task says so, and a row with no limit shows its clock alone, with no bar', async ($, on) => {
     const w = await withTasks($, on, [delegateRow({ state: 'queued', started_at: null })])
     const ui = await $.ui.mount(BAND)
@@ -382,6 +393,54 @@ describe('band', () => {
     expect(await ui.find({ text: /engine band/ })).toBeDefined()
     await w.clock.advance(10000)
     expect(await ui.find({ text: /engine band/ })).toBeDefined()
+    await ui.unmount()
+  })
+
+  test('a task that ends while another runs stays in its place as its result line', async ($, on) => {
+    const w = await withTasks($, on, [delegateRow({ id: 'aaaaaa', worker: 'agy' }), delegateRow({ id: 'bbbbbb' })])
+    await w.clock.advance(5000)
+    setDelegateIndex(w, [delegateRow({ id: 'aaaaaa', worker: 'agy', state: 'done', ended_at: 1_000_000 + 3 * 60000 }), delegateRow({ id: 'bbbbbb' })])
+    await w.clock.advance(5000)
+    await w.clock.settle()
+    for (const columns of [120, 52]) {
+      const ui = await $.ui.mount({ ...BAND, props: { ...BAND.props, bodyColumns: columns } })
+      const frames = await roundBoxes(ui)
+      expect(frames.length).toBe(1)
+      const text = frames[0]?.text ?? ''
+      expect(text).toContain('✓ delegate · agy')
+      // At 52 columns the running row's label is cut: its Cancel marks it.
+      expect(text.indexOf('✓ delegate · agy')).toBeLessThan(text.indexOf('Cancel'))
+      expect(await ui.find({ key: 'cancel-task:aaaaaa' })).toBeUndefined()
+      expect(await ui.find({ key: 'cancel-task:bbbbbb' })).toBeDefined()
+      for (const box of await ui.findAll({ type: 'Box' })) {
+        if (box.props.flexDirection === 'row' && box.text.includes('delegate') && !box.text.includes('Tasks')) {
+          // A Button's text is its label alone: its brackets are added back.
+          const brackets = box.text.includes('Cancel') ? '[  ]'.length : 0
+          expect(box.text.length + brackets + 4 <= columns).toBe(true)
+        }
+      }
+      await ui.unmount()
+    }
+    // The person's prompt takes the ended row away; the running one stays.
+    await $.prompt.submit({ text: 'next', wait: false, origin: { kind: 'composer' } })
+    await w.clock.settle()
+    const ui = await $.ui.mount(BAND)
+    expect(await ui.find({ text: /✓ delegate/ })).toBeUndefined()
+    expect(await ui.find({ key: 'cancel-task:bbbbbb' })).toBeDefined()
+    await ui.unmount()
+  })
+
+  test('an ask that ends while a task runs shows its result line above the task', async ($, on) => {
+    const { clock } = await withTasks($, on, [delegateRow()], {}, w => answerConsult(on, w.clock, fixtures.CODEX_ANSWER, { afterMs: 1000 }))
+    const pending = $.tool.call({ tool: `${CONSULT}ask_codex`, tool_use_id: 'call-1', prompt: 'x' })
+    await clock.advance(1000)
+    await pending
+    await clock.settle()
+    const ui = await $.ui.mount(BAND)
+    const text = (await roundBoxes(ui))[0]?.text ?? ''
+    expect(text).toContain('✓ ask · codex')
+    expect(text.indexOf('✓ ask · codex')).toBeLessThan(text.indexOf('delegate · codex'))
+    expect(await ui.find({ key: 'answers' })).toBeDefined()
     await ui.unmount()
   })
 

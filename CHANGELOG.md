@@ -4,6 +4,16 @@ All notable changes to this plugin are documented here. Format loosely follows [
 
 ## [Unreleased]
 
+## [0.15.5] - 2026-11-01
+
+### Changed
+
+- **A row that ends while others still run stays in the band.** It becomes its result line in place (`✓ delegate · agy · default · 3m08s — finished`, `✓ ask · codex · … — "…"`), with no Cancel, until your next prompt. Before, it vanished until the last row ended, so a task that finished first looked as if it had never ended. When everything has ended, the one short summary row is unchanged.
+
+### Fixed
+
+- **A task's bar and time limit no longer come and go.** A consult server older than 0.15.4, still running in another session, rewrites the shared task index without the time limit, so the row flipped between `5m40s / 3h00m` with a bar and `5m40s` alone. The band now keeps a limit it has already seen.
+
 ## [0.15.4] - 2026-10-31
 
 ### Added
