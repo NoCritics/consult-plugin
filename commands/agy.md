@@ -1,5 +1,5 @@
 ---
-description: Send a prompt to the Antigravity CLI (Google) and return its clean response
+description: Ask Antigravity (Google) one question and return its answer. Not when the user says to delegate, or for project work or research over many sources - use consult:delegate
 argument-hint: "[--model <id>] [--effort low|medium|high|xhigh|max] [--image <path>] <prompt to send>"
 allowed-tools: ["mcp__plugin_consult_consult__ask_agy", "mcp__plugin_consult_consult__agy_status"]
 ---

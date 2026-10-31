@@ -36,6 +36,7 @@ import { prepareLocalCall } from './lib/local-models.js';
 import { rewriteLocalModelLines, settingsTargetPath, saveNicknames } from './lib/local-models.js';
 import { ollamaBase, fetchTags, vramMb, resetVramCacheForTests, savedNicknames, LOCAL_SLOW_FLOOR_MS } from './lib/local-models.js';
 import { modelFacts, baseName, proposeNicknames, resolveModel, quantRank } from './lib/local-models.js';
+import { spillLongAnswer, isLongText, LONG_ANSWER_BYTES, PREVIEW_CHARS, KEEP_ANSWERS } from './lib/long-answer.js';
 
 let failed = 0;
 function eq(label, got, want) {
@@ -2617,6 +2618,48 @@ if (SPAWN_OPTS.shell) {
     let message = '';
     try { spawnableCmd(unsafe); } catch (e) { message = e.message; }
     truthy(`spawnableCmd: ${unsafe} is refused and named`, message.includes(unsafe));
+  }
+}
+
+// ---- long answers go to a file ----
+{
+  const answersFolder = fs.mkdtempSync(path.join(os.tmpdir(), 'consult-answers-'));
+  try {
+    const short = { response: 'short answer', model: 'm' };
+    eq('long answer: a short answer is returned unchanged', spillLongAnswer(short, 'ask_agy', { dir: answersFolder }), short);
+    eq('long answer: nothing is written for a short answer', fs.readdirSync(answersFolder), []);
+    const atLimit = { response: 'x'.repeat(LONG_ANSWER_BYTES), model: 'm' };
+    eq('long answer: an answer exactly at the limit is returned unchanged', spillLongAnswer(atLimit, 'ask_agy', { dir: answersFolder }), atLimit);
+    const lines = [];
+    for (let index = 0; index < 4000; index += 1) lines.push(`line ${index}: ${'word '.repeat(4)}`);
+    const fullAnswer = lines.join('\n');
+    const spilled = spillLongAnswer({ response: fullAnswer, model: 'gemini/4 argon', latency_ms: 5 }, 'ask_agy', { dir: answersFolder, now: new Date('2026-10-31T01:02:03.004Z') });
+    truthy('long answer: the result names the saved file', typeof spilled.full_answer_path === 'string' && spilled.full_answer_path.startsWith(answersFolder));
+    eq('long answer: the result gives the full length', spilled.response_chars, fullAnswer.length);
+    truthy('long answer: the response starts with the answer and says where the rest is', spilled.response.startsWith(fullAnswer.slice(0, PREVIEW_CHARS)) && spilled.response.includes(spilled.full_answer_path) && spilled.response.includes(String(fullAnswer.length)));
+    truthy('long answer: the response stays well under the limit', spilled.response.length < PREVIEW_CHARS + 500);
+    eq('long answer: other fields are kept', [spilled.model, spilled.latency_ms], ['gemini/4 argon', 5]);
+    const saved = fs.readFileSync(spilled.full_answer_path, 'utf8');
+    truthy('long answer: the file holds the whole answer with its line breaks', saved.endsWith(fullAnswer) && saved.split('\n').length > 4000);
+    truthy('long answer: the file name is safe and dated', /^2026-10-31T01-02-03-004Z-ask_agy-gemini-4-argon-[0-9a-f]{6}\.md$/.test(path.basename(spilled.full_answer_path)));
+    truthy('long answer: the limit counts bytes, so dense text is long sooner', isLongText('漢'.repeat(14000)) && !isLongText('x'.repeat(14000)));
+    const ownNote = path.join(answersFolder, 'my-notes.md');
+    fs.writeFileSync(ownNote, 'mine');
+    for (let index = 0; index < KEEP_ANSWERS + 5; index += 1) {
+      spillLongAnswer({ response: fullAnswer, model: 'm' }, 'ask_codex', { dir: answersFolder, now: new Date(Date.UTC(2026, 10, 1, 0, 0, index)) });
+    }
+    truthy('long answer: a file consult did not write is never removed', fs.existsSync(ownNote));
+    fs.unlinkSync(ownNote);
+    const kept = fs.readdirSync(answersFolder).sort();
+    eq('long answer: the folder keeps the newest answers only', kept.length, KEEP_ANSWERS);
+    truthy('long answer: the oldest answers are the ones removed', kept[0].startsWith('2026-11-01T00-00-05'));
+    // A folder that can't be made: a file stands where it should be.
+    const blocked = path.join(answersFolder, 'blocked');
+    fs.writeFileSync(blocked, 'a file, not a folder');
+    const unsaved = { response: fullAnswer, model: 'm' };
+    eq('long answer: when it cannot be saved the whole answer comes back', spillLongAnswer(unsaved, 'ask_agy', { dir: path.join(blocked, 'inside') }), unsaved);
+  } finally {
+    fs.rmSync(answersFolder, { recursive: true, force: true });
   }
 }
 

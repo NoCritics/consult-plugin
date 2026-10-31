@@ -41,7 +41,8 @@ import {
 } from './lib/local-runners.js';
 import { setupLocal, unloadLocal } from './lib/local-setup.js';
 import { guardOneShot } from './lib/delegate-local.js';
-import { DELEGATE_TOOLS, DELEGATE_TOOL_NAMES, DELEGATE_TOOL_META, DELEGATE_ROUTING_TEXT, callDelegateTool } from './lib/delegate.js';
+import { spillLongAnswer } from './lib/long-answer.js';
+import { DELEGATE_TOOLS, DELEGATE_TOOL_NAMES, DELEGATE_TOOL_META, ASK_OR_DELEGATE_RULE, ASK_DELEGATE_NOTE, callDelegateTool } from './lib/delegate.js';
 import { startDelegateBackground } from './lib/delegate-sweep.js';
 import { councilVote } from './lib/council.js';
 import { loadSettings, runnerSettings, runnerFor, configuredRunners } from './lib/settings.js';
@@ -59,13 +60,12 @@ const DELEGATE_ENABLED = process.env.CONSULT_DELEGATE !== 'off';
 // lets Claude go straight to the right tool instead of searching blind.
 // Claude Code truncates them at 2,048 chars -- most important first.
 const SERVER_INSTRUCTIONS = [
-  'consult asks OTHER AI models for a second opinion via their local CLIs: Codex (OpenAI GPT), Antigravity/agy (Google Gemini; also Claude and GPT-OSS models), local models (llama-swap, Ollama, LM Studio, llama-server), and the legacy Gemini CLI.',
-  'Use it when the user names one of those models or asks for a second opinion, another model\'s view, a review by another AI, or a council/vote between models. Also when the user wants an image generated (agy_generate_image, or codex_generate_image for GPT/OpenAI images).',
-  'Tools: ask_codex, ask_agy, ask_local, ask_gemini (one-shot; ask_codex/ask_agy/ask_local accept image paths); agy_generate_image (makes images and saves them to disk, ~1 min each); codex_generate_image (GPT images via Codex, saved to disk, ~1 min each); consult_chat_start / consult_chat_send / consult_chat_end (multi-turn); council_vote (models answer and rank each other); agy_status, local_status, codex_login_status, codex_login_start, gemini_auth_status (diagnostics); local_setup (runner and nicknames, only when the user asks); local_unload (only after the user agrees).',
-  ...(DELEGATE_ENABLED ? [`${DELEGATE_ROUTING_TEXT} Delegate tools: delegate (starts it, returns at once), delegate_status, delegate_list, delegate_result, delegate_merge, delegate_send, delegate_cancel, delegate_wait.`] : []),
-  'If these tools are deferred, load every one you need in a SINGLE tool search rather than one search per tool.',
-  'Prefer ask_agy over ask_gemini for Google models. The other model cannot see this conversation or the user\'s files: put everything it needs, including file contents, in the prompt.',
-  'Long codex calls can take minutes; pass timeout_s (30-1800 s). A result starting with "INCOMPLETE:" is not an answer: say so, show the partial only as partial; one retry with its suggested timeout_s is fine.'
+  'consult reaches OTHER AI models through their CLIs: Codex (OpenAI), agy/Antigravity (Google; also Claude, GPT-OSS), local models (llama-swap, Ollama, LM Studio, llama-server), legacy Gemini CLI.',
+  'Use it when the user names one of them, wants a second opinion, another model\'s view or a council vote, or an image made by agy or GPT.',
+  'Tools: ask_codex, ask_agy, ask_local, ask_gemini (one prompt, one reply; images except ask_gemini); agy_generate_image, codex_generate_image (to disk); consult_chat_start, consult_chat_send, consult_chat_end (multi-turn); council_vote (models answer and rank each other); agy_status, local_status, codex_login_status, codex_login_start, gemini_auth_status (diagnostics); local_setup (when asked), local_unload (once the user agrees).',
+  ...(DELEGATE_ENABLED ? [`${ASK_OR_DELEGATE_RULE} Delegate tools: delegate (returns at once), delegate_status, delegate_list, delegate_result, delegate_merge, delegate_send, delegate_cancel, delegate_wait.`] : []),
+  'If deferred, load every tool you need in one tool search. Prefer ask_agy over ask_gemini. Ask and chat models see only the prompt: put in it all they need, file contents too.',
+  'Pass timeout_s (30-1800 s) for long calls. A result starting with "INCOMPLETE:" is partial, not an answer: say so; one retry with its suggested timeout_s is fine.'
 ].join('\n');
 
 const server = new Server(
@@ -88,7 +88,7 @@ const TOOLS = [
     name: 'ask_codex',
     description:
       'Send a prompt to the Codex CLI (OpenAI) headless and return the model\'s clean text response. ' +
-      'Use this for a second opinion, code review, or any task you want Codex (GPT-family) to weigh in on. ' +
+      'Use this for a second opinion, a review of pasted code, or a question you want Codex (GPT-family) to answer. ' +
       'Codex runs in read-only sandbox - it cannot write to disk. Long prompts are fine. ' +
       'Image reviews at high reasoning effort can take several minutes (the timeout is 10 minutes by default; pass `timeout_s` for more, up to 30 minutes). ' +
       'If the result starts with "INCOMPLETE:", codex ran out of time: the fenced text is only the last message it had finished - possibly just a progress note - so do not present it as Codex\'s answer. ' +
@@ -111,7 +111,7 @@ const TOOLS = [
     description:
       'Send a prompt to the Antigravity CLI (Google) headless and return the model\'s clean text response. ' +
       'This is the DEFAULT Google-side provider - prefer it over ask_gemini, which no longer works on individual accounts. ' +
-      'Use for a second opinion, code review, or any task you want a Gemini-family model to weigh in on. ' +
+      'Use for a second opinion, a review of pasted code, or a question you want a Gemini-family model to answer. ' +
       'Also fronts non-Google models (Claude Sonnet/Opus, GPT-OSS) - call `agy_status` to list what this account can reach. ' +
       'Ask QUESTIONS only. consult prepends an answer-in-text-only instruction and disables slash-command expansion, but it cannot make agy read-only: headless agy auto-denies shell commands everywhere, yet it WILL create/edit files inside directories the user has marked trusted in agy itself (settings.json trustedWorkspaces - often their whole home dir). ' +
       'Never phrase a prompt as "fix/change/write the file". Results carry a `denied_actions` field when agy was refused a tool, and consult raises a clear error on an empty or partial (timed-out) response. `agy_status` reports the current write posture.',
@@ -394,6 +394,15 @@ const TOOLS = [
   ...(DELEGATE_ENABLED ? DELEGATE_TOOLS : [])
 ];
 
+// With delegate on, each ask tool says where work and research go instead.
+if (DELEGATE_ENABLED) {
+  for (const tool of TOOLS) {
+    if (tool.name === 'ask_codex' || tool.name === 'ask_agy' || tool.name === 'ask_local') {
+      tool.description = `${tool.description} ${ASK_DELEGATE_NOTE}`;
+    }
+  }
+}
+
 // MCP tool annotations (spec 2025-03-26+). Hints only -- clients use them to
 // decide what to auto-approve and how to label the tool -- but they are the
 // truth here: every ask/status tool is a pure read, chat_end deletes files,
@@ -460,6 +469,13 @@ function appendLog(settings, entry) {
     logDirReady = true;
     write();
   });
+}
+
+// A very long answer is saved to a file in Claude Code, which can read it
+// there. Claude Desktop (CONSULT_DELEGATE=off) has no tool to open the file,
+// so it gets the whole answer as before.
+function longAnswerResult(result, tool) {
+  return DELEGATE_ENABLED ? spillLongAnswer(result, tool) : result;
 }
 
 function asText(obj) {
@@ -689,7 +705,7 @@ async function callTool(req, extra) {
         timeout_ms: callTimeoutMs ?? codexTimeoutMs(settings)
       });
       appendLog(settings, { tool: 'ask_codex', model: result.model, latency_ms: result.latency_ms, prompt_len: args.prompt.length, response_len: result.response.length, images: args.images?.length ?? 0 });
-      return asText(result);
+      return asText(longAnswerResult(result, 'ask_codex'));
     }
     case 'ask_gemini': {
       const result = await askGemini({
@@ -699,7 +715,7 @@ async function callTool(req, extra) {
         timeout_ms: callTimeoutMs ?? settings.timeout_ms
       });
       appendLog(settings, { tool: 'ask_gemini', model: result.model, latency_ms: result.latency_ms, prompt_len: args.prompt.length, response_len: result.response.length });
-      return asText(result);
+      return asText(longAnswerResult(result, 'ask_gemini'));
     }
     case 'ask_agy': {
       const result = await askAgy({
@@ -714,7 +730,7 @@ async function callTool(req, extra) {
         prompt_len: args.prompt.length, response_len: result.response.length,
         tokens: result.tokens
       });
-      return asText(result);
+      return asText(longAnswerResult(result, 'ask_agy'));
     }
     case 'agy_generate_image': {
       const result = await agyGenerateImage({
@@ -780,7 +796,7 @@ async function callTool(req, extra) {
         prompt_len: args.prompt.length, response_len: result.response.length,
         tokens: result.tokens, reasoning_chars: result.reasoning_chars
       });
-      return asText(result);
+      return asText(longAnswerResult(result, 'ask_local'));
     }
     case 'local_status': {
       const runner = chosenRunner(settings, args.runner);
@@ -824,14 +840,14 @@ async function callTool(req, extra) {
       const fn = pickChatFn('start', p);
       const result = await fn(chatStartArgs(p, args, settings, callTimeoutMs));
       appendLog(settings, { tool: 'consult_chat_start', participant: p, model: result.model, latency_ms: result.latency_ms, prompt_len: args.prompt.length, response_len: result.response.length, session_id: result.session_id });
-      return asText({ ...result, participant: p });
+      return asText({ ...longAnswerResult(result, `chat_${p}`), participant: p });
     }
     case 'consult_chat_send': {
       const p = args.participant;
       const fn = pickChatFn('send', p);
       const result = await fn(chatSendArgs(p, args, settings, callTimeoutMs));
       appendLog(settings, { tool: 'consult_chat_send', participant: p, model: result.model, latency_ms: result.latency_ms, prompt_len: args.prompt.length, response_len: result.response.length, session_id: result.session_id });
-      return asText({ ...result, participant: p });
+      return asText({ ...longAnswerResult(result, `chat_${p}`), participant: p });
     }
     case 'consult_chat_end': {
       const p = args.participant;

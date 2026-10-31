@@ -31,15 +31,28 @@ import {
   projectKey, projectSettings, saveProjectSettings, withLockFolder, removeTaskWhen, unmergedBase, isSupervisorLive, ACTIVE_STATES
 } from './delegate-store.js';
 import { launchSupervisor, copyWorkFolder } from './delegate-supervisor.js';
+import { isLongText, previewWithPath } from './long-answer.js';
 
 // ---- the words ----
 
-const ROUTING_WHEN =
-  "Background task run by Codex, agy or a local model instead of a Claude subagent. Use when the user names one of those workers or their models, or says 'through consult' / 'another model' / 'not Claude'.";
-const ROUTING_NOT = 'For ordinary delegation use your own subagent tool.';
-// When to use delegate and when not; the tool description opens with this and
-// the server instructions (which stay loaded when tools are deferred) carry it.
-export const DELEGATE_ROUTING_TEXT = `${ROUTING_WHEN} ${ROUTING_NOT}`;
+// Ask or delegate: one rule, said the same way in the server instructions
+// (which stay loaded when tools are deferred), the delegate description and
+// the ask_* descriptions. The worker's name never picks the route.
+export const ASK_OR_DELEGATE_RULE =
+  'Ask or delegate. consult is in play when the user names codex, agy, local or their models, or says through consult / another model / not Claude; the name picks the worker, never the route. First match wins: ' +
+  '1) an instruction to delegate -> delegate, even for a quick question (not a quoted or negated "delegate"); ' +
+  '2) project work (fix, write or edit files, run, debug, investigate, inspect folders) or research over many sources -> delegate, even if they say ask; ' +
+  '3) an answer, explanation or summary from knowledge or text in the conversation -> ask_*; ' +
+  '4) ask, consult, what does X think, second opinion -> ask_*; task, hand off, give X the job, have X work on -> delegate; ' +
+  '5) ask_*. A longer ask timeout never replaces delegate. Without consult in play, use your own subagents.';
+// The delegate description opens with this.
+export const DELEGATE_ROUTING_TEXT =
+  'Background task run by Codex, agy or a local model in the project folder: work on the project (fix, write or edit files, run, debug, investigate), inspecting project folders, or research over many sources. ' +
+  'Use it whenever the user tells one of those workers to delegate, even a quick question, and for such work even when they say "ask". Otherwise an answer, explanation or summary goes to ask_<worker>; if that still leaves it open, task, hand off, give X the job and have X work on mean delegate. ' +
+  "With no consult worker named and no 'through consult' / 'another model' / 'not Claude', use your own subagent tool.";
+// Added to the ask_* descriptions when delegate is on.
+export const ASK_DELEGATE_NOTE =
+  'This is for one bounded question: one prompt, one text reply. When the user says to delegate (even a quick question), or wants work on the project (fix, write or edit files, run, debug, investigate), inspection of project folders, or research over many sources, use `delegate` instead; a longer timeout_s is no substitute.';
 
 export const GIT_SETUP_QUESTION =
   'This project has no git; a separate copy needs it. Set it up (`git init`, a `.gitignore`, a first commit)? Otherwise workers edit here.';
@@ -260,13 +273,18 @@ export function needsAttention(task) {
 
 // final.md counts only when the task's latest run recorded it: a run that failed
 // leaves final_path null, and an older run's answer is not its own.
+// A report too long for one tool result comes back as its start and the
+// path of the whole file, which Claude reads there.
 function readFinalMessage(task) {
   if (!task.final_path) return null;
+  const finalPath = path.join(taskFolder(task.id), 'final.md');
+  let text;
   try {
-    return fs.readFileSync(path.join(taskFolder(task.id), 'final.md'), 'utf8');
+    text = fs.readFileSync(finalPath, 'utf8');
   } catch (_) {
     return null;
   }
+  return isLongText(text) ? previewWithPath(text, finalPath) : text;
 }
 
 // How many local tasks are in front of this one: running on the runner, or queued earlier.

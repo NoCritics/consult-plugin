@@ -1,19 +1,31 @@
 ---
 name: second-opinion
-description: Use when the user wants an answer from a model other than you - a second opinion, a named external model (Codex/GPT/OpenAI, Antigravity/agy, Gemini, a separately invoked Claude), a local model (llama-swap, Ollama, LM Studio, llama-server, vLLM, or a local model name like qwen), a council vote or tournament where several models compete, an ongoing chat with one of them, or an image to be generated with Antigravity or with GPT through Codex. This includes screenshots, mockups or diagrams the user wants that model to look at, and questions about whether those CLIs or the local runner are signed in and reachable. Routes to the consult MCP server's tools.
+description: Use when the user wants an answer from a model other than you - a question for it, a second opinion, a named external model (Codex/GPT/OpenAI, Antigravity/agy, Gemini, a separately invoked Claude), a local model (llama-swap, Ollama, LM Studio, llama-server, vLLM, or a local model name like qwen), a council vote or tournament where several models compete, an ongoing chat with one of them, or an image to be generated with Antigravity or with GPT through Codex. This includes screenshots, mockups or diagrams the user wants that model to look at, and questions about whether those CLIs or the local runner are signed in and reachable. Routes to the consult MCP server's tools. For work on the project, research over many sources, or anything the user tells that model to delegate (even a quick question), use consult:delegate instead.
 ---
 
 # Second Opinion
 
 Route the user's request to the external models exposed by the `consult` MCP server: Codex, Antigravity (agy), the legacy Gemini CLI, a local model, or a council of several.
 
+## Ask or delegate
+
+Decide this first. The model the user names picks the worker, never the route. The first match wins:
+
+1. The user tells the worker to delegate, even a quick question -> `delegate`. A quoted or negated "delegate" does not count.
+2. Project work (fix, write or edit files, run, debug, investigate, inspect folders) or research over many sources -> `delegate`, even when the user says "ask".
+3. An answer, explanation or summary from knowledge or from text in the conversation -> an ask tool (the rest of this skill).
+4. The verb: "ask", "consult", "what does X think", "second opinion" -> an ask tool; "task", "hand off", "give X the job", "have X work on" -> `delegate`.
+5. Otherwise an ask tool.
+
+A longer `timeout_s` never replaces `delegate`. When the request belongs to delegate, follow `/consult:delegate`'s steps (the `delegate` tool) and stop reading here.
+
 ## Decide which tool to call
 
 - User names "Codex", "GPT", "OpenAI", "o3", "gpt-5" to ask a question or get an answer -> `mcp__plugin_consult_consult__ask_codex`. If the request is for an image, use `codex_generate_image` (see the image lines below) instead.
-- User names "Gemini", "Google", "Antigravity", "agy" -> `mcp__plugin_consult_consult__ask_agy`. This is the DEFAULT Google-side provider.
+- User names "Gemini", "Google", "Antigravity", "agy" for a question -> `mcp__plugin_consult_consult__ask_agy`. This is the DEFAULT Google-side provider.
   - Only use `mcp__plugin_consult_consult__ask_gemini` when the user explicitly names the **legacy gemini CLI** and clearly means it. Google withdrew its free tier for individual accounts, so it fails with an ineligible-tier error unless they have a paid `GEMINI_API_KEY`. If they said "gemini" generically, use `ask_agy` and mention you used Antigravity.
   - `agy` also fronts non-Google models (Claude Sonnet/Opus, GPT-OSS). Call `mcp__plugin_consult_consult__agy_status` to list what is reachable rather than guessing model ids.
-- User names "local", "locally", "offline", "private", "llama-swap", "ollama", "LM Studio", "llama.cpp", "vLLM", or a local model name ("qwen", "llama", "mistral", "gemma") -> `mcp__plugin_consult_consult__ask_local`. Free — the model runs on this machine with no API tokens; Claude (a cloud model) still writes the prompt and reads the answer.
+- User names "local", "locally", "offline", "private", "llama-swap", "ollama", "LM Studio", "llama.cpp", "vLLM", or a local model name ("qwen", "llama", "mistral", "gemma") for a question -> `mcp__plugin_consult_consult__ask_local`. Free — the model runs on this machine with no API tokens; Claude (a cloud model) still writes the prompt and reads the answer.
 - User names a local nickname ("ask local fast", "the big local model") -> `ask_local` with `model` set to it (`fast`, `vision`, `vision-best`, `big`); a fragment of a model name ("distill", "27b") works when it matches one model.
 - User asks to set up, pick or rename their local models, or to switch local runner ("use ollama", "back to llama-swap") -> `/consult:setlocal` (with the runner name to switch; the `local_setup` tool; save only what the user confirms).
 - User wants one local call on another runner ("ask ollama's fast") -> `ask_local` with `runner`; it is refused while the runner in use holds a model, and `local_unload` frees it only after the user agrees.
@@ -43,7 +55,7 @@ Pass exactly what the user wants asked. If the user said "ask codex about X", th
 
 ### File detection and inlining (default behavior, always on)
 
-External CLIs have NO access to your filesystem - they only see the prompt string. Before calling any consult tool, scan the user's request for file references and inline them automatically.
+External CLIs have NO access to your filesystem - they only see the prompt string. Before calling an ask tool, a chat tool or `council_vote` (delegate workers read files themselves), scan the user's request for file references and inline them automatically.
 
 **Detect:**
 - Explicit paths in the request (e.g. `src/utils.py`, `./foo.js`, `C:\path\file.ext`, paths with line ranges like `src/api.py:50-80` or `src/api.py#L50-L80`).

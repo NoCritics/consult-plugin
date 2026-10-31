@@ -1,5 +1,5 @@
 ---
-description: Send a prompt to a local model (llama-swap, Ollama, LM Studio, llama-server) and return its clean response
+description: Ask a local model (llama-swap, Ollama, LM Studio, llama-server) one question and return its answer. Not when the user says to delegate, or for project work or research over many sources - use consult:delegate
 argument-hint: "[--model <name>] [--runner <runner>] [--think | --no-think] [--image <path>] <prompt to send to the local model>"
 allowed-tools: ["mcp__plugin_consult_consult__ask_local", "mcp__plugin_consult_consult__local_status"]
 ---

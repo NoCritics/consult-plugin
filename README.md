@@ -166,6 +166,7 @@ Optional. They go in `~/.claude/consult.local.md` (global) or `<project>/.claude
 - **Cleanup:**
   - Cancelling a call stops the CLI behind it.
   - agy's saved conversation is deleted after a one-off question. A chat keeps its conversation until you end the chat.
+- **Long answers:** in Claude Code, an answer over 40,000 bytes is saved in full to `~/.claude/consult-answers/`, which keeps the last 100. Claude gets the first 8,000 characters and the file's path.
 - **Remote servers:** no tool takes a server address, so a prompt can't send your prompts elsewhere. consult warns if a project's settings point a local runner at another machine.
 
 ## More

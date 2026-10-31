@@ -1,6 +1,6 @@
 {
   "name": "consult",
-  "version": "0.15.2",
+  "version": "0.15.3",
   "description": "Consult external AI CLIs (Codex, Antigravity) and local models (llama-swap, Ollama, LM Studio, llama-server, vLLM) from inside Claude Code. Exposes them as MCP tools, slash commands, an auto-triggering skill, and multi-turn chat sessions.",
   "author": {
     "name": "NoCritics",

@@ -50,6 +50,8 @@ export type Outcome = {
   effort: string | null
   images: ImageRef[]
   council: CouncilInfo | null
+  // consult saved a very long answer to a file and returned its start.
+  answerSaved?: true
 }
 
 export type Ran = { result?: unknown; text?: string; isError?: true; deny?: string }
@@ -149,6 +151,9 @@ export function interpretResult(tool: string, ran: Ran): Outcome {
     return { status: 'answered', answer: lines.join('\n'), model, effort, images, council: null }
   }
   if (typeof body.response === 'string') {
+    if (typeof body.full_answer_path === 'string') {
+      return { status: 'answered', answer: body.response, model, effort, images: [], council: null, answerSaved: true }
+    }
     return { status: 'answered', answer: body.response, model, effort, images: [], council: null }
   }
   return { status: 'answered', answer: text, model, effort, images: [], council: null }

@@ -4,6 +4,20 @@ All notable changes to this plugin are documented here. Format loosely follows [
 
 ## [Unreleased]
 
+## [0.15.3] - 2026-10-31
+
+### Fixed
+
+- **Claude picks between asking a model and delegating to it by one rule.** "Delegate agy to research…" could turn into a 15-minute `ask_agy` call instead of a background task. Naming a model now picks only the worker. The first match decides:
+  1. Being told to delegate means `delegate`, even for a quick question.
+  2. Project work (fix, write, run, debug, investigate) or research over many sources means `delegate`, even when the user says "ask".
+  3. An answer, explanation or summary means `ask_*`.
+  4. Otherwise the verb decides: "ask" or "what does X think" means `ask_*`; "task", "hand off" or "give X the job" means `delegate`.
+  5. Failing all of these, `ask_*`.
+
+  The server instructions, the tool descriptions and the skills now say the same thing. In 17 test prompts run twice each, Claude picked the expected tool 34 of 34 times, up from 31 of 34.
+- **A very long answer no longer comes back as an error.** Claude Code refuses a tool result over about 25,000 tokens, and it saved a 76,000-character agy answer as JSON with the whole answer on one line. Now, in Claude Code, an answer over 40,000 bytes from an ask tool or a chat is saved in full as Markdown in `~/.claude/consult-answers/`, which keeps the last 100. Claude gets the first 8,000 characters, the length and the path. A delegated task's report that long comes back the same way, with the path to its `final.md`. Claude Desktop, which can't open the file, still gets the whole answer.
+
 ## [0.15.2] - 2026-10-30
 
 ### Security

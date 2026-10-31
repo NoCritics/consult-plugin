@@ -31,6 +31,14 @@ describe('outcome', () => {
     expect(outcome.answer).toBe('The screenshot shows a login form.')
   })
 
+  test('an answer saved to a file is marked as cut short', () => {
+    const body = JSON.stringify({ response: 'The start.\n\n[The answer continues: 50000 characters in all. The full answer is in C:/a.md. Read it there, in parts.]', model: 'm', full_answer_path: 'C:/a.md', response_chars: 50000 })
+    const saved = interpretResult('ask_agy', { result: [{ type: 'text', text: body }], text: body })
+    expect(saved.answerSaved).toBe(true)
+    expect(saved.answer).toContain('C:/a.md')
+    expect(interpretResult('ask_codex', fixtures.CODEX_ANSWER).answerSaved).toBe(undefined)
+  })
+
   test('agy answer with denied actions', () => {
     const outcome = interpretResult('ask_agy', fixtures.AGY_ANSWER_WITH_DENIED)
     expect(outcome.status).toBe('answered')

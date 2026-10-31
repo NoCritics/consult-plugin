@@ -1,5 +1,5 @@
 ---
-description: Hand a background task to Codex, agy or a local model instead of a Claude subagent
+description: Hand project work (fix, write, run, debug, investigate) or research over many sources to Codex, agy or a local model as a background task; also whenever the user tells one of them to delegate, even a quick question
 argument-hint: "[codex | agy | local | local:<nickname>] <the task>"
 allowed-tools: ["mcp__plugin_consult_consult__delegate", "mcp__plugin_consult_consult__delegate_status", "mcp__plugin_consult_consult__delegate_result", "mcp__plugin_consult_consult__delegate_wait", "mcp__plugin_consult_consult__delegate_list", "mcp__plugin_consult_consult__delegate_cancel"]
 ---
@@ -27,6 +27,6 @@ Hand a task to another model (Codex, agy or a local model) that works on it in t
 
 ## Notes
 
-- This command is the guaranteed route to consult's workers. Without it, use `delegate` only when the user names Codex, agy or a local model, or says "through consult", "another model" or "not Claude"; for ordinary delegation use your own subagent tool.
+- This command is the guaranteed route to consult's workers. Without it, `delegate` applies once the user names Codex, agy or a local model, or says "through consult", "another model" or "not Claude", and then for work, research over many sources, or an instruction to delegate (the ask-or-delegate rule in the server instructions); otherwise use your own subagent tool.
 - A local worker keeps the worker's own model calls on this machine, but it is not offline and you, who write the brief and read the result, are a cloud model. Do not call it "private" beyond that.
 - `delegate_send` sends a follow-up to a task whose run ended, in the same worker session and folder; `delegate_cancel` stops a running one; `delegate_status` and `delegate_list` show where tasks stand.

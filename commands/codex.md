@@ -1,5 +1,5 @@
 ---
-description: Send a prompt to the Codex CLI (OpenAI) and return its clean response
+description: Ask Codex (OpenAI) one question and return its answer. Not when the user says to delegate, or for project work or research over many sources - use consult:delegate
 argument-hint: "[--image <path>] <prompt to send to Codex>"
 allowed-tools: ["mcp__plugin_consult_consult__ask_codex", "mcp__plugin_consult_consult__codex_login_status", "mcp__plugin_consult_consult__codex_login_start"]
 ---

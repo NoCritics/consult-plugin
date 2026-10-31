@@ -4231,7 +4231,7 @@ try {
           const names = toolsModule.DELEGATE_TOOLS.map((tool) => tool.name);
           eq('the eight tools are defined', names, ['delegate', 'delegate_status', 'delegate_list', 'delegate_result', 'delegate_merge', 'delegate_send', 'delegate_cancel', 'delegate_wait']);
           const description = toolsModule.DELEGATE_TOOLS[0].description;
-          truthy('delegate: the description opens with the routing text', description.startsWith("Background task run by Codex, agy or a local model instead of a Claude subagent. Use when the user names one of those workers or their models, or says 'through consult' / 'another model' / 'not Claude'. For ordinary delegation use your own subagent tool."));
+          truthy('delegate: the description opens with the routing text', description.startsWith(toolsModule.DELEGATE_ROUTING_TEXT) && description.startsWith('Background task run by Codex, agy or a local model in the project folder:'));
           const missingAliases = Object.keys(WORKER_ALIASES).filter((alias) => !description.includes(alias));
           eq('delegate: every worker alias is listed', missingAliases, []);
           truthy('delegate: the fences are in plain words', /codex[^.]*only inside its copy/i.test(description) && /agy[^.]*not fenced[^.]*can't run commands/i.test(description) && /local[^.]*not fenced[^.]*read-only tasks get read tools only/i.test(description));
@@ -4492,6 +4492,15 @@ try {
           updateTask(running.id, { state: 'running' });
           const stillRunning = await call('delegate_result', { id: running.id }, contextFor(repo));
           eq('delegate_result: a running task has no final message and is not marked reported', [stillRunning.value.state, stillRunning.value.final_message, readTask(running.id).reported_at], ['running', null, null]);
+
+          const longReport = createTask({ worker: 'agy', mode: 'read', location: 'here', project: repo, title: 'long report', brief: 'b\n' });
+          const longReportPath = path.join(taskFolder(longReport.id), 'final.md');
+          const longReportText = `## Findings\n${'A finding with its source.\n'.repeat(3000)}`;
+          fs.writeFileSync(longReportPath, longReportText);
+          updateTask(longReport.id, { state: 'done', summary: 'Found things.', ended_at: Date.now(), final_path: longReportPath });
+          const longResult = await call('delegate_result', { id: longReport.id }, contextFor(repo));
+          truthy('delegate_result: a very long report comes back as its start and the path of final.md',
+            longResult.value.final_message.startsWith('## Findings\n') && longResult.value.final_message.includes(longReportPath) && longResult.value.final_message.length < longReportText.length / 5);
 
           const failedTask = createTask({ worker: 'agy', mode: 'read', location: 'here', project: repo, title: 'failed one', brief: 'b\n' });
           updateTask(failedTask.id, { state: 'failed', summary: 'Failed: boom', limit: { kind: 'exhausted', resets_at: 5 }, denied: ['shell'], warning: 'careful' });

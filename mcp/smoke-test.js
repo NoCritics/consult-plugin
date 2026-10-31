@@ -79,7 +79,7 @@ try {
   if (missingDelegate.length) {
     console.error('FAIL: tools/list lacks the delegate tools:', missingDelegate.join(', '));
     failed = true;
-  } else if (!list.find(tool => tool.name === 'delegate').description.startsWith('Background task run by Codex, agy or a local model instead of a Claude subagent.')) {
+  } else if (!list.find(tool => tool.name === 'delegate').description.startsWith('Background task run by Codex, agy or a local model in the project folder:')) {
     console.error('FAIL: the delegate description does not open with the routing text');
     failed = true;
   } else {
@@ -107,11 +107,23 @@ try {
   } else {
     console.log('server instructions OK -', instructions.length, 'chars, name all tools');
   }
-  if (!instructions.includes("Background task run by Codex, agy or a local model instead of a Claude subagent. Use when the user names one of those workers or their models, or says 'through consult' / 'another model' / 'not Claude'.")) {
-    console.error('FAIL: the server instructions lack the delegate routing text');
+  if (!instructions.includes('Ask or delegate.') || !instructions.includes('an instruction to delegate -> delegate, even for a quick question')) {
+    console.error('FAIL: the server instructions lack the ask-or-delegate rule');
     failed = true;
   } else {
-    console.log('server instructions carry the delegate routing text OK');
+    console.log('server instructions carry the ask-or-delegate rule OK');
+  }
+  // Each ask tool points work and research at delegate.
+  const askWithoutNote = [];
+  for (const tool of list) {
+    const isAskTool = tool.name === 'ask_codex' || tool.name === 'ask_agy' || tool.name === 'ask_local';
+    if (isAskTool && !tool.description.includes('use `delegate` instead')) askWithoutNote.push(tool.name);
+  }
+  if (askWithoutNote.length) {
+    console.error('FAIL: ask tools without the delegate note:', askWithoutNote.join(', '));
+    failed = true;
+  } else {
+    console.log('ask tools point work and research at delegate OK');
   }
 
   const callMsg = await waitFor(3, 10000);
@@ -226,6 +238,16 @@ try {
     failed = true;
   } else {
     console.log('CONSULT_DELEGATE=off: instructions carry no delegate text OK');
+  }
+  const desktopAskNamingDelegate = [];
+  for (const tool of desktopList) {
+    if (tool.name.startsWith('ask_') && /delegate/i.test(tool.description)) desktopAskNamingDelegate.push(tool.name);
+  }
+  if (desktopAskNamingDelegate.length) {
+    console.error('FAIL: with CONSULT_DELEGATE=off these ask tools mention delegate:', desktopAskNamingDelegate.join(', '));
+    failed = true;
+  } else {
+    console.log('CONSULT_DELEGATE=off: ask tools do not mention delegate OK');
   }
   const desktopCall = await desktop.waitFor(3, 10000);
   if (!desktopCall.error) {
