@@ -56,7 +56,7 @@ Ask in plain words, or use a slash command.
 
 ## In Claude Code
 
-- **The band.** While a call runs, a row above the prompt shows what kind of call it is (`ask`, `chat`, `image`, `council`), the model, a bar against its time limit, and **Cancel**, which stops that call only. A background task gets a `delegate` row for as long as it runs, with its time against the task's limit and a Cancel of its own; with only tasks shown, the band's button opens the Delegated tab. A row that ends while others still run stays as its result line; when the last one ends, one short row says how it went. Either stays until your next prompt. The rows fit a band narrowed by the `/consult` pane.
+- **The band.** While a call runs, a row above the prompt shows what kind of call it is (`ask`, `chat`, `image`, `council`), the model, a bar against its time limit, and **Cancel**, which stops that call only. A background task gets a `delegate` row for as long as it runs, with its time against the task's limit and a Cancel of its own; with only tasks shown, the band's button opens the Delegated tab. A row that ends while others still run stays as its result line (the three newest; older ones fold into one line); when the last one ends, one short row says how it went. Either stays until your next prompt. The rows fit a band narrowed by the `/consult` pane.
 - **The `/consult` pane** has three tabs:
   - **Answers:** this session's and earlier sessions' answers (the last 50), with copy buttons. Image entries can be opened, shown in their folder or copied as a path. kitty and Ghostty display PNGs in the pane.
   - **Local models:** choose the runner and a model for each nickname. Shows the settings change before you save.

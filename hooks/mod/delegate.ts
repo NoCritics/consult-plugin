@@ -110,6 +110,8 @@ let sessionProjectFound: string | null = null
 let projectKeys = new Map<string, string>()
 // When this session last stamped its claim on a task, by task id, so the store is asked only when a stamp is due.
 let claimStamps = new Map<string, number>()
+// Each band task's time limit, by task id; 0 when its state.json has none either.
+let knownLimits = new Map<string, number>()
 
 function textOrNull(value: unknown): string | null {
   return typeof value === 'string' ? value : null
@@ -438,24 +440,38 @@ function bandTaskOf(row: TaskRow): BandTask {
 // The owned tasks the band shows, in the index's order: the queued and running
 // ones, and the ones that ended while it showed them, kept until the person's
 // next prompt.
-// A task's time limit never changes, so one the band already knows is kept
-// when a row comes without it: a consult server older than 0.15.4, still
-// running in another session, rewrites the shared index without the field.
 function nextBand(shown: BandTask[], seen: BandTask[]): BandTask[] {
+  const shownIds = new Set<string>()
+  for (const task of shown) shownIds.add(task.id)
   const next: BandTask[] = []
   for (const task of seen) {
-    let shownBefore: BandTask | null = null
-    for (const shownTask of shown) {
-      if (shownTask.id === task.id) shownBefore = shownTask
-    }
-    if (!isActiveState(task.state) && shownBefore === null) continue
-    if (task.limitMs === null && shownBefore !== null && shownBefore.limitMs !== null) {
-      next.push({ ...task, limitMs: shownBefore.limitMs })
-    } else {
-      next.push(task)
-    }
+    if (isActiveState(task.state) || shownIds.has(task.id)) next.push(task)
   }
   return next
+}
+
+// A task's time limit never changes. A consult server older than 0.15.4,
+// still running in another session, rewrites the shared index without it, so
+// a row without one takes the limit seen before, or else the one in the
+// task's own state.json, read once.
+async function timeLimitOf($: EngineInterface, home: string, row: TaskRow): Promise<number | null> {
+  if (row.timeLimitMs !== null) {
+    knownLimits.set(row.id, row.timeLimitMs)
+    return row.timeLimitMs
+  }
+  let known = knownLimits.get(row.id)
+  if (known === undefined) {
+    known = 0
+    try {
+      const state = parseObject(await $.fs.read(`${home}/tasks/${row.id}/state.json`))
+      if (state !== null && typeof state.time_limit_ms === 'number' && state.time_limit_ms > 0) known = state.time_limit_ms
+    } catch {
+      // unreadable for now (Windows refuses a reader for a moment): asked again next tick
+      return null
+    }
+    knownLimits.set(row.id, known)
+  }
+  return known > 0 ? known : null
 }
 
 // The person's prompt: the tasks that ended leave the band, as the finished calls do.
@@ -538,7 +554,7 @@ async function scan($: EngineInterface, now: number): Promise<void> {
       isOrphan = true
     }
     if (!isOwned) continue
-    seenTasks.push(bandTaskOf(row))
+    seenTasks.push(bandTaskOf({ ...row, timeLimitMs: await timeLimitOf($, home, row) }))
 
     if (isActiveState(row.state)) isOwnedTaskActive = true
     // Reported (delegate_result, delegate_merge): Claude has dealt with it.
@@ -632,6 +648,7 @@ export function startDelegateWatch($: EngineInterface): void {
   sessionProjectFound = null
   projectKeys = new Map()
   claimStamps = new Map()
+  knownLimits = new Map()
   isSweepPending = true
   armTicker($)
   $.clock.after(0, () => {

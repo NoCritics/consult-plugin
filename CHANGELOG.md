@@ -4,6 +4,13 @@ All notable changes to this plugin are documented here. Format loosely follows [
 
 ## [Unreleased]
 
+## [0.15.6] - 2026-11-01
+
+### Fixed
+
+- **Ended rows can no longer pile up in the band.** While something still runs, the three most recently ended rows keep their places and older ones fold into one line above them (`✓ 2 answers · 1 task done`). A long turn of many calls used to push the prompt up a row per call.
+- **A task first seen without its time limit gets it.** When an older server had already rewritten the index before the band first saw a task, its bar was missing for the whole run. The band now reads the limit from the task's own state file, once, and keeps it for every reader of the row, not only the band.
+
 ## [0.15.5] - 2026-11-01
 
 ### Changed

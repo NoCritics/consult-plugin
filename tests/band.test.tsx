@@ -4,7 +4,7 @@ import type { Engine } from 'claude-code/testing'
 
 import type { CallRecord } from '../types'
 import * as fixtures from './fixtures/results'
-import { CONSULT, PLUGIN, answerConsult, beatInstance, delegateRow, setDelegateIndex, world } from './world'
+import { CONSULT, DELEGATE_DATA, PLUGIN, answerConsult, beatInstance, delegateRow, setDelegateIndex, world } from './world'
 import type { World, WorldOptions } from './world'
 
 const DENY = 'Cancelled by the user from the consult band.'
@@ -336,14 +336,25 @@ describe('band', () => {
     await ui.unmount()
   })
 
-  test('a row an older server rewrote without its limit keeps the limit the band knew', async ($, on) => {
+  test('a row an older server rewrote without its limit keeps the limit and the bar the band knew', async ($, on) => {
     const w = await withTasks($, on, [delegateRow({ time_limit_ms: 180 * 60000 })])
     await w.clock.advance(5000)
-    const withoutLimit = delegateRow()
-    setDelegateIndex(w, [withoutLimit])
+    setDelegateIndex(w, [delegateRow()])
     await w.clock.advance(5 * 60000)
     const ui = await $.ui.mount(BAND)
     expect(await ui.find({ text: /5m05s \/ 3h00m/ })).toBeDefined()
+    // The bar is drawn again, not only the clock.
+    expect((await roundBoxes(ui))[0]?.text).toContain('░')
+    await ui.unmount()
+  })
+
+  test('a row first seen without its limit takes it from the task state file', async ($, on) => {
+    const w = await withTasks($, on, [delegateRow()], {}, world => {
+      world.files[`${DELEGATE_DATA}/tasks/${TASK}/state.json`] = JSON.stringify({ id: TASK, time_limit_ms: 180 * 60000 })
+    })
+    await w.clock.advance(5000)
+    const ui = await $.ui.mount(BAND)
+    expect(await ui.find({ text: /5s \/ 3h00m/ })).toBeDefined()
     await ui.unmount()
   })
 
@@ -441,6 +452,24 @@ describe('band', () => {
     expect(text).toContain('✓ ask · codex')
     expect(text.indexOf('✓ ask · codex')).toBeLessThan(text.indexOf('delegate · codex'))
     expect(await ui.find({ key: 'answers' })).toBeDefined()
+    await ui.unmount()
+  })
+
+  test('past three ended rows, the older ones fold into one line above them', async ($, on) => {
+    const { clock } = await withTasks($, on, [delegateRow()], {}, w => answerConsult(on, w.clock, fixtures.CODEX_ANSWER, { afterMs: 1000 }))
+    for (let index = 1; index <= 5; index++) {
+      const pending = $.tool.call({ tool: `${CONSULT}ask_codex`, tool_use_id: `call-${index}`, prompt: 'x' })
+      await clock.advance(1000)
+      await pending
+      await clock.settle()
+    }
+    const ui = await $.ui.mount(BAND)
+    const text = (await roundBoxes(ui))[0]?.text ?? ''
+    expect(text).toContain('✓ 2 answers')
+    expect(text.split('✓ ask · codex').length - 1).toBe(3)
+    expect(text.indexOf('✓ 2 answers')).toBeLessThan(text.indexOf('✓ ask · codex'))
+    expect(text.split('consult').length - 1).toBe(1)
+    expect(await ui.find({ key: `cancel-task:${TASK}` })).toBeDefined()
     await ui.unmount()
   })
 
