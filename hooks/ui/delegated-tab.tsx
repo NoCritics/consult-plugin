@@ -15,10 +15,13 @@ import {
   confirmYes,
   dropConfirm,
   editSetting,
+  fenceChosen,
+  fenceNote,
+  fencesOf,
   hasChanges,
   isAskedAbout,
-  isNotFenced,
   labelTail,
+  liftWarning,
   localAtOnceSummary,
   markOf,
   openFoldOnClose,
@@ -78,6 +81,11 @@ const STOPPING_LABEL = 'Stopping…'
 const SETTING_COLUMN = 25
 const TABLE_INDENT = 2
 const TABLE_LABELS: Record<(typeof TABLE_ROWS)[number], string> = { code: 'code', research_review: 'research & review', private: 'private' }
+// agy and Local are only asked to stay in the project folder.
+const SOFT_FENCE_OPTIONS = [
+  { value: 'soft', label: 'stay in folder' },
+  { value: 'none', label: 'anywhere' },
+]
 const WORKER_OPTIONS = [
   { value: 'codex', label: 'codex' },
   { value: 'agy', label: 'agy' },
@@ -85,6 +93,20 @@ const WORKER_OPTIONS = [
   // The worker is asked for when a task of that kind comes up.
   { value: 'ask', label: 'ask' },
 ]
+const FENCE_ROWS = [
+  {
+    worker: 'codex',
+    label: 'Codex',
+    field: 'fence_codex',
+    options: [
+      { value: 'fenced', label: 'fenced' },
+      { value: 'full', label: 'full access' },
+    ],
+    hint: "enforced by Codex's sandbox",
+  },
+  { worker: 'agy', label: 'agy', field: 'fence_agy', options: SOFT_FENCE_OPTIONS, hint: 'asked only, not enforced' },
+  { worker: 'local', label: 'Local', field: 'fence_local', options: SOFT_FENCE_OPTIONS, hint: 'asked only, not enforced' },
+] as const
 const WORKERS_EDIT_OPTIONS = [
   { value: 'auto', label: 'Auto' },
   { value: 'here', label: 'Here' },
@@ -274,7 +296,8 @@ export function drawDelegatedTab($: EngineInterface, table: Table, surface: stri
     }
     if (openButtons.length > 0) lines.push(<Box flexDirection="row">{openButtons}</Box>)
     const notes: string[] = []
-    if (isNotFenced(row)) notes.push('not fenced')
+    const fenceText = fenceNote(row)
+    if (fenceText !== null) notes.push(fenceText)
     if (row.worker === 'agy') notes.push("can't run commands")
     if (row.worker === 'local' && row.state === 'running' && row.keep_running) notes.push('keeps the GPU busy and its model loaded')
     if (notes.length > 0) lines.push(<Text color="warning" wrap="truncate-end">{notes.join(' · ')}</Text>)
@@ -405,13 +428,21 @@ export function drawDelegatedTab($: EngineInterface, table: Table, surface: stri
       if (option.value === settings.workers_edit) workersEditName = option.label
     }
     const summary = `workers edit ${workersEditName} · table · local at once ${localAtOnceSummary(settings)} · limit ${timeLimitSummary(settings.time_limit_min)}`
+    // A lifted fence leads, on its own wrapping lines, so a narrow width cuts the
+    // rest of the summary and never the marker.
+    const fences = fencesOf(settings)
+    const liftedParts: string[] = []
+    if (fences.codex === 'full') liftedParts.push('codex full access')
+    if (fences.agy === 'none') liftedParts.push('agy anywhere')
+    if (fences.local === 'none') liftedParts.push('local anywhere')
     if (!view.isFoldOpen) {
       settingsBlock = (
         <Box flexDirection="row">
           <Box flexShrink={0}>
             <Button key="delegated:fold" plain label="▸ Settings" onPress={() => toggleFold($)} />
           </Box>
-          <Box flexShrink={1} minWidth={0}>
+          <Box flexDirection="column" flexShrink={1} minWidth={0}>
+            {liftedParts.length > 0 ? <Text color="warning" wrap="wrap">{`  ${liftedParts.join(' · ')}`}</Text> : null}
             <Text dimColor wrap="truncate-end">{`  ${summary}`}</Text>
           </Box>
         </Box>
@@ -431,6 +462,24 @@ export function drawDelegatedTab($: EngineInterface, table: Table, surface: stri
           />,
         )
       }
+      const fenceSelects = []
+      for (const fenceRow of FENCE_ROWS) {
+        fenceSelects.push(
+          <Select
+            key={`delegated:set:fence:${fenceRow.worker}`}
+            label={`${' '.repeat(TABLE_INDENT)}${fenceRow.label.padEnd(SETTING_COLUMN - TABLE_INDENT)}`}
+            options={[...fenceRow.options]}
+            value={fenceChosen(view, fenceRow.worker)}
+            onSelect={value => editSetting($, fenceRow.field, value)}
+          />,
+          <Text dimColor>{`${' '.repeat(SETTING_COLUMN)}${fenceRow.hint}`}</Text>,
+        )
+      }
+      const liftText = liftWarning(view)
+      const liftLines = []
+      if (liftText !== null) {
+        for (const sentence of liftText.split('\n')) liftLines.push(<Text color="warning" wrap="wrap">{sentence}</Text>)
+      }
       settingsBlock = (
         <Box flexDirection="column">
           <Button key="delegated:fold" plain label="▾ Settings" onPress={() => toggleFold($)} />
@@ -444,6 +493,9 @@ export function drawDelegatedTab($: EngineInterface, table: Table, surface: stri
             />
             <Text dimColor>Who does what, by kind of task</Text>
             {tableSelects}
+            <Text bold>Fences (this project)</Text>
+            {fenceSelects}
+            {liftLines}
             <Input
               key="delegated:set:local_at_once"
               label={'Local at once'.padEnd(SETTING_COLUMN)}

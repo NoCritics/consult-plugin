@@ -86,4 +86,5 @@
 # delegate.local_at_once: auto          # auto, or a ceiling 1-8 for local tasks at once
 # delegate.on_close: stop               # stop | keep: what happens to running tasks when Claude Code closes
 # delegate.time_limit_min: 180          # per task, 10-1440
+# Worker fences are set per project in the Delegated tab (/consult), not in this file.
 ---

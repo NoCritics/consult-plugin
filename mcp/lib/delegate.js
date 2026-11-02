@@ -23,12 +23,12 @@ import { validateAgyEffort } from './agy.js';
 import { localConfigured, DELEGATE_WORKERS } from './settings.js';
 import { NICKNAME_SPELLINGS } from './local-models.js';
 import { WORKER_ALIASES, parseWorkerWord, workerForKind } from './delegate-route.js';
-import { WORKER_FENCED, requireModelId } from './delegate-workers.js';
+import { requireModelId } from './delegate-workers.js';
 import { lastLimits, limitPolicy } from './delegate-limits.js';
 import { isOutside, gitState, decideLocation, setupAllowed, setupGit, makeCopy, uncommittedCount, removeCopy, changedFiles, diffStat, mergeCopy } from './delegate-git.js';
 import {
   dataHome, taskFolder, createTask, readTask, updateTask, updateTaskWhen, scanTasks, listTasks, indexRow,
-  projectKey, projectSettings, saveProjectSettings, withLockFolder, removeTaskWhen, unmergedBase, isSupervisorLive, ACTIVE_STATES
+  projectKey, projectSettings, taskFence, saveProjectSettings, withLockFolder, removeTaskWhen, unmergedBase, isSupervisorLive, ACTIVE_STATES
 } from './delegate-store.js';
 import { launchSupervisor, copyWorkFolder } from './delegate-supervisor.js';
 import { isLongText, previewWithPath } from './long-answer.js';
@@ -113,7 +113,8 @@ export const DELEGATE_TOOLS = [
       `${DELEGATE_ROUTING_TEXT} ` +
       `Workers: codex, agy, local, or local:<nickname> (${uniqueNicknames().join(', ')}) to pick a local model. ${aliasSentence()} ` +
       '`worker: "auto"` with a `kind` uses the user\'s default table: use it only when the user clearly pointed at consult without naming a worker, and say which worker it chose. ' +
-      'Fences: codex works only inside its copy; agy is not fenced and can\'t run commands; local is not fenced, and read-only tasks get read tools only. ' +
+      'Fences are set per project by the user in the Delegated tab, and the start reply\'s `fence` says this task\'s: codex is `fenced` (works only inside its copy) or `full` (write tasks have full access to the PC; read tasks stay read-only but may read anywhere); agy and local are `soft` (asked in their brief to stay in the folder, not enforced) or `none` (not asked). agy can\'t run commands; local read-only tasks get read tools only. ' +
+      'Never change a fence yourself, with a tool, a script or a file edit: if the user wants one changed, tell them it is in the Delegated tab\'s settings. When `fence_note` is set, tell the user in your one-line start message. ' +
       'A local worker keeps its own model calls on this machine, but it is not offline (its shell can reach the network), and Claude, which writes the brief and reads the result, is a cloud model. ' +
       'Write the brief yourself: the goal, the files involved, what done means and the constraints; the worker cannot see this conversation. ' +
       'Declare `mode`: "read" for research and review, "write" when it edits files. Write tasks run in a separate git copy of the project when it has git (merge it with delegate_merge). A copy starts from the project as it is now, uncommitted changes included (ignored files are not); the reply\'s `uncommitted` field says how many were in it. ' +
@@ -442,7 +443,8 @@ async function startDelegate(args, context) {
     owner_session: context.sessionId ?? null,
     owner_instance: context.instanceId ?? null,
     keep_running: context.settings.delegate.on_close === 'keep',
-    time_limit_ms: context.settings.delegate.time_limit_ms
+    time_limit_ms: context.settings.delegate.time_limit_ms,
+    fence: saved.fence[worker]
   });
   let uncommitted;
   if (decision.location === 'copy') {
@@ -473,10 +475,13 @@ async function startDelegate(args, context) {
   let latest = readTask(task.id);
   const folder = decision.location === 'copy' ? await workFolderOf(latest) : project;
   if (worker === 'local') latest = await waitForLocalStart(task.id, context.startWaitMs ?? LOCAL_START_WAIT_MS);
+  const fence = taskFence(latest);
   const result = {
     started: true, id: task.id, worker, model: latest.model ?? model, location: decision.location, folder,
-    fenced: WORKER_FENCED[worker], state: latest.state
+    fence, fenced: fence === 'fenced', state: latest.state
   };
+  if (fence === 'full') result.fence_note = 'This project\'s fence is lifted: Codex has full access to this PC for this task.';
+  if (fence === 'none') result.fence_note = `This project's fence is lifted: ${worker} is not asked to stay in the project folder.`;
   if (worker === 'local' && latest.state === 'queued') {
     result.queued = true;
     result.queue_model = latest.queue_model ?? null;
@@ -543,6 +548,12 @@ async function resultTool(args, context) {
     limit: task.limit ?? null, limit_hit: task.limit_hit ?? null, denied: task.denied ?? null, warning: task.warning ?? null
   };
   let note = resultNote(task);
+  const fence = taskFence(task);
+  output.fence = fence;
+  if ((fence === 'full' || fence === 'none') && (task.mode === 'write' || task.worker === 'agy')) {
+    const liftedNote = `This task ran with its fence lifted (${fence}): it could change files outside its folder, which no copy or merge covers. Check the worker's final message for files it changed outside the folder and name them to the user.`;
+    note = note === undefined ? liftedNote : `${note} ${liftedNote}`;
+  }
   const baseCommit = unmergedBase(task);
   if (task.location === 'copy' && typeof baseCommit === 'string' && typeof task.end_commit === 'string') {
     try {

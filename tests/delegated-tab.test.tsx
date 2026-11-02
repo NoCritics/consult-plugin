@@ -42,6 +42,7 @@ function task(overrides: Partial<DelegateTaskRow> & { id: string }): DelegateTas
     mode: 'write',
     summary: null,
     fenced: true,
+    fence: null,
     stop_reason: null,
     queue_model: null,
     reported_at: null,
@@ -68,6 +69,7 @@ const DONE_READ = task({ id: 'eee555', worker: 'agy', title: 'review CSS', state
 const SETTINGS: DelegateShow['settings'] = {
   workers_edit: 'auto',
   table: { code: 'codex', research_review: 'agy', private: 'local' },
+  fence: { codex: 'fenced', agy: 'soft', local: 'soft' },
   local_at_once: 'auto',
   // what auto comes to now
   local_slots: 1,
@@ -1478,6 +1480,157 @@ describe('delegated tab', () => {
       expect(await ui.find({ type: 'Text', text: /Local at once: type auto or a number/ })).toBeDefined()
       expect(commandsRun(w)).toEqual(['show'])
       await ui.unmount()
+    })
+
+    describe('fences', () => {
+      const lifted = (fence: Partial<DelegateShow['settings']['fence']>) => shown([RUNNING], { settings: { ...SETTINGS, fence: { ...SETTINGS.fence, ...fence } } })
+      const savesOf = (w: World): string[] => commandsRun(w).filter(command => command.startsWith('save '))
+
+      test('the fences show for this project, enforced and asked-only', async ($, on) => {
+        const { ui } = await mountWith($, on, () => SKETCH)
+        await ui.press({ key: 'delegated:fold' })
+        const all = await lines(ui, 100)
+        expect(lineWith(all, /Fences \(this project\)/)).toBeDefined()
+        expect(lineWith(all, /enforced by Codex's sandbox/)).toBeDefined()
+        expect(lineWith(all, /asked only, not enforced/)).toBeDefined()
+        expect((await ui.find({ key: 'delegated:set:fence:codex' }))?.props.value).toBe('fenced')
+        expect((await ui.find({ key: 'delegated:set:fence:agy' }))?.props.value).toBe('soft')
+        expect((await ui.find({ key: 'delegated:set:fence:local' }))?.props.value).toBe('soft')
+        await ui.unmount()
+      })
+
+      test("lifting Codex's fence warns before saving", async ($, on) => {
+        const { w, ui } = await mountWith($, on, args => (args[0] === 'show' ? SKETCH : { settings: SETTINGS, global_written: false }))
+        await ui.press({ key: 'delegated:fold' })
+        expect(lineWith(await lines(ui, 100), /Full access:/)).toBeUndefined()
+        await ui.select({ key: 'delegated:set:fence:codex', value: 'full' })
+        const warning = await ui.find({ type: 'Text', text: /Full access: Codex can read, change or delete/ })
+        expect(warning?.props.color).toBe('warning')
+        await ui.press({ key: 'delegated:save' })
+        await w.clock.settle()
+        expect(savesOf(w)).toEqual(['save {"fence":{"codex":"full"}}'])
+        await ui.unmount()
+      })
+
+      test('lifting agy or Local warns with the Anywhere text, and both lifted give both lines', async ($, on) => {
+        const { ui } = await mountWith($, on, () => SKETCH)
+        await ui.press({ key: 'delegated:fold' })
+        await ui.select({ key: 'delegated:set:fence:local', value: 'none' })
+        expect(await ui.find({ type: 'Text', text: /Anywhere: agy and Local are no longer asked to stay in the project folder/ })).toBeDefined()
+        expect(await ui.find({ type: 'Text', text: /Full access: Codex can read/ })).toBeUndefined()
+        await ui.select({ key: 'delegated:set:fence:codex', value: 'full' })
+        expect(await ui.find({ type: 'Text', text: /Full access: Codex can read/ })).toBeDefined()
+        expect(await ui.find({ type: 'Text', text: /Anywhere: agy and Local/ })).toBeDefined()
+        await ui.unmount()
+      })
+
+      test('a lift put back before Save shows no warning and nothing to save', async ($, on) => {
+        const { w, ui } = await mountWith($, on, () => SKETCH)
+        await ui.press({ key: 'delegated:fold' })
+        await ui.select({ key: 'delegated:set:fence:codex', value: 'full' })
+        await ui.select({ key: 'delegated:set:fence:codex', value: 'fenced' })
+        expect(lineWith(await lines(ui, 100), /Full access:|Anywhere:/)).toBeUndefined()
+        expect((await ui.find({ key: 'delegated:save' }))?.props.dimColor).toBe(true)
+        await ui.press({ key: 'delegated:save' })
+        await w.clock.settle()
+        expect(savesOf(w)).toEqual([])
+        await ui.unmount()
+      })
+
+      test("saving only agy's fence sends only agy", async ($, on) => {
+        const { w, ui } = await mountWith($, on, args => (args[0] === 'show' ? lifted({ codex: 'full' }) : { settings: SETTINGS, global_written: false }))
+        await ui.press({ key: 'delegated:fold' })
+        expect((await ui.find({ key: 'delegated:set:fence:codex' }))?.props.value).toBe('full')
+        await ui.select({ key: 'delegated:set:fence:agy', value: 'none' })
+        await ui.press({ key: 'delegated:save' })
+        await w.clock.settle()
+        expect(savesOf(w)).toEqual(['save {"fence":{"agy":"none"}}'])
+        await ui.unmount()
+      })
+
+      test('the folded line shows a lifted fence, first', async ($, on) => {
+        const { ui, show } = await showing($, on, 120)
+        await show(lifted({ codex: 'full' }))
+        expect(lineWith(await lines(ui, 120), /codex full access/)).toBeDefined()
+        await show(lifted({ agy: 'none', local: 'none' }))
+        expect(lineWith(await lines(ui, 120), /agy anywhere · local anywhere/)).toBeDefined()
+        await show(lifted({}))
+        expect(lineWith(await lines(ui, 120), /full access|anywhere/)).toBeUndefined()
+        await ui.unmount()
+      })
+
+      test('the lifted marker survives at 89 columns, where the rest of the line is cut', async ($, on) => {
+        const { ui, show } = await showing($, on, 89)
+        await show(lifted({ codex: 'full' }))
+        expect(lineWith(await lines(ui, 89), /codex full access/)).toBeDefined()
+        await show(lifted({ codex: 'full', agy: 'none', local: 'none' }))
+        const all = (await lines(ui, 89)).join(' ')
+        expect(all).toMatch(/codex full access/)
+        expect(all).toMatch(/agy +anywhere/)
+        expect(all).toMatch(/local +anywhere/)
+        await ui.unmount()
+      })
+
+      test('the lifted marker survives at 44 columns, where the rest of the line is cut', async ($, on) => {
+        const { ui, show } = await showing($, on, 44)
+        await show(lifted({ codex: 'full' }))
+        expect(lineWith(await lines(ui, 44), /codex full access/)).toBeDefined()
+        await show(lifted({ codex: 'full', agy: 'none', local: 'none' }))
+        const all = (await lines(ui, 44)).join(' ')
+        expect(all).toMatch(/codex full access/)
+        expect(all).toMatch(/agy +anywhere/)
+        expect(all).toMatch(/local +anywhere/)
+        await ui.unmount()
+      })
+
+      test('a tab state kept from before fences draws, with every worker fenced', async ($, on) => {
+        const old = { ...SKETCH, settings: { ...SETTINGS } } as Record<string, any>
+        delete old.settings.fence
+        const { ui } = await mountWith($, on, () => old)
+        expect(lineWith(await lines(ui, 100), /▸ Settings/)).toBeDefined()
+        expect(lineWith(await lines(ui, 100), /full access|anywhere/)).toBeUndefined()
+        await ui.press({ key: 'delegated:fold' })
+        expect((await ui.find({ key: 'delegated:set:fence:codex' }))?.props.value).toBe('fenced')
+        expect((await ui.find({ key: 'delegated:set:fence:agy' }))?.props.value).toBe('soft')
+        await ui.select({ key: 'delegated:set:fence:codex', value: 'full' })
+        expect(await ui.find({ type: 'Text', text: /Full access: Codex can read/ })).toBeDefined()
+        await ui.unmount()
+      })
+
+      test("task notes follow the task's fence", async ($, on) => {
+        const rows = [
+          task({ id: 'f00001', worker: 'codex', title: 'first job', fence: 'full' }),
+          task({ id: 'f00002', worker: 'agy', title: 'second job', fence: 'none', fenced: false }),
+          task({ id: 'f00003', worker: 'agy', title: 'third job', fence: null, fenced: false }),
+          task({ id: 'f00004', worker: 'codex', title: 'fourth job', fence: null }),
+          task({ id: 'f00005', worker: 'local', title: 'fifth job', fence: 'soft', fenced: false }),
+        ]
+        const { ui } = await mountWith($, on, () => shown(rows))
+        await ui.press({ key: 'delegated:row:f00001' })
+        expect(lineWith(await lines(ui, 100), /^\s+full access$/)).toBeDefined()
+        await ui.press({ key: 'delegated:row:f00002' })
+        expect(lineWith(await lines(ui, 100), /^\s+anywhere · can't run commands$/)).toBeDefined()
+        await ui.press({ key: 'delegated:row:f00003' })
+        expect(lineWith(await lines(ui, 100), /^\s+not fenced · can't run commands$/)).toBeDefined()
+        await ui.press({ key: 'delegated:row:f00004' })
+        expect(lineWith(await lines(ui, 100), /fenced|full access|anywhere/)).toBeUndefined()
+        await ui.press({ key: 'delegated:row:f00005' })
+        expect(lineWith(await lines(ui, 100), /^\s+not fenced$/)).toBeDefined()
+        await ui.unmount()
+      })
+
+      for (const columns of [44, 89]) {
+        test(`at ${columns} columns, with the fold open and both warnings shown, no line is wider`, async ($, on) => {
+          const { ui } = await mountWith($, on, () => SKETCH, {}, columns)
+          await ui.press({ key: 'delegated:fold' })
+          await ui.select({ key: 'delegated:set:fence:codex', value: 'full' })
+          await ui.select({ key: 'delegated:set:fence:agy', value: 'none' })
+          const all = await lines(ui, columns)
+          expect(lineWith(all, /Full access/)).toBeDefined()
+          for (const line of all) expect(line.length, line).toBeLessThanOrEqual(columns)
+          await ui.unmount()
+        })
+      }
     })
 
     test('a refresh while the fold is open keeps what was typed', async ($, on) => {

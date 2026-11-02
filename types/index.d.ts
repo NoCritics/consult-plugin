@@ -112,6 +112,8 @@ export type DelegateTaskRow = {
   summary: string | null
   // null until a worker has started
   fenced: boolean | null
+  // what the task was started under; null on a task from before the fence setting
+  fence: 'fenced' | 'full' | 'soft' | 'none' | null
   stop_reason: string | null
   queue_model: string | null
   reported_at: number | null
@@ -135,6 +137,8 @@ export type DelegateLimit = { level: 'ok' | 'warn' | 'full'; note: string }
 export type DelegateSettingsShown = {
   workers_edit: 'auto' | 'here' | 'copy'
   table: { code: string; research_review: string; private: string }
+  // this project's fence for each worker
+  fence: { codex: 'fenced' | 'full'; agy: 'soft' | 'none'; local: 'soft' | 'none' }
   local_at_once: 'auto' | number
   // what auto comes to now (the slots of what the runner holds); null when the setting is a number or unknown
   // (a save's answer leaves it out)
@@ -158,6 +162,9 @@ export type DelegateEdits = {
   code?: string
   research_review?: string
   private?: string
+  fence_codex?: string
+  fence_agy?: string
+  fence_local?: string
   local_at_once?: string
   on_close?: string
   time_limit?: string
@@ -200,7 +207,7 @@ export type DelegateElsewhere = { id: string; project: string; worker: string; t
 // An owned task as the band shows it: queued or running, or ended while the
 // band showed it (until the person's next prompt). startedAt is null while
 // it is queued; limitMs is null in an index row from before 0.15.4.
-export type BandTask = { id: string; worker: string; model: string | null; state: string; startedAt: number | null; endedAt: number | null; limitMs: number | null }
+export type BandTask = { id: string; worker: string; model: string | null; state: string; startedAt: number | null; endedAt: number | null; limitMs: number | null; fence: 'full' | 'none' | null }
 
 // What the delegate watcher keeps: the ids of the tasks this session owns (the
 // ones it started, and orphans it picked up; oldest first, at most 200), the

@@ -15,18 +15,26 @@ import { CMD_UNSAFE_RE } from './spawn-cli.js';
 import { prepareRunnerCall, isValidEnvName } from './local-runners.js';
 import { isLoopback, validateBaseUrl } from './local.js';
 import { parseWorkerWord } from './delegate-route.js';
-import { taskFolder } from './delegate-store.js';
+import { taskFolder, taskFence, narrowerFence, projectSettings } from './delegate-store.js';
 import { rateLimitsFromTail } from './delegate-limits.js';
 
 export { lastRateLimitsIn } from './delegate-limits.js';
 
-// Whether each worker is kept inside its folder by its own sandbox.
-export const WORKER_FENCED = Object.freeze({ codex: true, agy: false, local: false });
-
 // What every worker is told before the brief. A read task is told, in words,
 // to change nothing: only codex's sandbox and pi's tool set enforce it.
-export function workerPreamble(folder, isWrite = true, worker = null) {
+export function workerPreamble(folder, isWrite = true, worker = null, fence = null) {
   const noCommands = worker === 'agy' ? " You can't run commands here (no git, tests or builds): check your work by reading the files." : '';
+  if (fence === 'full' || fence === 'none') {
+    if (!isWrite) {
+      return `You are working alone on a delegated task. The project is in this folder: ${folder}. You may read files anywhere on this PC. ` +
+        'This is a read-only task: answer in text. Do not create, edit or delete any files, ' +
+        `and do not run git commit, push, stash, checkout or reset.${noCommands} When you finish, end with a short summary of your findings: ` +
+        'what you looked at, what you found, and anything you could not check.';
+    }
+    return `You are working alone on a delegated task. The project is in this folder: ${folder}. You may work outside it on this PC when the task needs it. ` +
+      `Do not run git commit, push, stash, checkout or reset.${noCommands} When you finish, end with a short summary: ` +
+      `what you changed (files), how you checked it, and anything left undone. List every file you changed outside ${folder} by its full path.`;
+  }
   if (!isWrite) {
     return `You are working alone on a delegated task. Work only inside this folder: ${folder}. ` +
       'This is a read-only task: answer in text. Do not create, edit or delete any files, ' +
@@ -93,12 +101,13 @@ function requireSpawnablePaths(entries) {
 // codex resume takes no -s or -C: the sandbox goes in as a config override
 // (bare word, not quoted, like reasoningCfg: shellSafeArgs refuses a `"`), and
 // the process runs in the folder (`cwd` in the result).
-function codexArgs({ task, isWrite, resume }) {
+function codexArgs({ task, isWrite, resume, fence }) {
   requireModelId(task.model);
   validateReasoningEffort(task.effort);
-  const sandbox = isWrite ? 'workspace-write' : 'read-only';
+  let sandbox = 'read-only';
+  if (isWrite) sandbox = fence === 'full' ? 'danger-full-access' : 'workspace-write';
   const networkArgs = [];
-  if (isWrite) networkArgs.push('-c', 'sandbox_workspace_write.network_access=true');
+  if (isWrite && fence !== 'full') networkArgs.push('-c', 'sandbox_workspace_write.network_access=true');
   const modelArgs = [];
   if (task.model) modelArgs.push('-m', task.model);
   if (task.effort) modelArgs.push('-c', reasoningCfg(task.effort));
@@ -157,7 +166,7 @@ export function contextWarning(fact) {
 // The pi command for a local task. The runner's address and the NAME of its
 // key variable reach the pi extension (pi-provider.js) through env; the key's
 // value stays in the environment pi inherits and is never read here.
-function localCommand({ task, nickname, workFolder, taskDir, isWrite, resume, promptText, settings, runner, inventory }) {
+function localCommand({ task, nickname, workFolder, taskDir, isWrite, resume, promptText, settings, runner, inventory, fenced }) {
   if (runner === null || runner === undefined) throw new Error('A local task needs the local runner (runnerSettings(settings)).');
   if (runner.key_env && (!isValidEnvName(runner.key_env) || !isLoopback(runner.url))) {
     throw new Error(`The runner's key variable ${JSON.stringify(runner.key_env)} is not a valid name, or ${runner.url} is not on this machine; a key from the environment is only sent to this machine.`);
@@ -191,7 +200,7 @@ function localCommand({ task, nickname, workFolder, taskDir, isWrite, resume, pr
   return {
     cmd: resolveCmd('pi').path, args, env, stdinText: null,
     briefFile: { path: briefPath, text: promptText },
-    cwd: workFolder, fenced: WORKER_FENCED.local, model: prepared.model, warning: contextWarning(fact)
+    cwd: workFolder, fenced, model: prepared.model, warning: contextWarning(fact)
   };
 }
 
@@ -205,22 +214,26 @@ export function workerCommand(task, { settings, runner = null, inventory = null,
   const workFolder = task.worktree ?? task.project;
   const taskDir = task.dir ?? taskFolder(task.id);
   const isWrite = task.mode === 'write';
+  // The stored worker is the plain name; a local:<nickname> word still reads as local.
+  // The fence used is the narrower of the task's own and the project's current one.
+  const fence = narrowerFence(word.worker, taskFence({ ...task, worker: word.worker }), projectSettings(task.project).fence[word.worker]);
+  const fenced = fence === 'fenced';
   let promptText;
   if (resume) {
     promptText = followUp ?? CONTINUE_PROMPT;
     if (!isWrite) promptText = `${READ_ONLY_REMINDER}\n\n${promptText}`;
   } else {
-    promptText = `${workerPreamble(workFolder, isWrite, word.worker)}\n\n${brief ?? fs.readFileSync(path.join(taskDir, 'brief.md'), 'utf8')}`;
+    promptText = `${workerPreamble(workFolder, isWrite, word.worker, fence)}\n\n${brief ?? fs.readFileSync(path.join(taskDir, 'brief.md'), 'utf8')}`;
   }
 
   if (word.worker === 'local') {
-    return localCommand({ task, nickname: word.nickname, workFolder, taskDir, isWrite, resume, promptText, settings, runner, inventory });
+    return localCommand({ task, nickname: word.nickname, workFolder, taskDir, isWrite, resume, promptText, settings, runner, inventory, fenced });
   }
   let cmd;
   let args;
   if (word.worker === 'codex') {
     cmd = resolveCmd('codex').path;
-    args = codexArgs({ task, isWrite, resume });
+    args = codexArgs({ task, isWrite, resume, fence });
   } else {
     const timeLimitMs = task.time_limit_ms ?? settings?.delegate?.time_limit_ms;
     cmd = resolveCmd('agy').path;
@@ -228,7 +241,7 @@ export function workerCommand(task, { settings, runner = null, inventory = null,
   }
   return {
     cmd, args, env: {},
-    stdinText: promptText, briefFile: null, cwd: workFolder, fenced: WORKER_FENCED[word.worker], model: task.model ?? null, warning: null
+    stdinText: promptText, briefFile: null, cwd: workFolder, fenced, model: task.model ?? null, warning: null
   };
 }
 

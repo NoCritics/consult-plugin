@@ -102,11 +102,12 @@ export function markOf(row: DelegateTaskRow): { mark: string; color: string } {
   return { mark: '!', color: 'warning' }
 }
 
-// Local (pi) and agy are not kept inside their folder by a sandbox; a row not
-// started yet is judged by its worker.
-export function isNotFenced(row: DelegateTaskRow): boolean {
-  if (row.fenced !== null) return !row.fenced
-  return row.worker !== 'codex'
+// What a row says of the fence it was started under: Codex lifted, agy or Local
+// lifted ('anywhere') or only asked ('not fenced'); null when it is fenced in. A
+// task from before fences (null) is judged by its worker's default.
+export function fenceNote(row: DelegateTaskRow): string | null {
+  if (row.worker === 'codex') return row.fence === 'full' ? 'full access' : null
+  return row.fence === 'none' ? 'anywhere' : 'not fenced'
 }
 
 // The ids of this project's tasks that are running or queued, sorted.
@@ -183,6 +184,51 @@ export function parseLocalAtOnce(text: string): 'auto' | number | null {
   return null
 }
 
+export const FENCE_WORKERS = ['codex', 'agy', 'local'] as const
+export type FenceWorker = (typeof FENCE_WORKERS)[number]
+
+// The fences of a shown settings object. A `shown` kept from before 0.16.0 (the
+// atom survives a plugin update in a live session) has none: it reads as the
+// default, every worker fenced.
+export function fencesOf(settings: { fence?: Record<FenceWorker, string> }): Record<FenceWorker, string> {
+  return settings.fence ?? { codex: 'fenced', agy: 'soft', local: 'soft' }
+}
+
+// The fence the fold holds for a worker: the edit, or the shown value.
+export function fenceChosen(view: DelegatedView, worker: FenceWorker): string {
+  const shownValue: string = view.shown === null ? '' : fencesOf(view.shown.settings)[worker]
+  const edits = view.edits
+  const edited = worker === 'codex' ? edits.fence_codex : worker === 'agy' ? edits.fence_agy : edits.fence_local
+  return edited ?? shownValue
+}
+
+const CODEX_LIFT_WARNING =
+  "Full access: Codex can read, change or delete any file you can, and run any command, without asking. Changes outside the project don't go through the copy and can't be undone."
+const OTHER_LIFT_WARNING =
+  'Anywhere: agy and Local are no longer asked to stay in the project folder. They could already reach any file you can; now their brief no longer holds them back.'
+
+// The fences whose edit differs from the shown value, as { worker: value }.
+function fenceChangesOf(view: DelegatedView): Record<string, string> {
+  const changed: Record<string, string> = {}
+  if (view.shown === null) return changed
+  for (const worker of FENCE_WORKERS) {
+    const chosen = fenceChosen(view, worker)
+    if (chosen !== fencesOf(view.shown.settings)[worker]) changed[worker] = chosen
+  }
+  return changed
+}
+
+// What to warn about before Save: a fence edited to a lifted value (full / none).
+// An edit put back to the shown value is no change and warns of nothing. Codex's
+// sentence, then agy and Local's; null when no lift is waiting.
+export function liftWarning(view: DelegatedView): string | null {
+  const changed = fenceChangesOf(view)
+  const warnings: string[] = []
+  if (changed.codex === 'full') warnings.push(CODEX_LIFT_WARNING)
+  if (changed.agy === 'none' || changed.local === 'none') warnings.push(OTHER_LIFT_WARNING)
+  return warnings.length === 0 ? null : warnings.join('\n')
+}
+
 // What a Save sends: only the settings that differ from the shown ones, in the
 // script's own shape. `problem` says what typed text could not be read.
 export function changesOf(view: DelegatedView): { changes: Record<string, unknown>; problem: string | null } {
@@ -198,6 +244,8 @@ export function changesOf(view: DelegatedView): { changes: Record<string, unknow
     table[row] = edited
   }
   if (Object.keys(table).length > 0) changes.table = table
+  const fence = fenceChangesOf(view)
+  if (Object.keys(fence).length > 0) changes.fence = fence
   if (edits.local_at_once !== undefined) {
     const slots = parseLocalAtOnce(edits.local_at_once)
     if (slots === null) return { changes, problem: 'Local at once: type auto or a number.' }

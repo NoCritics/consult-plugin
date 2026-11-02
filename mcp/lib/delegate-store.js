@@ -48,10 +48,35 @@ const RENAME_PATIENCE_MS = 5000;
 const RENAME_RETRY_MS = 5;
 
 const INDEX_FIELDS = [
-  'id', 'worker', 'model', 'title', 'project', 'state', 'location', 'mode', 'summary', 'fenced',
+  'id', 'worker', 'model', 'title', 'project', 'state', 'location', 'mode', 'summary', 'fenced', 'fence',
   'started_at', 'ended_at', 'stop_reason', 'limit', 'queue_model', 'owner_instance', 'reported_at',
   'queue_waiting_long', 'keep_running', 'hold', 'owner_session', 'created_at', 'queued_at', 'read_only_edits', 'time_limit_ms'
 ];
+
+// What each worker's tasks may do beyond the folder they work in. Codex is
+// `fenced` (an enforced sandbox) or `full`; agy and local are `soft` (a rule in
+// the brief) or `none`.
+export const FENCE_VALUES = Object.freeze({ codex: ['fenced', 'full'], agy: ['soft', 'none'], local: ['soft', 'none'] });
+export const DEFAULT_FENCE = Object.freeze({ codex: 'fenced', agy: 'soft', local: 'soft' });
+
+// The task's own fence when it is valid for its worker, else the worker's
+// default (a task from before fences has none). A state.json an unfenced worker
+// rewrote may name any worker: an unknown one reads as fenced.
+export function taskFence(task) {
+  if (!Object.hasOwn(FENCE_VALUES, task.worker)) return 'fenced';
+  if (FENCE_VALUES[task.worker].includes(task.fence)) return task.fence;
+  return DEFAULT_FENCE[task.worker];
+}
+
+// The more restrictive of two fences for one worker: the first value in
+// FENCE_VALUES (`fenced` or `soft`) wins over the lifted one. A worker that is
+// not fenced can rewrite a task's state.json, so the fence stored there never
+// widens what the project's setting allows.
+export function narrowerFence(worker, first, second) {
+  const liftedValue = FENCE_VALUES[worker][1];
+  if (first === liftedValue && second === liftedValue) return liftedValue;
+  return DEFAULT_FENCE[worker];
+}
 
 export function dataHome(env = process.env) {
   return env.CONSULT_DELEGATE_HOME || path.join(os.homedir(), '.claude', 'consult-delegate');
@@ -133,6 +158,8 @@ export function createTask(spec) {
   requireOneOf('mode', spec.mode, TASK_MODES);
   requireOneOf('location', spec.location, TASK_LOCATIONS);
   if (typeof spec.project !== 'string' || spec.project === '') throw new Error('project must be a folder path');
+  const fence = spec.fence ?? DEFAULT_FENCE[spec.worker];
+  requireOneOf('fence', fence, FENCE_VALUES[spec.worker]);
   const id = newTaskId();
   const createdAt = spec.created_at ?? Date.now();
   const state = {
@@ -167,6 +194,7 @@ export function createTask(spec) {
     final_path: null,
     limit: null,
     fenced: null,
+    fence,
     hold: spec.hold ?? false,
     keep_running: spec.keep_running ?? false,
     time_limit_ms: spec.time_limit_ms ?? null,
@@ -686,19 +714,36 @@ export function projectSettings(project) {
   let all = null;
   try { all = readJsonOrNull(projectsFile()); } catch (_) { /* unreadable: defaults */ }
   const saved = all?.[projectKey(project)] ?? {};
+  const fence = {};
+  for (const worker of Object.keys(FENCE_VALUES)) {
+    fence[worker] = FENCE_VALUES[worker].includes(saved.fence?.[worker]) ? saved.fence[worker] : DEFAULT_FENCE[worker];
+  }
   return {
     workers_edit: WORKERS_EDIT_VALUES.includes(saved.workers_edit) ? saved.workers_edit : 'auto',
-    git: GIT_ANSWERS.includes(saved.git) ? saved.git : 'ask'
+    git: GIT_ANSWERS.includes(saved.git) ? saved.git : 'ask',
+    fence
   };
 }
 
-// Saves `changes` (workers_edit and/or git) for the project and returns its
-// settings. A null value puts that setting back to its default (auto, ask). A
+// Saves `changes` (workers_edit, git and/or fence) for the project and returns
+// its settings. A null value puts that setting back to its default (auto, ask;
+// for `fence`, a worker's null puts that worker back; others keep theirs). A
 // file that is not valid JSON is left as it is and the save fails.
 export function saveProjectSettings(project, changes) {
   const defaults = { workers_edit: 'auto', git: 'ask' };
   const resolved = {};
   for (const key of Object.keys(changes)) {
+    if (key === 'fence') {
+      const changedWorkers = {};
+      for (const worker of Object.keys(changes.fence)) {
+        if (!Object.hasOwn(FENCE_VALUES, worker)) throw new Error(`Unknown fence worker ${JSON.stringify(worker)}`);
+        const fenceValue = changes.fence[worker] === null ? DEFAULT_FENCE[worker] : changes.fence[worker];
+        requireOneOf(`fence for ${worker}`, fenceValue, FENCE_VALUES[worker]);
+        changedWorkers[worker] = fenceValue;
+      }
+      resolved.fence = changedWorkers;
+      continue;
+    }
     const value = changes[key] === null ? defaults[key] : changes[key];
     if (key === 'workers_edit') requireOneOf('workers_edit', value, WORKERS_EDIT_VALUES);
     else if (key === 'git') requireOneOf('git', value, GIT_ANSWERS);
@@ -712,7 +757,19 @@ export function saveProjectSettings(project, changes) {
     throw new Error(`${projectsFile()} is not valid JSON (${error.message}); fix or delete it`);
   }
   const key = projectKey(project);
-  all[key] = { ...projectSettings(project), ...resolved };
+  // Merge only what changed into the entry as it is on disk now, so a save never
+  // brings back an older value of a setting it did not touch.
+  const entry = all[key] !== null && typeof all[key] === 'object' && !Array.isArray(all[key]) ? { ...all[key] } : {};
+  for (const setting of Object.keys(resolved)) {
+    if (setting !== 'fence') {
+      entry[setting] = resolved[setting];
+      continue;
+    }
+    const rawFence = entry.fence !== null && typeof entry.fence === 'object' && !Array.isArray(entry.fence) ? { ...entry.fence } : {};
+    for (const worker of Object.keys(resolved.fence)) rawFence[worker] = resolved.fence[worker];
+    entry.fence = rawFence;
+  }
+  all[key] = entry;
   writeJsonAtomic(projectsFile(), all);
   return projectSettings(project);
 }

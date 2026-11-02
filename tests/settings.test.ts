@@ -63,6 +63,9 @@ describe('settings', () => {
       'line 2: ignored `delegate.on_close`: delegate settings are global-only (~/.claude/consult.local.md)',
     ])
     expect(frontmatterWarnings('---\ndelegate.colour: red\n---\n')).toEqual(['line 2: unknown setting `delegate.colour`'])
+    expect(frontmatterWarnings('---\ndelegate.fence.codex: full\n---\n', true)).toEqual([
+      'line 2: ignored `delegate.fence.codex`: delegate settings are global-only (~/.claude/consult.local.md)',
+    ])
   })
 
   test('loadConsultSettings: delegate settings come from the global file only', async () => {

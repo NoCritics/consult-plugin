@@ -358,6 +358,53 @@ describe('band', () => {
     await ui.unmount()
   })
 
+  test('a task with its fence lifted says so in its row', async ($, on) => {
+    await withTasks($, on, [delegateRow({ fence: 'full', time_limit_ms: 180 * 60000 })])
+    for (const columns of [120, 52]) {
+      const ui = await $.ui.mount({ ...BAND, props: { ...BAND.props, bodyColumns: columns } })
+      if (columns === 120) expect(await ui.find({ text: /unfenced · delegate · codex/ })).toBeDefined()
+      let row: Found | undefined
+      for (const box of await ui.findAll({ type: 'Box' })) {
+        if (box.props.flexDirection === 'row' && box.text.includes('unfenced')) row = box
+      }
+      expect(row?.text).toContain('unfenced')
+      expect((row?.text.length ?? 0) + '[  ]'.length + 4 <= columns).toBe(true)
+      await ui.unmount()
+    }
+  })
+
+  test('an agy task with its fence lifted says unfenced', async ($, on) => {
+    await withTasks($, on, [delegateRow({ worker: 'agy', fence: 'none' })])
+    const ui = await $.ui.mount(BAND)
+    expect(await ui.find({ text: /unfenced · delegate · agy/ })).toBeDefined()
+    await ui.unmount()
+  })
+
+  test('a task without a fence field shows no marker', async ($, on) => {
+    await withTasks($, on, [delegateRow()])
+    const ui = await $.ui.mount(BAND)
+    expect(await ui.find({ text: /delegate · codex · default/ })).toBeDefined()
+    expect(await ui.find({ text: /unfenced/ })).toBeUndefined()
+    await ui.unmount()
+  })
+
+  test('a row whose fence is not a known value shows no marker', async ($, on) => {
+    await withTasks($, on, [delegateRow({ fence: 'wide-open' })])
+    const ui = await $.ui.mount(BAND)
+    expect(await ui.find({ text: /delegate · codex · default/ })).toBeDefined()
+    expect(await ui.find({ text: /unfenced|wide-open/ })).toBeUndefined()
+    await ui.unmount()
+  })
+
+  test('a row first seen without its fence takes it from the task state file', async ($, on) => {
+    await withTasks($, on, [delegateRow()], {}, world => {
+      world.files[`${DELEGATE_DATA}/tasks/${TASK}/state.json`] = JSON.stringify({ id: TASK, fence: 'full' })
+    })
+    const ui = await $.ui.mount(BAND)
+    expect(await ui.find({ text: /unfenced/ })).toBeDefined()
+    await ui.unmount()
+  })
+
   test('a queued task says so, and a row with no limit shows its clock alone, with no bar', async ($, on) => {
     const w = await withTasks($, on, [delegateRow({ state: 'queued', started_at: null })])
     const ui = await $.ui.mount(BAND)

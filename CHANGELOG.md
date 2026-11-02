@@ -4,6 +4,19 @@ All notable changes to this plugin are documented here. Format loosely follows [
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-11-02
+
+### Added
+
+- **A fence per worker, per project.** In the Delegated tab's settings ("Fences (this project)"): Codex `fenced` or `full access`; agy and the local worker `stay in folder` or `anywhere`. Lifting one shows a warning before Save. Nothing else can set a fence: no tool, and not `consult.local.md`.
+- **Markers where it matters.** The band leads a running task's row with `unfenced` when its fence is lifted; the tab's task notes read `full access`, `anywhere` or `not fenced`; the settings line shows e.g. `codex full access`.
+- **Start and result notes.** The start reply says the fence is lifted, and an unfenced worker is asked to list the files it changed outside the folder, which the result tells Claude to name.
+
+### Changed
+
+- A task keeps the fence it started with. Every run (first, resume, follow-up) uses the stricter of that and the project's current setting.
+- Codex at full access runs write tasks with `danger-full-access`; read tasks stay read-only. agy and the local worker at `anywhere` are no longer asked to stay in the folder.
+
 ## [0.15.6] - 2026-11-01
 
 ### Fixed

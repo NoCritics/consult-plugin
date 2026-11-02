@@ -949,6 +949,8 @@ eq('codexDefaultLabel: unknown', codexDefaultLabel(undefined, null), '(codex def
     eq(`settings parity: ${one.name}: runner in use`, runnerSettings(parsed).type, one.expect.runner ?? null);
   }
 
+  eq('settings parity: a fence key in a project file is global-only', frontmatterWarnings('---\ndelegate.fence.codex: full\n---\n', { projectScope: true }), ['line 2: ignored `delegate.fence.codex`: delegate settings are global-only (~/.claude/consult.local.md)']);
+
   const { CONSULT_DEFAULTS } = await import('./lib/defaults.js');
   const shared = JSON.parse(fs.readFileSync(new URL('./lib/defaults.json', import.meta.url), 'utf8'));
   eq('defaults: defaults.js reads defaults.json', { ...CONSULT_DEFAULTS }, shared);

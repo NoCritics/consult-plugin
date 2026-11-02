@@ -3,7 +3,7 @@
   "manifest_version": "0.4",
   "name": "consult",
   "display_name": "consult",
-  "version": "0.15.6",
+  "version": "0.16.0",
   "description": "Ask Codex, Antigravity (agy) and local models for a second opinion, chat with them, run a ranked council, or generate images with agy or GPT through Codex.",
   "long_description": "Wraps the Codex and Antigravity (agy) CLIs, the legacy Gemini CLI, and any local OpenAI-compatible runner (llama-swap, Ollama, LM Studio, llama-server, vLLM) as tools: one-shot asks with optional images, multi-turn chat, a council that ranks parallel answers by Borda count, and image generation through Antigravity (Google) or through Codex (GPT images under your ChatGPT plan).\n\n**Requires** the CLIs you want to use to be installed and signed in on this machine (`codex login`; run `agy` once). Nothing is bundled except the MCP server itself.\n\nSettings are read from `.claude/consult.local.md` in the server's working directory, falling back to `~/.claude/consult.local.md`. Under Claude Desktop that is effectively always the global file.\n\nThe same server ships in the `consult` Claude Code plugin, which adds slash commands and an auto-triggering skill on top.",
   "author": { "name": "NoCritics", "url": "https://github.com/NoCritics" },

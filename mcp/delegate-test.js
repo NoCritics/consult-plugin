@@ -14,7 +14,7 @@ import {
 } from './lib/delegate-git.js';
 import {
   dataHome, newTaskId, createTask, readTask, updateTask, listTasks,
-  beat, isAlive, isSessionAlive, projectSettings, saveProjectSettings, projectKey, taskFolder,
+  beat, isAlive, isSessionAlive, taskFence, narrowerFence, projectSettings, saveProjectSettings, projectKey, taskFolder,
   withTaskLock, breakStaleLock, updateTaskWhen, withLockFolder
 } from './lib/delegate-store.js';
 import { loadSettings, frontmatterWarnings, DEFAULTS } from './lib/settings.js';
@@ -153,7 +153,7 @@ try {
     eq('index: newest first', index.tasks.map(row => row.title), ['third', 'second', 'first']);
     truthy('index: updated_at is a time in ms', Math.abs(index.updated_at - Date.now()) < 5000);
     eq('index: row fields', Object.keys(index.tasks[0]).sort(), [
-      'id', 'worker', 'model', 'title', 'project', 'state', 'location', 'mode', 'summary', 'fenced',
+      'id', 'worker', 'model', 'title', 'project', 'state', 'location', 'mode', 'summary', 'fenced', 'fence',
       'started_at', 'ended_at', 'stop_reason', 'limit', 'queue_model', 'owner_instance', 'reported_at',
       'queue_waiting_long', 'keep_running', 'hold', 'owner_session', 'created_at', 'queued_at', 'time_limit_ms'
     ].sort());
@@ -577,27 +577,63 @@ try {
   // ---- per-project settings ----
   {
     const project = path.join(scratch, 'My Projects', 'Имя');
-    eq('projectSettings: defaults for an unknown project', projectSettings(project), { workers_edit: 'auto', git: 'ask' });
+    const fenceDefaults = { codex: 'fenced', agy: 'soft', local: 'soft' };
+    eq('projectSettings: defaults for an unknown project', projectSettings(project), { workers_edit: 'auto', git: 'ask', fence: fenceDefaults });
     eq('projectSettings: no file is created by reading', fs.existsSync(process.env.CONSULT_PROJECTS_FILE), false);
     const saved = saveProjectSettings(project, { workers_edit: 'copy' });
-    eq('saveProjectSettings: returns the new settings', saved, { workers_edit: 'copy', git: 'ask' });
-    eq('projectSettings: round trip', projectSettings(project), { workers_edit: 'copy', git: 'ask' });
+    eq('saveProjectSettings: returns the new settings', saved, { workers_edit: 'copy', git: 'ask', fence: fenceDefaults });
+    eq('projectSettings: round trip', projectSettings(project), { workers_edit: 'copy', git: 'ask', fence: fenceDefaults });
     saveProjectSettings(project, { git: 'declined' });
-    eq('saveProjectSettings: keeps what was not changed', projectSettings(project), { workers_edit: 'copy', git: 'declined' });
-    eq('projectSettings: another project is unaffected', projectSettings(path.join(scratch, 'My Projects', 'Other')), { workers_edit: 'auto', git: 'ask' });
+    eq('saveProjectSettings: keeps what was not changed', projectSettings(project), { workers_edit: 'copy', git: 'declined', fence: fenceDefaults });
+    eq('projectSettings: another project is unaffected', projectSettings(path.join(scratch, 'My Projects', 'Other')), { workers_edit: 'auto', git: 'ask', fence: fenceDefaults });
     eq('projects file: keyed by the absolute path (lower-cased on Windows)', Object.keys(JSON.parse(fs.readFileSync(process.env.CONSULT_PROJECTS_FILE, 'utf8'))), [process.platform === 'win32' ? project.toLowerCase() : project]);
     if (process.platform === 'win32') {
-      eq('projectSettings: the key is case-normalised on Windows', projectSettings(project.toUpperCase()), { workers_edit: 'copy', git: 'declined' });
-      eq('projectSettings: forward slashes find the same project', projectSettings(project.replaceAll('\\', '/')), { workers_edit: 'copy', git: 'declined' });
+      eq('projectSettings: the key is case-normalised on Windows', projectSettings(project.toUpperCase()), { workers_edit: 'copy', git: 'declined', fence: fenceDefaults });
+      eq('projectSettings: forward slashes find the same project', projectSettings(project.replaceAll('\\', '/')), { workers_edit: 'copy', git: 'declined', fence: fenceDefaults });
     }
     throws('saveProjectSettings: an unknown workers_edit is refused', () => saveProjectSettings(project, { workers_edit: 'sideways' }));
     throws('saveProjectSettings: an unknown git answer is refused', () => saveProjectSettings(project, { git: 'maybe' }));
     throws('saveProjectSettings: an unknown key is refused', () => saveProjectSettings(project, { colour: 'red' }));
-    eq('saveProjectSettings: a refused save changes nothing', projectSettings(project), { workers_edit: 'copy', git: 'declined' });
+    eq('saveProjectSettings: a refused save changes nothing', projectSettings(project), { workers_edit: 'copy', git: 'declined', fence: fenceDefaults });
     fs.writeFileSync(process.env.CONSULT_PROJECTS_FILE, '{ not json');
-    eq('projectSettings: a broken file reads as defaults', projectSettings(project), { workers_edit: 'auto', git: 'ask' });
+    eq('projectSettings: a broken file reads as defaults', projectSettings(project), { workers_edit: 'auto', git: 'ask', fence: fenceDefaults });
     throws('saveProjectSettings: a broken file is not overwritten', () => saveProjectSettings(project, { git: 'declined' }));
     eq('saveProjectSettings: the broken file is untouched', fs.readFileSync(process.env.CONSULT_PROJECTS_FILE, 'utf8'), '{ not json');
+
+    // ---- the fence ----
+    const freshProject = path.join(scratch, 'My Projects', 'Fenced');
+    const projectsFile = process.env.CONSULT_PROJECTS_FILE;
+    fs.rmSync(projectsFile, { force: true });
+    const spec = sampleSpec();
+    eq('projectSettings: fence defaults', projectSettings(freshProject).fence, { codex: 'fenced', agy: 'soft', local: 'soft' });
+    saveProjectSettings(freshProject, { fence: { codex: 'full' } });
+    saveProjectSettings(freshProject, { fence: { agy: 'none' } });
+    eq('saveProjectSettings: fence merges per worker', projectSettings(freshProject).fence, { codex: 'full', agy: 'none', local: 'soft' });
+    saveProjectSettings(freshProject, { fence: { codex: null } });
+    eq('saveProjectSettings: null puts one worker back', projectSettings(freshProject).fence.codex, 'fenced');
+    throws('saveProjectSettings: codex cannot be soft', () => saveProjectSettings(freshProject, { fence: { codex: 'soft' } }));
+    throws('saveProjectSettings: unknown worker', () => saveProjectSettings(freshProject, { fence: { gemini: 'none' } }));
+    // a save writes only what it changed, never a re-stamp of the other settings
+    const stampProject = path.join(scratch, 'My Projects', 'Stamp');
+    fs.rmSync(projectsFile, { force: true });
+    saveProjectSettings(stampProject, { git: 'declined' });
+    eq('saveProjectSettings: a git save stores no fence', JSON.parse(fs.readFileSync(projectsFile, 'utf8'))[projectKey(stampProject)], { git: 'declined' });
+    fs.writeFileSync(projectsFile, JSON.stringify({ [projectKey(stampProject)]: { fence: { codex: 'full' } } }));
+    saveProjectSettings(stampProject, { git: 'declined' });
+    eq('saveProjectSettings: a git save leaves the stored fence as it is', JSON.parse(fs.readFileSync(projectsFile, 'utf8'))[projectKey(stampProject)], { fence: { codex: 'full' }, git: 'declined' });
+    saveProjectSettings(stampProject, { fence: { agy: 'none' } });
+    eq('saveProjectSettings: a fence save changes only the named worker', JSON.parse(fs.readFileSync(projectsFile, 'utf8'))[projectKey(stampProject)], { fence: { codex: 'full', agy: 'none' }, git: 'declined' });
+    // a hand-edited file with a bad value reads as the default
+    fs.writeFileSync(projectsFile, JSON.stringify({ [projectKey(freshProject)]: { fence: { codex: 'wide-open', agy: 'none' } } }));
+    eq('projectSettings: a bad value reads as the default', projectSettings(freshProject).fence, { codex: 'fenced', agy: 'none', local: 'soft' });
+    // unreadable file: defaults
+    fs.writeFileSync(projectsFile, '{ not json');
+    eq('projectSettings: unreadable file reads fenced', projectSettings(freshProject).fence, { codex: 'fenced', agy: 'soft', local: 'soft' });
+    eq('createTask: fence defaults by worker', [createTask({ ...spec, worker: 'codex' }).fence, createTask({ ...spec, worker: 'agy' }).fence], ['fenced', 'soft']);
+    eq('createTask: fence is kept', createTask({ ...spec, worker: 'codex', fence: 'full' }).fence, 'full');
+    throws('createTask: a fence of another worker is refused', () => createTask({ ...spec, worker: 'agy', fence: 'full' }));
+    eq('taskFence: an old task reads its default', [taskFence({ worker: 'codex' }), taskFence({ worker: 'local', fence: null })], ['fenced', 'soft']);
+    eq('taskFence: an unknown worker does not throw', [taskFence({ worker: '__proto__', fence: 'full' }), taskFence({ worker: 'gizmo' })], ['fenced', 'fenced']);
   }
 
   // ---- delegate.* settings ----
@@ -1604,6 +1640,52 @@ try {
     eq('agy resume: --conversation with the id, the follow-up on stdin', [argAfter(agyResumed.args, '--conversation'), agyResumed.stdinText], [sessionUuid, 'Next step.']);
     throws('agy: a bad effort is refused', () => workerCommand(createTask(sampleSpec({ worker: 'agy', effort: 'loud' })), { settings: defaultSettings }));
 
+    // a task follows its own fence, as far as its project's setting allows
+    const setProjectFence = (fence) => fs.writeFileSync(process.env.CONSULT_PROJECTS_FILE, JSON.stringify({ [projectKey(codexTask.project)]: { fence } }));
+    setProjectFence({ codex: 'full', agy: 'none', local: 'none' });
+    const fullTask = { ...codexTask, fence: 'full' };
+    const fullWrite = workerCommand({ ...fullTask, mode: 'write' }, { settings: defaultSettings });
+    eq('codex full write: danger-full-access, no network override, not fenced',
+      [fullWrite.args.includes('danger-full-access'), fullWrite.args.some((arg) => arg.includes('network_access')), fullWrite.fenced], [true, false, false]);
+    truthy('codex full write: brief lets it work outside', fullWrite.stdinText.startsWith(workerPreamble(fullWrite.cwd, true, 'codex', 'full')) && !/Work only inside/.test(fullWrite.stdinText));
+    const fullRead = workerCommand({ ...fullTask, mode: 'read' }, { settings: defaultSettings });
+    eq('codex full read: still read-only', [fullRead.args[fullRead.args.indexOf('-s') + 1], fullRead.fenced], ['read-only', false]);
+    truthy('codex full read: may read anywhere', /may read files anywhere on this PC/.test(fullRead.stdinText));
+    const fullResume = workerCommand({ ...fullTask, mode: 'write', worker_session: codexThread }, { settings: defaultSettings, resume: true });
+    truthy('codex full resume: sandbox_mode=danger-full-access, no network override', fullResume.args.includes('sandbox_mode=danger-full-access') && !fullResume.args.some((arg) => arg.includes('network_access')));
+    // a task started fenced keeps it on resume even after the project is unfenced
+    const fencedResume = workerCommand({ ...codexTask, fence: 'fenced', mode: 'write', worker_session: codexThread }, { settings: defaultSettings, resume: true });
+    truthy('codex fenced resume: workspace-write', fencedResume.args.includes('sandbox_mode=workspace-write'));
+    // an old task with no fence
+    const oldTask = workerCommand({ ...codexTask, fence: undefined, mode: 'write' }, { settings: defaultSettings });
+    eq('codex old task: fenced', [oldTask.args.includes('workspace-write'), oldTask.fenced], [true, true]);
+    eq('preamble: fenced wording unchanged', workerPreamble('C:/p', true, 'codex', 'fenced'), workerPreamble('C:/p', true, 'codex'));
+    eq('preamble: unfenced write wording',
+      workerPreamble('C:/p', true, 'codex', 'full'),
+      'You are working alone on a delegated task. The project is in this folder: C:/p. You may work outside it on this PC when the task needs it. Do not run git commit, push, stash, checkout or reset. When you finish, end with a short summary: what you changed (files), how you checked it, and anything left undone. List every file you changed outside C:/p by its full path.');
+    eq('preamble: unfenced read wording (agy adds the no-commands line)',
+      workerPreamble('C:/p', false, 'agy', 'none'),
+      `You are working alone on a delegated task. The project is in this folder: C:/p. You may read files anywhere on this PC. This is a read-only task: answer in text. Do not create, edit or delete any files, and do not run git commit, push, stash, checkout or reset.${agyNoCommands} When you finish, end with a short summary of your findings: what you looked at, what you found, and anything you could not check.`);
+    const agyNone = workerCommand({ ...agyTask, fence: 'none', mode: 'write' }, { settings: defaultSettings });
+    truthy('agy none: flags unchanged, brief unfenced', agyNone.args.includes('--sandbox') && agyNone.args.includes('--add-dir') && /You may work outside it/.test(agyNone.stdinText));
+
+    // the stored fence never widens the project's current setting
+    eq('narrowerFence: codex is full only when both are', [narrowerFence('codex', 'full', 'full'), narrowerFence('codex', 'full', 'fenced'), narrowerFence('codex', 'fenced', 'full'), narrowerFence('codex', 'fenced', 'fenced')], ['full', 'fenced', 'fenced', 'fenced']);
+    eq('narrowerFence: agy and local are none only when both are', [narrowerFence('agy', 'none', 'none'), narrowerFence('agy', 'none', 'soft'), narrowerFence('local', 'soft', 'none')], ['none', 'soft', 'soft']);
+    setProjectFence({ codex: 'fenced', agy: 'soft' });
+    const widenedByFile = workerCommand({ ...codexTask, fence: 'full', mode: 'write' }, { settings: defaultSettings });
+    eq('codex stored full, project fenced: workspace-write and fenced', [widenedByFile.args.includes('workspace-write'), widenedByFile.args.includes('danger-full-access'), widenedByFile.fenced], [true, false, true]);
+    const widenedResume = workerCommand({ ...codexTask, fence: 'full', mode: 'write', worker_session: codexThread }, { settings: defaultSettings, resume: true });
+    truthy('codex stored full, project fenced: a resume stays workspace-write', widenedResume.args.includes('sandbox_mode=workspace-write'));
+    setProjectFence({ codex: 'full' });
+    const fullBoth = workerCommand({ ...codexTask, fence: 'full', mode: 'write' }, { settings: defaultSettings });
+    eq('codex stored full, project full: danger-full-access', [fullBoth.args.includes('danger-full-access'), fullBoth.fenced], [true, false]);
+    const fencedStays = workerCommand({ ...codexTask, fence: 'fenced', mode: 'write' }, { settings: defaultSettings });
+    eq('codex stored fenced, project full: stays workspace-write', [fencedStays.args.includes('workspace-write'), fencedStays.fenced], [true, true]);
+    setProjectFence({ agy: 'soft' });
+    const agyWidened = workerCommand({ ...agyTask, fence: 'none', mode: 'write' }, { settings: defaultSettings });
+    truthy('agy stored none, project soft: the soft preamble', agyWidened.stdinText.startsWith(workerPreamble(agyWidened.cwd, true, 'agy', 'soft')) && !/You may work outside it/.test(agyWidened.stdinText));
+
     // local (pi)
     const keySentinel = 'sk-test-sentinel-not-a-real-key';
     const originalKey = process.env.LLAMA_SWAP_API_KEY;
@@ -1635,6 +1717,9 @@ try {
       const localReadTask = createTask(sampleSpec({ worker: 'local', mode: 'read' }));
       const localReadCommand = workerCommand({ ...localReadTask, model: 'fast' }, { settings: defaultSettings, runner: swapRunner, inventory: swapInventory });
       eq('local read: the brief file starts with the read-only preamble', localReadCommand.briefFile.text.startsWith(workerPreamble(localReadTask.project, false)), true);
+      setProjectFence({ local: 'none' });
+      const localNoneRead = workerCommand({ ...localReadTask, fence: 'none', model: 'fast' }, { settings: defaultSettings, runner: swapRunner, inventory: swapInventory });
+      truthy('local none read: still read tools only, brief unfenced', localNoneRead.args.includes('read,grep,find,ls') && /may read files anywhere on this PC/.test(localNoneRead.briefFile.text));
       const bigCommand = workerCommand(localTask, { settings: defaultSettings, runner: swapRunner, inventory: swapInventory });
       eq('local: the default nickname resolves, and a small context warns', [bigCommand.model, bigCommand.env.CONSULT_PI_CONTEXT, typeof bigCommand.warning], ['qwen3.5-27b', '8192', 'string']);
       const wordCommand = workerCommand({ ...localTask, worker: 'local:fast' }, { settings: defaultSettings, runner: swapRunner, inventory: swapInventory });
@@ -4021,7 +4106,6 @@ try {
 
       guarded('workers: rollout tail', () => {
         eq('lastRateLimitsIn is still exported from the workers module', typeof workersNamespace.lastRateLimitsIn, 'function');
-        eq('WORKER_FENCED names the fence of each worker', workersNamespace.WORKER_FENCED, { codex: true, agy: false, local: false });
         const junkLine = JSON.stringify({ type: 'response_item', payload: { text: 'x'.repeat(1000) } }) + '\n';
         const sessionFolder = path.join(toolsCodexHome, 'sessions', '2026', '10', '27');
         fs.mkdirSync(sessionFolder, { recursive: true });
@@ -4234,7 +4318,8 @@ try {
           truthy('delegate: the description opens with the routing text', description.startsWith(toolsModule.DELEGATE_ROUTING_TEXT) && description.startsWith('Background task run by Codex, agy or a local model in the project folder:'));
           const missingAliases = Object.keys(WORKER_ALIASES).filter((alias) => !description.includes(alias));
           eq('delegate: every worker alias is listed', missingAliases, []);
-          truthy('delegate: the fences are in plain words', /codex[^.]*only inside its copy/i.test(description) && /agy[^.]*not fenced[^.]*can't run commands/i.test(description) && /local[^.]*not fenced[^.]*read-only tasks get read tools only/i.test(description));
+          truthy('delegate: fences are the user\'s', /set per project by the user in the Delegated tab/.test(description) && /Never change a fence yourself/.test(description));
+          eq('no tool takes a fence argument', toolsModule.DELEGATE_TOOLS.filter((tool) => tool.inputSchema.properties?.fence !== undefined).map((tool) => tool.name), []);
           truthy('delegate: local is not called private beyond its model calls', /not offline/.test(description) && /Claude[^.]*cloud/.test(description));
           const schema = toolsModule.DELEGATE_TOOLS[0].inputSchema;
           eq('delegate: worker has no enum (local:fast and aliases must pass)', schema.properties.worker.enum, undefined);
@@ -4296,6 +4381,35 @@ try {
           eq('delegate: a read task works in the project itself', [started.location, gptWord.value.location, gptWord.value.folder], ['here', 'here', project]);
           eq('delegate: the stub was asked to launch each started task', launchedIds.includes(gptWord.value.id) && launchedIds.includes(tableReview.value.id), true);
           eq('delegate: fenced is known up front', [gptWord.value.fenced, geminiWord.value.fenced, localFast.value.fenced], [true, false, false]);
+          eq('delegate: nothing saved starts fenced, with no note', [gptWord.value.fence, geminiWord.value.fence, localFast.value.fence, gptWord.value.fence_note, readTask(gptWord.value.id).fence], ['fenced', 'soft', 'soft', undefined, 'fenced']);
+        });
+
+        await guardedAsync('delegate: a lifted fence', async () => {
+          const project = makePlainFolder('lifted fence');
+          fs.writeFileSync(process.env.CONSULT_PROJECTS_FILE, JSON.stringify({ [projectKey(project)]: { fence: { codex: 'full', local: 'none' } } }));
+          const lifted = await call('delegate', briefArgs({ worker: 'codex', mode: 'write', location: 'here' }), contextFor(project));
+          eq('delegate: a lifted codex fence is reported and stored', [lifted.value.fence, lifted.value.fenced, readTask(lifted.value.id).fence], ['full', false, 'full']);
+          truthy('delegate: and comes with a note', /full access/.test(lifted.value.fence_note));
+          const liftedLocal = await call('delegate', briefArgs({ worker: 'local:fast', mode: 'read' }), contextFor(project));
+          eq('delegate: a lifted local fence is none, with a note naming the worker', [liftedLocal.value.fence, liftedLocal.value.fenced, liftedLocal.value.fence_note], ['none', false, 'This project\'s fence is lifted: local is not asked to stay in the project folder.']);
+          const liftedCodexRead = await call('delegate', briefArgs({ worker: 'codex', mode: 'read' }), contextFor(project));
+          const liftedAgy = await call('delegate', briefArgs({ worker: 'agy', mode: 'read' }), contextFor(project));
+          eq('delegate: agy stays soft when only codex and local were lifted', [liftedAgy.value.fence, liftedAgy.value.fence_note], ['soft', undefined]);
+          updateTask(lifted.value.id, { state: 'done' });
+          updateTask(liftedCodexRead.value.id, { state: 'done' });
+          updateTask(liftedLocal.value.id, { state: 'done' });
+          const writeResult = await call('delegate_result', { id: lifted.value.id }, contextFor(project));
+          eq('delegate_result: reports the fence', writeResult.value.fence, 'full');
+          truthy('delegate_result: a lifted write task says it could change files outside its folder', /could change files outside its folder/.test(writeResult.value.note));
+          const readResult = await call('delegate_result', { id: liftedCodexRead.value.id }, contextFor(project));
+          eq('delegate_result: a lifted codex read task has no such sentence', [readResult.value.fence, /outside its folder/.test(readResult.value.note ?? '')], ['full', false]);
+          const localResult = await call('delegate_result', { id: liftedLocal.value.id }, contextFor(project));
+          eq('delegate_result: a lifted local read task has no such sentence (read tools only)', /outside its folder/.test(localResult.value.note ?? ''), false);
+          fs.writeFileSync(process.env.CONSULT_PROJECTS_FILE, JSON.stringify({ [projectKey(project)]: { fence: { agy: 'none' } } }));
+          const liftedAgyRead = await call('delegate', briefArgs({ worker: 'agy', mode: 'read' }), contextFor(project));
+          updateTask(liftedAgyRead.value.id, { state: 'done' });
+          const agyReadResult = await call('delegate_result', { id: liftedAgyRead.value.id }, contextFor(project));
+          truthy('delegate_result: a lifted agy read task has the sentence (its shell can write)', /could change files outside its folder/.test(agyReadResult.value.note));
         });
 
         await guardedAsync('delegate: git', async () => {
@@ -5485,7 +5599,7 @@ try {
         eq('door show: other projects are only counts (finished and not yet reported, running)', shown.json.elsewhere, [{ project: projectB, finished: 2, running: 2 }]);
         const { local_slots: defaultSlots, ...defaultSettings } = shown.json.settings;
         eq('door show: the defaults', defaultSettings, {
-          workers_edit: 'auto', table: { code: 'codex', research_review: 'agy', private: 'local' }, local_at_once: 'auto', on_close: 'stop', time_limit_min: 180
+          workers_edit: 'auto', table: { code: 'codex', research_review: 'agy', private: 'local' }, fence: { codex: 'fenced', agy: 'soft', local: 'soft' }, local_at_once: 'auto', on_close: 'stop', time_limit_min: 180
         });
         truthy('door show: with local_at_once auto, local_slots is what auto comes to now (a whole number, at least 1)', Number.isInteger(defaultSlots) && defaultSlots >= 1);
         eq('door show: usage limits start out ok for every worker', ['codex', 'agy', 'local'].map((worker) => [worker, shown.json.limits?.[worker]?.level, shown.json.limits?.[worker]?.note]), [['codex', 'ok', ''], ['agy', 'ok', ''], ['local', 'ok', '']]);
@@ -5510,7 +5624,7 @@ try {
         saveProjectSettings(projectA, { workers_edit: 'copy', git: 'declined' });
         const configured = await runDoor(projectA, 'show');
         eq('door show: the saved settings, research and review differing show as mixed', configured.json.settings, {
-          workers_edit: 'copy', table: { code: 'codex', research_review: 'mixed', private: 'agy' }, local_at_once: 2, on_close: 'keep', time_limit_min: 45, local_slots: null
+          workers_edit: 'copy', table: { code: 'codex', research_review: 'mixed', private: 'agy' }, fence: { codex: 'fenced', agy: 'soft', local: 'soft' }, local_at_once: 2, on_close: 'keep', time_limit_min: 45, local_slots: null
         });
         eq('door show: git declined', configured.json.git?.declined, true);
         fs.writeFileSync(globalSettingsPath, '---\ndelegate.research: local\ndelegate.review: local\n---\n');
@@ -5787,7 +5901,7 @@ try {
         eq('door save: on_close goes to the global file as delegate.on_close, every other byte kept', [keep.json.error, fs.readFileSync(globalSettingsPath, 'utf8')], [undefined, '---\r\n# my notes\r\ntimeout_ms: 600000\r\nlocal_runner: llama-swap\r\ndelegate.on_close: keep\r\n---\r\nBody text\r\n']);
         eq('door save: a save that wrote the global file says so', keep.json.global_written, true);
         eq('door save: the first save keeps a .bak of the file as it was', fs.readFileSync(`${globalSettingsPath}.bak`, 'utf8'), original);
-        eq('door save: the settings come back as show reads them', keep.json.settings, { workers_edit: 'copy', table: { code: 'codex', research_review: 'agy', private: 'local' }, local_at_once: 'auto', on_close: 'keep', time_limit_min: 180 });
+        eq('door save: the settings come back as show reads them', keep.json.settings, { workers_edit: 'copy', table: { code: 'codex', research_review: 'agy', private: 'local' }, fence: { codex: 'fenced', agy: 'soft', local: 'soft' }, local_at_once: 'auto', on_close: 'keep', time_limit_min: 180 });
         const second = await runDoor(projectA, 'save', JSON.stringify({ time_limit_min: 45, local_at_once: 3, keep_backup: true }));
         eq('door save: keep_backup leaves the first .bak alone and still saves', [second.json.error, fs.readFileSync(`${globalSettingsPath}.bak`, 'utf8'), fs.readFileSync(globalSettingsPath, 'utf8').includes('delegate.time_limit_min: 45\r\n'), fs.readFileSync(globalSettingsPath, 'utf8').includes('delegate.local_at_once: 3\r\n')], [undefined, original, true, true]);
         eq('door save: the numbers come back as numbers', [second.json.settings?.time_limit_min, second.json.settings?.local_at_once], [45, 3]);
@@ -5847,13 +5961,19 @@ try {
         const declined = await runDoor(projectA, 'save', JSON.stringify({ git: 'declined' }));
         eq('door save: git declined is saved and shows', [declined.json.error, projectSettings(projectA).git, (await runDoor(projectA, 'show')).json.git?.declined], [undefined, 'declined', true]);
         const asked = await runDoor(projectA, 'save', JSON.stringify({ git: null, workers_edit: null }));
-        eq('door save: null puts git back to ask and workers_edit to auto', [asked.json.error, projectSettings(projectA), asked.json.settings?.workers_edit, (await runDoor(projectA, 'show')).json.git?.declined], [undefined, { workers_edit: 'auto', git: 'ask' }, 'auto', false]);
+        eq('door save: null puts git back to ask and workers_edit to auto', [asked.json.error, projectSettings(projectA), asked.json.settings?.workers_edit, (await runDoor(projectA, 'show')).json.git?.declined], [undefined, { workers_edit: 'auto', git: 'ask', fence: { codex: 'fenced', agy: 'soft', local: 'soft' } }, 'auto', false]);
+        const fenceSaved = await runDoor(projectA, 'save', JSON.stringify({ fence: { codex: 'full' } }));
+        eq('door save: a fence is saved for the project', [fenceSaved.json.error, projectSettings(projectA).fence.codex, fenceSaved.json.settings?.fence?.codex], [undefined, 'full', 'full']);
+        const projectsBeforeSoftCodex = fs.readFileSync(doorProjectsFile, 'utf8');
+        const softCodex = await runDoor(projectA, 'save', JSON.stringify({ fence: { codex: 'soft' } }));
+        eq('door save: a fence the worker cannot have is refused and writes nothing', [typeof softCodex.json.error, fs.readFileSync(doorProjectsFile, 'utf8'), projectSettings(projectA).fence.codex], ['string', projectsBeforeSoftCodex, 'full']);
+        await runDoor(projectA, 'save', JSON.stringify({ fence: { codex: null } }));
         eq('door save: a made-up git answer is refused', typeof (await runDoor(projectA, 'save', JSON.stringify({ git: 'maybe' }))).json.error, 'string');
         const nullStore = (() => {
           saveProjectSettings(projectB, { git: 'declined', workers_edit: 'copy' });
           return saveProjectSettings(projectB, { git: null, workers_edit: null });
         })();
-        eq('saveProjectSettings: null resets', nullStore, { workers_edit: 'auto', git: 'ask' });
+        eq('saveProjectSettings: null resets', nullStore, { workers_edit: 'auto', git: 'ask', fence: { codex: 'fenced', agy: 'soft', local: 'soft' } });
 
         fs.rmSync(globalSettingsPath);
         fs.rmSync(`${globalSettingsPath}.bak`, { force: true });

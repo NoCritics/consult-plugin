@@ -73,7 +73,10 @@ function callLabel(call: CallRecord): string {
 }
 
 function taskParts(task: BandTask): string[] {
-  return ['delegate', task.worker, task.model ?? 'default']
+  const parts = ['delegate', task.worker, task.model ?? 'default']
+  // First, so a narrowed row cuts the rest and keeps the marker: a lifted fence is never hidden while it acts.
+  if (task.fence === 'full' || task.fence === 'none') parts.unshift('unfenced')
+  return parts
 }
 
 function callRow($: EngineInterface, call: CallRecord, now: number): RunningRow {

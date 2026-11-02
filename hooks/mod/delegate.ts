@@ -74,6 +74,8 @@ type TaskRow = {
   endedAt: number | null
   // The task's own limit, null in a row from before the field.
   timeLimitMs: number | null
+  // 'full' (Codex) or 'none' (agy, local) when the task runs with its fence lifted; null for any other value or none.
+  fence: 'full' | 'none' | null
   // Files a read-only task changed anyway (agy cannot be fenced); empty when none. Only the count reaches
   // a notice: the names come from a worker that is not fenced, and a notice is submitted with the user's authority.
   editedFiles: string[]
@@ -110,11 +112,16 @@ let sessionProjectFound: string | null = null
 let projectKeys = new Map<string, string>()
 // When this session last stamped its claim on a task, by task id, so the store is asked only when a stamp is due.
 let claimStamps = new Map<string, number>()
-// Each band task's time limit, by task id; 0 when its state.json has none either.
-let knownLimits = new Map<string, number>()
+// What the band knows of each task's time limit and lifted fence, by task id; stateRead once its state.json has been asked.
+type KnownTerms = { limitMs: number | null; fence: 'full' | 'none' | null; stateRead: boolean }
+let knownLimits = new Map<string, KnownTerms>()
 
 function textOrNull(value: unknown): string | null {
   return typeof value === 'string' ? value : null
+}
+
+function liftedFenceOf(value: unknown): 'full' | 'none' | null {
+  return value === 'full' || value === 'none' ? value : null
 }
 
 function toRow(value: unknown): TaskRow | null {
@@ -141,6 +148,7 @@ function toRow(value: unknown): TaskRow | null {
     startedAt: typeof raw.started_at === 'number' ? raw.started_at : null,
     endedAt: typeof raw.ended_at === 'number' ? raw.ended_at : null,
     timeLimitMs: typeof raw.time_limit_ms === 'number' && raw.time_limit_ms > 0 ? raw.time_limit_ms : null,
+    fence: liftedFenceOf(raw.fence),
     editedFiles: stringList(raw.read_only_edits),
   }
 }
@@ -434,6 +442,7 @@ function bandTaskOf(row: TaskRow): BandTask {
     startedAt: row.state === 'queued' ? null : row.startedAt,
     endedAt: row.endedAt,
     limitMs: row.timeLimitMs,
+    fence: row.fence,
   }
 }
 
@@ -450,28 +459,32 @@ function nextBand(shown: BandTask[], seen: BandTask[]): BandTask[] {
   return next
 }
 
-// A task's time limit never changes. A consult server older than 0.15.4,
-// still running in another session, rewrites the shared index without it, so
-// a row without one takes the limit seen before, or else the one in the
-// task's own state.json, read once.
-async function timeLimitOf($: EngineInterface, home: string, row: TaskRow): Promise<number | null> {
-  if (row.timeLimitMs !== null) {
-    knownLimits.set(row.id, row.timeLimitMs)
-    return row.timeLimitMs
-  }
-  let known = knownLimits.get(row.id)
-  if (known === undefined) {
-    known = 0
+// A task's time limit and fence never change. A consult server older than
+// 0.15.4 (limit) or 0.16.0 (fence), still running in another session, rewrites
+// the shared index without them, so a row missing either takes it from the
+// value seen before, or else from the task's own state.json, read once.
+async function limitAndFenceOf(
+  $: EngineInterface,
+  home: string,
+  row: TaskRow,
+): Promise<{ timeLimitMs: number | null; fence: 'full' | 'none' | null }> {
+  const known = knownLimits.get(row.id) ?? { limitMs: null, fence: null, stateRead: false }
+  if (row.timeLimitMs !== null) known.limitMs = row.timeLimitMs
+  if (row.fence !== null) known.fence = row.fence
+  if (!known.stateRead && (known.limitMs === null || known.fence === null)) {
     try {
       const state = parseObject(await $.fs.read(`${home}/tasks/${row.id}/state.json`))
-      if (state !== null && typeof state.time_limit_ms === 'number' && state.time_limit_ms > 0) known = state.time_limit_ms
+      if (state !== null) {
+        if (known.limitMs === null && typeof state.time_limit_ms === 'number' && state.time_limit_ms > 0) known.limitMs = state.time_limit_ms
+        if (known.fence === null) known.fence = liftedFenceOf(state.fence)
+      }
+      known.stateRead = true
     } catch {
       // unreadable for now (Windows refuses a reader for a moment): asked again next tick
-      return null
     }
-    knownLimits.set(row.id, known)
   }
-  return known > 0 ? known : null
+  knownLimits.set(row.id, known)
+  return { timeLimitMs: known.limitMs, fence: known.fence }
 }
 
 // The person's prompt: the tasks that ended leave the band, as the finished calls do.
@@ -554,7 +567,7 @@ async function scan($: EngineInterface, now: number): Promise<void> {
       isOrphan = true
     }
     if (!isOwned) continue
-    seenTasks.push(bandTaskOf({ ...row, timeLimitMs: await timeLimitOf($, home, row) }))
+    seenTasks.push(bandTaskOf({ ...row, ...(await limitAndFenceOf($, home, row)) }))
 
     if (isActiveState(row.state)) isOwnedTaskActive = true
     // Reported (delegate_result, delegate_merge): Claude has dealt with it.

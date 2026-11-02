@@ -171,9 +171,11 @@ function countsElsewhere(tasks, project) {
 function settingsView(project) {
   const delegate = loadSettings().delegate;
   const { research, review } = delegate.table;
+  const shownProject = projectSettings(project);
   return {
-    workers_edit: projectSettings(project).workers_edit,
+    workers_edit: shownProject.workers_edit,
     table: { code: delegate.table.code, research_review: research === review ? research : 'mixed', private: delegate.table.private },
+    fence: shownProject.fence,
     local_at_once: delegate.local_at_once,
     on_close: delegate.on_close,
     time_limit_min: delegate.time_limit_ms / 60000
@@ -297,7 +299,7 @@ function objectFrom(text, what) {
 function splitChange(change) {
   const split = { project: {}, global: {} };
   for (const [key, value] of Object.entries(change)) {
-    if (key === 'workers_edit' || key === 'git') {
+    if (key === 'workers_edit' || key === 'git' || key === 'fence') {
       split.project[key] = value;
     } else if (GLOBAL_SETTINGS.includes(key)) {
       split.global[`delegate.${key}`] = value;
@@ -308,7 +310,7 @@ function splitChange(change) {
         for (const settingKey of TABLE_ROWS[row]) split.global[settingKey] = worker;
       }
     } else {
-      throw new Error(`Unknown setting \`${key}\` (workers_edit, git, table, ${GLOBAL_SETTINGS.join(', ')}).`);
+      throw new Error(`Unknown setting \`${key}\` (workers_edit, git, fence, table, ${GLOBAL_SETTINGS.join(', ')}).`);
     }
   }
   return split;

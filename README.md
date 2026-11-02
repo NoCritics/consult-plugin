@@ -56,7 +56,7 @@ Ask in plain words, or use a slash command.
 
 ## In Claude Code
 
-- **The band.** While a call runs, a row above the prompt shows what kind of call it is (`ask`, `chat`, `image`, `council`), the model, a bar against its time limit, and **Cancel**, which stops that call only. A background task gets a `delegate` row for as long as it runs, with its time against the task's limit and a Cancel of its own; with only tasks shown, the band's button opens the Delegated tab. A row that ends while others still run stays as its result line (the three newest; older ones fold into one line); when the last one ends, one short row says how it went. Either stays until your next prompt. The rows fit a band narrowed by the `/consult` pane.
+- **The band.** While a call runs, a row above the prompt shows what kind of call it is (`ask`, `chat`, `image`, `council`), the model, a bar against its time limit, and **Cancel**, which stops that call only. A background task gets a `delegate` row for as long as it runs, with its time against the task's limit and a Cancel of its own (a task whose fence is lifted leads with `unfenced`); with only tasks shown, the band's button opens the Delegated tab. A row that ends while others still run stays as its result line (the three newest; older ones fold into one line); when the last one ends, one short row says how it went. Either stays until your next prompt. The rows fit a band narrowed by the `/consult` pane.
 - **The `/consult` pane** has three tabs:
   - **Answers:** this session's and earlier sessions' answers (the last 50), with copy buttons. Image entries can be opened, shown in their folder or copied as a path. kitty and Ghostty display PNGs in the pane.
   - **Local models:** choose the runner and a model for each nickname. Shows the settings change before you save.
@@ -90,7 +90,7 @@ Runner settings live in `~/.claude/consult.local.md` only; a project's file can'
   - private work goes to a local model.
 
   Change these in the Delegated tab's settings.
-- **Fencing:** Codex runs in its own sandbox and stays inside its folder. agy and the local worker (the `pi` agent) are not fenced: they can write anywhere you can. agy can't run commands.
+- **Fencing:** each project has a fence per worker, set in the Delegated tab's settings. Codex is fenced by its own sandbox and stays inside its folder; set to *full access*, its write tasks can change any file and run any command on this PC (read tasks still change nothing, but may read anywhere). agy and the local worker (the `pi` agent) aren't fenced by anything: by default their brief asks them to stay in the folder, and *anywhere* drops that. agy can't run commands. Changes a worker makes outside the project don't go through the copy and can't be undone, and nothing stops an unfenced worker from editing consult's own settings; a stronger fence is planned. A task keeps the fence it started with: every run uses the stricter of that and the project's current setting, so lifting a fence never widens a task already started, while putting it back narrows it on the next resume.
 - **Copies:** in a git project (git 2.40 or newer, at least one commit), a task that edits files works in a separate copy that includes your uncommitted changes.
   - Claude merges the copy back file by file. A file changed on both sides gets conflict markers.
   - Nothing is committed, and your branch and staged changes are left alone.

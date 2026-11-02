@@ -1,6 +1,6 @@
 {
   "name": "consult-mcp",
-  "version": "0.15.6",
+  "version": "0.16.0",
   "private": true,
   "type": "module",
   "description": "MCP server that wraps the Codex, Antigravity, Gemini and Claude CLIs plus any local OpenAI-compatible runner (llama-swap, Ollama, LM Studio, llama-server, vLLM) as headless tools. Provides single-shot asks, multi-turn chat with on-disk session relay, and a Borda-count council tournament.",

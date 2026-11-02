@@ -93,5 +93,10 @@ export const SETTINGS_CASES = [
     "name": "delegate keys are known in the global file",
     "text": "---\ndelegate.on_close: keep\ndelegate.time_limit_min: 90\n---\n",
     "expect": { "raw": { "delegate.on_close": "keep", "delegate.time_limit_min": 90 }, "notifyAfterS": 120, "historySize": 50, "summaryModel": null, "warnings": [] }
+  },
+  {
+    "name": "a fence is not a settings key: delegate.fence.codex is unknown",
+    "text": "---\ndelegate.on_close: keep\ndelegate.fence.codex: full\n---\n",
+    "expect": { "raw": { "delegate.on_close": "keep" }, "notifyAfterS": 120, "historySize": 50, "summaryModel": null, "warnings": ["line 3: unknown setting `delegate.fence.codex`"] }
   }
 ];
