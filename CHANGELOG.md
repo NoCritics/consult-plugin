@@ -4,6 +4,37 @@ All notable changes to this plugin are documented here. Format loosely follows [
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-11-08
+
+### Added
+
+- **Real fences for agy and the local worker.** Both are now enforced, not just asked for in the brief. agy runs with `--settings` naming the task's folder as its only trusted workspace. pi runs inside Codex's sandbox, with the work folder as its one write root and its own agent and temp folders. Codex can be installed just for its sandbox; it needs no sign-in.
+- **A sandbox self-test per Codex version**, cached in `~/.claude/consult-sandbox-check.json`: a pass is kept, a failure is retried after an hour, and an inconclusive check (offline, a write to home that failed some other way than a refusal, a cache that could not be written) runs again next task. It runs the way pi does: in a work folder of its own, with `TEMP` and `TMP` in a temp folder of its own. If Codex is missing, is inside the project, fails the test, or the folder is your home folder, a drive root or one that holds consult's own files, pi gets the guard only (file edits checked, commands not) and the task says so. If the sandbox cannot start, the task fails; it never retries without it.
+- **consult's own files stay out of a fenced worker's reach.** Its task data, `~/.claude/consult-projects.json`, the sandbox-check file and the plugin itself:
+  - a fenced agy write task in a folder that holds them (your home folder, say) is refused at start and at a follow-up, with a message to run it in a project folder or lift agy's fence for that project;
+  - pi there gets the guard only, and the guard refuses edits to those files even inside the folder.
+- **The Delegated tab and start reply** say how each task is fenced. The tab shows the guard for a home folder, a drive root or a folder holding consult's files when the project's write tasks run in place (a copy is none of those). A local task that drops to the guard after it started says so in its result, with the reason.
+- **`delegate` never waits for the sandbox check.** It names the local layer from the cache; when nothing is cached yet the reply says `fence_layer: "pending"`, and the task's supervisor runs the check as the task starts (`delegate_status` and `delegate_result` then name the layer it got).
+- **pi's newest sessions are never lost.** A temp copy left by a run whose copy-back failed is copied back before the next run; if that fails again, a fenced run continues on the temp copy and a lifted run stops without starting pi.
+
+### Changed
+
+- **The fence is on by default for every project**, for all three workers. A stored `soft` reads as `fenced`, and the tab can no longer save it. Fence choices are `fenced`/`none` for agy and the local worker.
+- **agy read tasks trust no folder.** A read task can write nowhere; agy 1.5.3 was checked to still read its `--add-dir` folder.
+- **A failed sandbox check is retried after an hour**; a pass holds for that Codex version.
+- A sandboxed pi no longer shares the real temp folder: its `TEMP` and `TMP` are its own. Its `codex sandbox` run pins the environment policy (`shell_environment_policy.inherit=all`, `ignore_default_excludes=true`), so a `~/.codex/config.toml` that strips variables can't cut pi off from its runner.
+- **A fenced Codex write task in a folder that holds consult's own files is now refused** (it ran there in 0.16.0), at start and at a follow-up, as for agy: run it in a project folder, or set Codex to full access for that project. Codex read tasks there are unaffected.
+- agy's refused writes are reported only when agy says it denied a write, and relative paths are resolved against the work folder.
+- Tests never start the real Codex for a fence or write your sandbox-check cache: the supervisor, the Delegated tab and test servers all honour the test switch, and test servers get a scratch cache file.
+
+### Known limits
+
+- Fenced workers can read anywhere, including secrets, and agy has network access.
+- agy's fence depends on agy honouring `--settings`, so an agy update could change it.
+- Codex at `full access` and agy/local at `none` remain trusted with everything.
+- Codex's permission entries stay on work folders, as they already do for Codex tasks.
+- A fenced agy or Codex write task can't run in place in a folder that holds consult's own files; a pi task there gets the guard only.
+
 ## [0.16.0] - 2026-11-02
 
 ### Added

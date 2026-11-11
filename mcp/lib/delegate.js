@@ -23,14 +23,14 @@ import { validateAgyEffort } from './agy.js';
 import { localConfigured, DELEGATE_WORKERS } from './settings.js';
 import { NICKNAME_SPELLINGS } from './local-models.js';
 import { WORKER_ALIASES, parseWorkerWord, workerForKind } from './delegate-route.js';
-import { requireModelId } from './delegate-workers.js';
+import { requireModelId, refuseInConsultFolder } from './delegate-workers.js';
 import { lastLimits, limitPolicy } from './delegate-limits.js';
 import { isOutside, gitState, decideLocation, setupAllowed, setupGit, makeCopy, uncommittedCount, removeCopy, changedFiles, diffStat, mergeCopy } from './delegate-git.js';
 import {
   dataHome, taskFolder, createTask, readTask, updateTask, updateTaskWhen, scanTasks, listTasks, indexRow,
-  projectKey, projectSettings, taskFence, saveProjectSettings, withLockFolder, removeTaskWhen, unmergedBase, isSupervisorLive, ACTIVE_STATES
+  projectKey, projectSettings, taskFence, narrowerFence, saveProjectSettings, withLockFolder, removeTaskWhen, unmergedBase, isSupervisorLive, ACTIVE_STATES
 } from './delegate-store.js';
-import { launchSupervisor, copyWorkFolder } from './delegate-supervisor.js';
+import { launchSupervisor, copyWorkFolder, cachedPiLayer } from './delegate-supervisor.js';
 import { isLongText, previewWithPath } from './long-answer.js';
 
 // ---- the words ----
@@ -113,7 +113,7 @@ export const DELEGATE_TOOLS = [
       `${DELEGATE_ROUTING_TEXT} ` +
       `Workers: codex, agy, local, or local:<nickname> (${uniqueNicknames().join(', ')}) to pick a local model. ${aliasSentence()} ` +
       '`worker: "auto"` with a `kind` uses the user\'s default table: use it only when the user clearly pointed at consult without naming a worker, and say which worker it chose. ' +
-      'Fences are set per project by the user in the Delegated tab, and the start reply\'s `fence` says this task\'s: codex is `fenced` (works only inside its copy) or `full` (write tasks have full access to the PC; read tasks stay read-only but may read anywhere); agy and local are `soft` (asked in their brief to stay in the folder, not enforced) or `none` (not asked). agy can\'t run commands; local read-only tasks get read tools only. ' +
+      'Fences are set per project by the user in the Delegated tab, and the start reply\'s `fence` says this task\'s: codex is `fenced` (works only inside its copy) or `full` (write tasks have full access to the PC; read tasks stay read-only but may read anywhere); agy and local are `fenced` (agy trusts only the project folder; local runs in Codex\'s sandbox, or with consult\'s file-edit check when Codex is missing) or `none`. agy can\'t run commands; local read-only tasks get read tools only. ' +
       'Never change a fence yourself, with a tool, a script or a file edit: if the user wants one changed, tell them it is in the Delegated tab\'s settings. When `fence_note` is set, tell the user in your one-line start message. ' +
       'A local worker keeps its own model calls on this machine, but it is not offline (its shell can reach the network), and Claude, which writes the brief and reads the result, is a cloud model. ' +
       'Write the brief yourself: the goal, the files involved, what done means and the constraints; the worker cannot see this conversation. ' +
@@ -423,12 +423,18 @@ async function startDelegate(args, context) {
       git = await gitState(project);
       decision = decide(git, false, saved.git);
     } else if (args.git_setup === 'no') {
-      saveProjectSettings(project, { git: 'declined' });
-      decision = { location: 'here', ask: null };
+      // Saved below, once the start is known not to be refused.
+      decision = { location: 'here', ask: null, declinesGit: true };
     } else {
       return { started: false, ask: 'git-setup', question: GIT_SETUP_QUESTION };
     }
   }
+  // A fenced agy or Codex write task may write anywhere in its work folder; one that holds consult's own
+  // files is refused before anything is made (Rulings 15 and 20). A copy (<data>/worktrees/<id>) never holds them.
+  if (decision.location === 'here') {
+    refuseInConsultFolder({ worker, isWrite: args.mode === 'write', fenced: saved.fence[worker] === 'fenced', folder: project });
+  }
+  if (decision.declinesGit === true) saveProjectSettings(project, { git: 'declined' });
   let locationNote;
   const wantedCopy = (args.location ?? saved.workers_edit) === 'copy';
   if (args.mode === 'write' && wantedCopy && decision.location === 'here') {
@@ -465,6 +471,23 @@ async function startDelegate(args, context) {
       throw new Error(`Could not make a separate copy of the project: ${error.message}`);
     }
   }
+  // A fenced local task: the reply names the layer known now, from the pre-checks and the sandbox
+  // check's cache; it never probes. With no cached verdict the layer is pending (kind null) and the
+  // supervisor, the only one that probes, decides it as the task starts. The layer is stored on the
+  // task before launch, so a supervisor that decides otherwise records the change (Ruling 18). A
+  // check that throws is the guard: the task still gets its supervisor.
+  let localLayer = null;
+  if (worker === 'local' && taskFence(task) === 'fenced') {
+    const stored = readTask(task.id);
+    try {
+      localLayer = await cachedPiLayer(context, decision.location === 'copy' ? await workFolderOf(stored) : project, [project, stored?.worktree]);
+    } catch (error) {
+      localLayer = { kind: 'guard', reason: `the fence check failed: ${oneLine(error.message, 200)}` };
+    }
+    try {
+      updateTask(task.id, { fence_layer: localLayer.kind, fence_layer_reason: localLayer.reason ?? null });
+    } catch (_) { /* the supervisor records its own layer anyway */ }
+  }
   try {
     launch(context, task.id);
   } catch (error) {
@@ -478,10 +501,18 @@ async function startDelegate(args, context) {
   const fence = taskFence(latest);
   const result = {
     started: true, id: task.id, worker, model: latest.model ?? model, location: decision.location, folder,
-    fence, fenced: fence === 'fenced', state: latest.state
+    fence, fenced: fence === 'fenced' && (worker !== 'local' || localLayer.kind !== 'guard'), state: latest.state
   };
+  result.fence_layer = null;
+  if (worker === 'agy' && fence === 'fenced') result.fence_layer = 'agy';
+  if (localLayer !== null) result.fence_layer = localLayer.kind ?? 'pending';
   if (fence === 'full') result.fence_note = 'This project\'s fence is lifted: Codex has full access to this PC for this task.';
-  if (fence === 'none') result.fence_note = `This project's fence is lifted: ${worker} is not asked to stay in the project folder.`;
+  if (fence === 'none') result.fence_note = `This project's fence is lifted: ${worker} may change files outside the project folder.`;
+  if (localLayer !== null && localLayer.kind === 'guard') result.fence_note = guardNote(localLayer.reason);
+  // Pending: the supervisor decides the layer as the task starts.
+  if (localLayer !== null && localLayer.kind === null) {
+    result.fence_note = "consult checks Codex's sandbox as the task starts; delegate_status and delegate_result name the layer it got (Codex's sandbox, or consult's own check).";
+  }
   if (worker === 'local' && latest.state === 'queued') {
     result.queued = true;
     result.queue_model = latest.queue_model ?? null;
@@ -527,6 +558,12 @@ async function listTool(args, context) {
 
 // ---- result ----
 
+// What the start reply and the result say of a local task fenced by consult's guard alone.
+function guardNote(reason) {
+  const because = typeof reason === 'string' && reason !== '' ? ` (${reason})` : '';
+  return `The local worker's fence is checked by consult only${because}: file edits outside the folder are refused, commands are not.`;
+}
+
 function resultNote(task) {
   if (task.state === 'paused-limit') {
     return 'Paused at a usage limit; the copy, the worker\'s session and the log are kept. Show the user what is done (the diff) and offer: carry on after the reset (delegate_send), hand the rest to another worker, give it to one of your subagents, or merge the partial work labelled unfinished.';
@@ -547,13 +584,26 @@ async function resultTool(args, context) {
     changed: null, diff_stat: null, branch: task.branch ?? null, log_path: task.log_path ?? null,
     limit: task.limit ?? null, limit_hit: task.limit_hit ?? null, denied: task.denied ?? null, warning: task.warning ?? null
   };
-  let note = resultNote(task);
+  const notes = [];
+  const statusNote = resultNote(task);
+  if (statusNote !== undefined) notes.push(statusNote);
   const fence = taskFence(task);
   output.fence = fence;
+  output.fence_layer = task.fence_layer ?? null;
   if ((fence === 'full' || fence === 'none') && (task.mode === 'write' || task.worker === 'agy')) {
     const liftedNote = `This task ran with its fence lifted (${fence}): it could change files outside its folder, which no copy or merge covers. Check the worker's final message for files it changed outside the folder and name them to the user.`;
-    note = note === undefined ? liftedNote : `${note} ${liftedNote}`;
+    notes.push(liftedNote);
   }
+  if (task.worker === 'agy' && Array.isArray(task.refused_paths) && task.refused_paths.length > 0) {
+    notes.push(`agy was kept in its folder and refused these writes: ${task.refused_paths.join(', ')}. Only the user can lift agy's fence, in the Delegated tab.`);
+  }
+  if (typeof task.fence_layer_changed === 'string' && task.fence_layer_changed !== '') {
+    notes.push(`The fence changed between runs: ${task.fence_layer_changed}.`);
+  }
+  if (task.worker === 'local' && task.fence_layer === 'guard') {
+    notes.push(guardNote(task.fence_layer_reason));
+  }
+  let note = notes.length === 0 ? undefined : notes.join(' ');
   const baseCommit = unmergedBase(task);
   if (task.location === 'copy' && typeof baseCommit === 'string' && typeof task.end_commit === 'string') {
     try {
@@ -766,6 +816,11 @@ async function sendTool(args, context) {
   if (task.location === 'copy') {
     if (task.copy_removed === true) throw new Error('the copy was removed after merging; start a new task');
     if (!task.worktree || !fs.existsSync(task.worktree)) throw new Error('The task\'s copy no longer exists; start a new task.');
+  }
+  // The same refusal as at start: the follow-up would run fenced in a folder that holds consult's files.
+  if (task.location !== 'copy') {
+    const fenceNow = narrowerFence(task.worker, taskFence(task), projectSettings(task.project).fence[task.worker]);
+    refuseInConsultFolder({ worker: task.worker, isWrite: task.mode === 'write', fenced: fenceNow === 'fenced', folder: task.project });
   }
   const queuedAt = Date.now();
   // What the update below changes, as it was, so a launch that fails can put it all back.

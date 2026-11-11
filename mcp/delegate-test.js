@@ -14,13 +14,13 @@ import {
 } from './lib/delegate-git.js';
 import {
   dataHome, newTaskId, createTask, readTask, updateTask, listTasks,
-  beat, isAlive, isSessionAlive, taskFence, narrowerFence, projectSettings, saveProjectSettings, projectKey, taskFolder,
+  beat, isAlive, isSessionAlive, taskFence, normalFence, narrowerFence, projectSettings, saveProjectSettings, projectKey, taskFolder,
   withTaskLock, breakStaleLock, updateTaskWhen, withLockFolder
 } from './lib/delegate-store.js';
 import { loadSettings, frontmatterWarnings, DEFAULTS } from './lib/settings.js';
 import { parseWorkerWord, workerForKind, WORKER_ALIASES } from './lib/delegate-route.js';
 import {
-  workerCommand, parseWorkerStream, noteStepEvent, contextWarning, codexRolloutLimits, workerPreamble, CONTINUE_PROMPT, READ_ONLY_REMINDER
+  workerCommand, parseWorkerStream, noteStepEvent, contextWarning, codexRolloutLimits, workerPreamble, CONTINUE_PROMPT, READ_ONLY_REMINDER, refusedOutside
 } from './lib/delegate-workers.js';
 import { launchSupervisor, runSupervisor } from './lib/delegate-supervisor.js';
 import * as supervisorModule from './lib/delegate-supervisor.js';
@@ -33,6 +33,9 @@ import { recordLimit, recordLimitHit, lastLimits, limitPolicy } from './lib/dele
 import { makeAsker } from './lib/council.js';
 import { sleepUnlessAborted } from './lib/util.js';
 import { fakeServer, startServer, handshake, unpack } from './test-helpers.js';
+import { shellSafeArgs } from './lib/spawn-cli.js';
+import { piTempFolders } from './lib/delegate-fence.js';
+import { spawnableCmd, SPAWN_OPTS } from './lib/resolve-cmd.js';
 
 let failed = 0;
 function eq(label, got, want) {
@@ -56,10 +59,18 @@ const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'consult-delegate-test-'))
 const originalEnv = {
   CONSULT_DELEGATE_HOME: process.env.CONSULT_DELEGATE_HOME,
   CONSULT_PROJECTS_FILE: process.env.CONSULT_PROJECTS_FILE,
-  CODEX_HOME: process.env.CODEX_HOME
+  CODEX_HOME: process.env.CODEX_HOME,
+  CONSULT_PI_TEMP_ROOT: process.env.CONSULT_PI_TEMP_ROOT,
+  CONSULT_DELEGATE_TEST_NO_CODEX: process.env.CONSULT_DELEGATE_TEST_NO_CODEX,
+  CONSULT_SANDBOX_CHECK_FILE: process.env.CONSULT_SANDBOX_CHECK_FILE
 };
 process.env.CONSULT_DELEGATE_HOME = path.join(scratch, 'data');
 process.env.CONSULT_PROJECTS_FILE = path.join(scratch, 'consult-projects.json');
+// pi's temp folders go under the scratch folder, and a launched supervisor never reaches a real Codex.
+process.env.CONSULT_PI_TEMP_ROOT = path.join(scratch, 'consult-pi');
+process.env.CONSULT_DELEGATE_TEST_NO_CODEX = '1';
+// The Codex sandbox check cache is a scratch file for the whole run, never the user's ~/.claude one (unless the caller set one).
+if (!process.env.CONSULT_SANDBOX_CHECK_FILE) process.env.CONSULT_SANDBOX_CHECK_FILE = path.join(scratch, 'consult-sandbox-check.json');
 // No test reads the user's real ~/.codex: whatever asks for the codex home gets an empty folder.
 process.env.CODEX_HOME = path.join(scratch, 'default codex home');
 fs.mkdirSync(process.env.CODEX_HOME, { recursive: true });
@@ -77,6 +88,31 @@ try {
   eq('dataHome: the env override wins', dataHome({ CONSULT_DELEGATE_HOME: 'X:\\somewhere' }), 'X:\\somewhere');
   eq('dataHome: default is under ~/.claude', dataHome({}), path.join(os.homedir(), '.claude', 'consult-delegate'));
   eq('dataHome: reads the process env by default', dataHome(), path.join(scratch, 'data'));
+
+  // ---- consult's own files (F1, Ruling 15) ----
+  {
+    const pluginRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+    const protectedPaths = typeof storeNamespace.consultProtectedPaths === 'function' ? storeNamespace.consultProtectedPaths() : null;
+    eq('consultProtectedPaths: the data home, the projects file, the sandbox-check file and the plugin root',
+      protectedPaths, [dataHome(), process.env.CONSULT_PROJECTS_FILE, process.env.CONSULT_SANDBOX_CHECK_FILE, pluginRoot]);
+    const holds = (folder) => (typeof storeNamespace.holdsConsultFiles === 'function' ? storeNamespace.holdsConsultFiles(folder) : 'missing');
+    const copyFolder = path.join(dataHome(), 'worktrees', 'abc123');
+    fs.mkdirSync(copyFolder, { recursive: true });
+    eq('holdsConsultFiles: a folder holding the data home, projects file and check file', holds(scratch), true);
+    eq('holdsConsultFiles: the data home itself, and a folder inside it that is not a copy', [holds(dataHome()), holds(path.join(dataHome(), 'tasks'))], [true, true]);
+    eq('holdsConsultFiles: a task\'s copy under <data>/worktrees does not', holds(copyFolder), false);
+    eq('holdsConsultFiles: the plugin root, a folder in it and its parent', [holds(pluginRoot), holds(path.join(pluginRoot, 'mcp')), holds(path.dirname(pluginRoot))], [true, true, true]);
+    eq('holdsConsultFiles: an ordinary project does not, nor a sibling that shares a prefix', [holds(path.join(scratch, 'project')), holds(dataHome() + ' two')], [false, false]);
+    if (process.platform === 'win32') eq('holdsConsultFiles: case does not matter', holds(dataHome().toUpperCase()), true);
+    const fenceList = (folder) => (typeof storeNamespace.fenceProtectedPaths === 'function' ? storeNamespace.fenceProtectedPaths(folder) : 'missing');
+    eq('fenceProtectedPaths: a copy gets nothing extra to guard', fenceList(copyFolder), []);
+    eq('fenceProtectedPaths: an ordinary project gets nothing extra to guard', fenceList(path.join(scratch, 'project')), []);
+    const scratchList = fenceList(scratch);
+    eq('fenceProtectedPaths: a folder holding consult\'s files lists those inside it', Array.isArray(scratchList) ? scratchList.length : scratchList, 3);
+    const insideList = fenceList(path.join(dataHome(), 'tasks'));
+    eq('fenceProtectedPaths: a folder inside consult\'s files is guarded whole', Array.isArray(insideList) ? insideList.length : insideList, 1);
+    fs.rmSync(path.join(dataHome(), 'worktrees'), { recursive: true, force: true });
+  }
 
   // ---- sleepUnlessAborted ----
   {
@@ -153,7 +189,7 @@ try {
     eq('index: newest first', index.tasks.map(row => row.title), ['third', 'second', 'first']);
     truthy('index: updated_at is a time in ms', Math.abs(index.updated_at - Date.now()) < 5000);
     eq('index: row fields', Object.keys(index.tasks[0]).sort(), [
-      'id', 'worker', 'model', 'title', 'project', 'state', 'location', 'mode', 'summary', 'fenced', 'fence',
+      'id', 'worker', 'model', 'title', 'project', 'state', 'location', 'mode', 'summary', 'fenced', 'fence', 'fence_layer',
       'started_at', 'ended_at', 'stop_reason', 'limit', 'queue_model', 'owner_instance', 'reported_at',
       'queue_waiting_long', 'keep_running', 'hold', 'owner_session', 'created_at', 'queued_at', 'time_limit_ms'
     ].sort());
@@ -577,7 +613,7 @@ try {
   // ---- per-project settings ----
   {
     const project = path.join(scratch, 'My Projects', 'Имя');
-    const fenceDefaults = { codex: 'fenced', agy: 'soft', local: 'soft' };
+    const fenceDefaults = { codex: 'fenced', agy: 'fenced', local: 'fenced' };
     eq('projectSettings: defaults for an unknown project', projectSettings(project), { workers_edit: 'auto', git: 'ask', fence: fenceDefaults });
     eq('projectSettings: no file is created by reading', fs.existsSync(process.env.CONSULT_PROJECTS_FILE), false);
     const saved = saveProjectSettings(project, { workers_edit: 'copy' });
@@ -605,14 +641,30 @@ try {
     const projectsFile = process.env.CONSULT_PROJECTS_FILE;
     fs.rmSync(projectsFile, { force: true });
     const spec = sampleSpec();
-    eq('projectSettings: fence defaults', projectSettings(freshProject).fence, { codex: 'fenced', agy: 'soft', local: 'soft' });
+    eq('projectSettings: fence defaults', projectSettings(freshProject).fence, { codex: 'fenced', agy: 'fenced', local: 'fenced' });
     saveProjectSettings(freshProject, { fence: { codex: 'full' } });
     saveProjectSettings(freshProject, { fence: { agy: 'none' } });
-    eq('saveProjectSettings: fence merges per worker', projectSettings(freshProject).fence, { codex: 'full', agy: 'none', local: 'soft' });
+    eq('saveProjectSettings: fence merges per worker', projectSettings(freshProject).fence, { codex: 'full', agy: 'none', local: 'fenced' });
     saveProjectSettings(freshProject, { fence: { codex: null } });
     eq('saveProjectSettings: null puts one worker back', projectSettings(freshProject).fence.codex, 'fenced');
     throws('saveProjectSettings: codex cannot be soft', () => saveProjectSettings(freshProject, { fence: { codex: 'soft' } }));
     throws('saveProjectSettings: unknown worker', () => saveProjectSettings(freshProject, { fence: { gemini: 'none' } }));
+    // ---- fence values 0.17 ----
+    const writeProjectsFile = (contents) => fs.writeFileSync(projectsFile, JSON.stringify(contents));
+    fs.rmSync(projectsFile, { force: true });
+    eq('fence 0.17: defaults are fenced for all', projectSettings(freshProject).fence, { codex: 'fenced', agy: 'fenced', local: 'fenced' });
+    eq('fence 0.17: soft reads as fenced', [normalFence('agy', 'soft'), normalFence('local', 'soft'), normalFence('codex', 'soft')], ['fenced', 'fenced', 'fenced']);
+    eq('fence 0.17: an old task with soft', taskFence({ worker: 'local', fence: 'soft' }), 'fenced');
+    // a project file written by 0.16.0 with agy soft and codex full
+    writeProjectsFile({ [projectKey(freshProject)]: { fence: { codex: 'full', agy: 'soft', local: 'none' } } });
+    eq('fence 0.17: an old file reads soft as fenced', projectSettings(freshProject).fence, { codex: 'full', agy: 'fenced', local: 'none' });
+    saveProjectSettings(freshProject, { git: 'ask' });
+    eq('fence 0.17: saving another key keeps the old file readable', projectSettings(freshProject).fence.local, 'none');
+    throws('fence 0.17: soft can no longer be saved', () => saveProjectSettings(freshProject, { fence: { agy: 'soft' } }));
+    saveProjectSettings(freshProject, { fence: { agy: 'none' } });
+    eq('fence 0.17: none saves', projectSettings(freshProject).fence.agy, 'none');
+    eq('fence 0.17: narrower of none and fenced', narrowerFence('agy', 'none', 'fenced'), 'fenced');
+    eq('fence 0.17: a new task has no fence layer', createTask({ ...spec, worker: 'agy' }).fence_layer, null);
     // a save writes only what it changed, never a re-stamp of the other settings
     const stampProject = path.join(scratch, 'My Projects', 'Stamp');
     fs.rmSync(projectsFile, { force: true });
@@ -625,14 +677,14 @@ try {
     eq('saveProjectSettings: a fence save changes only the named worker', JSON.parse(fs.readFileSync(projectsFile, 'utf8'))[projectKey(stampProject)], { fence: { codex: 'full', agy: 'none' }, git: 'declined' });
     // a hand-edited file with a bad value reads as the default
     fs.writeFileSync(projectsFile, JSON.stringify({ [projectKey(freshProject)]: { fence: { codex: 'wide-open', agy: 'none' } } }));
-    eq('projectSettings: a bad value reads as the default', projectSettings(freshProject).fence, { codex: 'fenced', agy: 'none', local: 'soft' });
+    eq('projectSettings: a bad value reads as the default', projectSettings(freshProject).fence, { codex: 'fenced', agy: 'none', local: 'fenced' });
     // unreadable file: defaults
     fs.writeFileSync(projectsFile, '{ not json');
-    eq('projectSettings: unreadable file reads fenced', projectSettings(freshProject).fence, { codex: 'fenced', agy: 'soft', local: 'soft' });
-    eq('createTask: fence defaults by worker', [createTask({ ...spec, worker: 'codex' }).fence, createTask({ ...spec, worker: 'agy' }).fence], ['fenced', 'soft']);
+    eq('projectSettings: unreadable file reads fenced', projectSettings(freshProject).fence, { codex: 'fenced', agy: 'fenced', local: 'fenced' });
+    eq('createTask: fence defaults by worker', [createTask({ ...spec, worker: 'codex' }).fence, createTask({ ...spec, worker: 'agy' }).fence], ['fenced', 'fenced']);
     eq('createTask: fence is kept', createTask({ ...spec, worker: 'codex', fence: 'full' }).fence, 'full');
     throws('createTask: a fence of another worker is refused', () => createTask({ ...spec, worker: 'agy', fence: 'full' }));
-    eq('taskFence: an old task reads its default', [taskFence({ worker: 'codex' }), taskFence({ worker: 'local', fence: null })], ['fenced', 'soft']);
+    eq('taskFence: an old task reads its default', [taskFence({ worker: 'codex' }), taskFence({ worker: 'local', fence: null })], ['fenced', 'fenced']);
     eq('taskFence: an unknown worker does not throw', [taskFence({ worker: '__proto__', fence: 'full' }), taskFence({ worker: 'gizmo' })], ['fenced', 'fenced']);
   }
 
@@ -1596,11 +1648,11 @@ try {
       const readTask = createTask(sampleSpec({ worker: word, mode: 'read' }));
       const readCommand = workerCommand(readTask, { settings: defaultSettings });
       const promptSent = readCommand.stdinText ?? readCommand.briefFile.text;
-      eq(`${word} read: the prompt starts with the read-only preamble`, promptSent.startsWith(workerPreamble(readTask.project, false, word)), true);
+      eq(`${word} read: the prompt starts with the read-only preamble`, promptSent.startsWith(workerPreamble(readTask.project, false, word, 'fenced', word === 'agy' ? 'agy' : null)), true);
       eq(`${word} read: and never asks for "what you changed"`, promptSent.includes('what you changed'), false);
     }
     const agyWriteForPreamble = workerCommand(createTask(sampleSpec({ worker: 'agy', mode: 'write' })), { settings: defaultSettings });
-    eq('a write task keeps the write preamble', agyWriteForPreamble.stdinText.startsWith(workerPreamble(agyWriteForPreamble.cwd, true, 'agy')), true);
+    eq('a write task keeps the write preamble', agyWriteForPreamble.stdinText.startsWith(workerPreamble(agyWriteForPreamble.cwd, true, 'agy', 'fenced', 'agy')), true);
 
     // codex
     const codexTask = createTask(sampleSpec({ worker: 'codex', mode: 'write' }));
@@ -1633,12 +1685,86 @@ try {
     eq('agy write: stream-json, accept-edits, sandbox, add-dir, print timeout, no -p',
       [agyWrite.args.slice(0, 3), argAfter(agyWrite.args, '--mode'), agyWrite.args.includes('--sandbox'), argAfter(agyWrite.args, '--add-dir'), argAfter(agyWrite.args, '--print-timeout'), agyWrite.args.includes('-p') || agyWrite.args.includes('--print')],
       [['--output-format', 'stream-json', '--disable-slash-commands'], 'accept-edits', true, agyTask.project, '9720s', false]);
-    eq('agy write: not fenced, brief on stdin only', [agyWrite.fenced, agyWrite.stdinText, mentionsBrief(agyWrite.args), agyWrite.briefFile, agyWrite.cwd], [false, `${workerPreamble(agyTask.project, true, 'agy')}\n\n${briefText}`, false, null, agyTask.project]);
+    eq('agy write: fenced by value, brief on stdin only', [agyWrite.fenced, agyWrite.stdinText, mentionsBrief(agyWrite.args), agyWrite.briefFile, agyWrite.cwd], [true, `${workerPreamble(agyTask.project, true, 'agy', 'fenced', 'agy')}\n\n${briefText}`, false, null, agyTask.project]);
     const agyRead = workerCommand(createTask(sampleSpec({ worker: 'agy', mode: 'read', time_limit_ms: 600000, model: 'gemini-3.8-flash', effort: 'low' })), { settings: defaultSettings });
     eq('agy read: no --mode, the task time limit, model and effort', [agyRead.args.includes('--mode'), argAfter(agyRead.args, '--print-timeout'), argAfter(agyRead.args, '--model'), argAfter(agyRead.args, '--effort')], [false, '540s', 'gemini-3.8-flash', 'low']);
     const agyResumed = workerCommand({ ...agyTask, worker_session: sessionUuid }, { settings: defaultSettings, resume: true, followUp: 'Next step.' });
     eq('agy resume: --conversation with the id, the follow-up on stdin', [argAfter(agyResumed.args, '--conversation'), agyResumed.stdinText], [sessionUuid, 'Next step.']);
     throws('agy: a bad effort is refused', () => workerCommand(createTask(sampleSpec({ worker: 'agy', effort: 'loud' })), { settings: defaultSettings }));
+
+    // agy, fenced: a per-task settings file trusts only the work folder
+    {
+      const spaceFolder = 'C:\\Проект с пробелом';
+      const fencedAgy = workerCommand({ ...agyTask, fence: 'fenced', project: spaceFolder }, { settings: defaultSettings });
+      const settingsAt = fencedAgy.args.indexOf('--settings');
+      eq('agy fenced: --settings points at the task folder file', fencedAgy.args.slice(settingsAt, settingsAt + 2), ['--settings', path.join(taskFolder(agyTask.id), 'agy-settings.json')]);
+      eq('agy fenced: the file trusts the work folder only', [fencedAgy.files.length, fencedAgy.files[0].path, JSON.parse(fencedAgy.files[0].text)], [1, path.join(taskFolder(agyTask.id), 'agy-settings.json'), { trustedWorkspaces: [spaceFolder] }]);
+      eq('agy fenced: layer', fencedAgy.fenceLayer, 'agy');
+      const fencedAgyRead = workerCommand({ ...createTask(sampleSpec({ worker: 'agy', mode: 'read' })), fence: 'fenced' }, { settings: defaultSettings });
+      eq('agy fenced read: trusts no folder (checked live: agy still reads its --add-dir folder)', JSON.parse(fencedAgyRead.files[0].text), { trustedWorkspaces: [] });
+      fs.writeFileSync(process.env.CONSULT_PROJECTS_FILE, JSON.stringify({ [projectKey(agyTask.project)]: { fence: { agy: 'none' } } }));
+      const liftedAgy = workerCommand({ ...agyTask, fence: 'none' }, { settings: defaultSettings });
+      eq('agy lifted: no --settings, no file', [liftedAgy.args.includes('--settings'), liftedAgy.files.length, liftedAgy.fenceLayer], [false, 0, null]);
+      eq('codex: no files', workerCommand({ ...codexTask, fence: 'fenced' }, { settings: defaultSettings }).files, []);
+      eq('preamble: fenced agy is told writes are refused', workerPreamble('C:\\p', true, 'agy', 'fenced', 'agy').includes('Work only inside this folder: C:\\p. Writes outside this folder are refused.'), true);
+      eq('preamble: guard wording', workerPreamble('C:\\p', true, 'local', 'fenced', 'guard').includes('File edits outside this folder are refused.'), true);
+      eq('preamble: no layer, no refusal sentence', workerPreamble('C:\\p', true, 'agy', 'fenced').includes('refused'), false);
+      const writeStep = (target) => ({ event: 'step_update', step_update: { state: 'DONE', step_type: 'tool', tool_name: 'write_file', tool_info: { name: 'write_file', parameters: { Path: target } } } });
+      const recordedAgyEvents = [
+        writeStep('C:\\work\\inside.txt'),
+        writeStep('C:\\Users\\user\\consult-agy-probe.txt'),
+        writeStep('C:\\Users\\user\\.claude\\consult-agy-probe.txt'),
+        writeStep('C:\\Users\\user\\consult-agy-probe.txt'),
+        { event: 'step_update', step_update: { state: 'DONE', step_type: 'tool', tool_name: 'view_file', tool_info: { name: 'view_file', parameters: { AbsolutePath: 'C:\\elsewhere\\read.txt' } } } },
+        { event: 'result', result: { status: 'SUCCESS', response: '', denied_actions: [{ action: 'write_file', display_name: 'WriteFile' }] } }
+      ];
+      eq('refusedOutside: outside paths only, once each', refusedOutside(recordedAgyEvents, 'C:\\work'), ['C:\\Users\\user\\consult-agy-probe.txt', 'C:\\Users\\user\\.claude\\consult-agy-probe.txt']);
+      const streamLines = recordedAgyEvents.map((event) => JSON.stringify(event));
+      eq('parseWorkerStream: agy refusedPaths with the work folder', parseWorkerStream('agy', streamLines, { workFolder: 'C:\\work' }).refusedPaths.length, 2);
+      eq('parseWorkerStream: agy without a work folder reports none', parseWorkerStream('agy', streamLines).refusedPaths, []);
+      eq('parseWorkerStream: the empty-answer refusal still errors', parseWorkerStream('agy', streamLines, { workFolder: 'C:\\work' }).error, 'agy was refused: WriteFile');
+      // F1d: strict comparison, relative paths resolved against the work folder, and only with a denial signal.
+      const withoutDenial = recordedAgyEvents.slice(0, -1).concat([{ event: 'result', result: { status: 'SUCCESS', response: 'Done.' } }]);
+      eq('refusedOutside: no write denial in the run means nothing was refused', refusedOutside(withoutDenial, 'C:\\work'), []);
+      eq('refusedOutside: a command denial alone is not a write denial', refusedOutside(recordedAgyEvents.slice(0, -1).concat([{ event: 'result', result: { status: 'SUCCESS', response: '', denied_actions: [{ action: 'command', display_name: 'RunCommand' }] } }]), 'C:\\work'), []);
+      eq('refusedOutside: the stderr auto-denied line is a denial signal', refusedOutside(withoutDenial, 'C:\\work', 'no output produced — a tool required the "write_file" permission that headless mode cannot prompt for, so it was auto-denied'), ['C:\\Users\\user\\consult-agy-probe.txt', 'C:\\Users\\user\\.claude\\consult-agy-probe.txt']);
+      const relativeEvents = [writeStep('notes\\inside.txt'), writeStep('..\\outside.txt'), recordedAgyEvents.at(-1)];
+      eq('refusedOutside: a relative path is resolved against the work folder, and named in full', refusedOutside(relativeEvents, 'C:\\work'), [path.resolve('C:\\work', '..\\outside.txt')]);
+      const homeEvents = [writeStep(path.join(os.homedir(), 'notes.txt')), writeStep(path.join(path.dirname(os.homedir()), 'elsewhere.txt')), recordedAgyEvents.at(-1)];
+      eq('refusedOutside: a work folder at home is compared strictly (no broad-folder exemption)', refusedOutside(homeEvents, os.homedir()), [path.join(path.dirname(os.homedir()), 'elsewhere.txt')]);
+      // R9: a work folder that cannot be resolved (a junction loop) still gives a normal result, never a throw.
+      if (process.platform === 'win32') {
+        const loopRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'consult-loop-'));
+        try {
+          const loopA = path.join(loopRoot, 'a');
+          const loopB = path.join(loopRoot, 'b');
+          fs.symlinkSync(loopB, loopA, 'junction');
+          fs.symlinkSync(loopA, loopB, 'junction');
+          let loopResult;
+          try {
+            loopResult = refusedOutside([writeStep('C:\\elsewhere\\x.txt'), recordedAgyEvents.at(-1)], path.join(loopA, 'work'));
+          } catch (error) {
+            loopResult = `threw: ${error.message}`;
+          }
+          eq('refusedOutside: an unresolvable work folder is a normal result, not a throw', loopResult, ['C:\\elsewhere\\x.txt']);
+        } finally {
+          fs.rmSync(loopRoot, { recursive: true, force: true });
+        }
+      }
+      eq('parseWorkerStream: agy passes its stderr to the refusal check', parseWorkerStream('agy', withoutDenial.map((event) => JSON.stringify(event)), { workFolder: 'C:\\work', stderr: 'it was auto-denied' }).refusedPaths.length, 2);
+      // F1c backstop: a fenced agy write task never trusts a folder that holds consult's own files.
+      throws('agy fenced write: a work folder holding consult\'s files is refused', () => workerCommand({ ...agyTask, fence: 'fenced', mode: 'write', project: scratch }, { settings: defaultSettings }));
+      let refusalMessage = '';
+      try { workerCommand({ ...agyTask, fence: 'fenced', mode: 'write', project: scratch }, { settings: defaultSettings }); } catch (error) { refusalMessage = error.message; }
+      eq('agy fenced write: the refusal says how to go on', refusalMessage, `agy can't be fenced in a folder that holds consult's own files (${scratch}). Run it in a project folder, or lift agy's fence for this project in the Delegated tab.`);
+      eq('agy fenced read: the same folder is fine (a read task trusts no folder)', workerCommand({ ...agyTask, fence: 'fenced', mode: 'read', project: scratch }, { settings: defaultSettings }).fenceLayer, 'agy');
+      // Ruling 20: the same backstop for a fenced Codex write task; a read task (read-only sandbox) builds.
+      let codexRefusalMessage = '';
+      try { workerCommand({ ...agyTask, worker: 'codex', fence: 'fenced', mode: 'write', project: scratch }, { settings: defaultSettings }); } catch (error) { codexRefusalMessage = error.message; }
+      eq('codex fenced write: a work folder holding consult\'s files is refused', codexRefusalMessage, `Codex can't be fenced in a folder that holds consult's own files (${scratch}). Run it in a project folder, or lift Codex's fence for this project in the Delegated tab.`);
+      const codexReadThere = workerCommand({ ...agyTask, worker: 'codex', fence: 'fenced', mode: 'read', project: scratch }, { settings: defaultSettings });
+      eq('codex fenced read: the same folder is fine (read-only sandbox)', codexReadThere.args[codexReadThere.args.indexOf('-s') + 1], 'read-only');
+    }
 
     // a task follows its own fence, as far as its project's setting allows
     const setProjectFence = (fence) => fs.writeFileSync(process.env.CONSULT_PROJECTS_FILE, JSON.stringify({ [projectKey(codexTask.project)]: { fence } }));
@@ -1671,8 +1797,8 @@ try {
 
     // the stored fence never widens the project's current setting
     eq('narrowerFence: codex is full only when both are', [narrowerFence('codex', 'full', 'full'), narrowerFence('codex', 'full', 'fenced'), narrowerFence('codex', 'fenced', 'full'), narrowerFence('codex', 'fenced', 'fenced')], ['full', 'fenced', 'fenced', 'fenced']);
-    eq('narrowerFence: agy and local are none only when both are', [narrowerFence('agy', 'none', 'none'), narrowerFence('agy', 'none', 'soft'), narrowerFence('local', 'soft', 'none')], ['none', 'soft', 'soft']);
-    setProjectFence({ codex: 'fenced', agy: 'soft' });
+    eq('narrowerFence: agy and local are none only when both are', [narrowerFence('agy', 'none', 'none'), narrowerFence('agy', 'none', 'fenced'), narrowerFence('local', 'fenced', 'none')], ['none', 'fenced', 'fenced']);
+    setProjectFence({ codex: 'fenced', agy: 'fenced' });
     const widenedByFile = workerCommand({ ...codexTask, fence: 'full', mode: 'write' }, { settings: defaultSettings });
     eq('codex stored full, project fenced: workspace-write and fenced', [widenedByFile.args.includes('workspace-write'), widenedByFile.args.includes('danger-full-access'), widenedByFile.fenced], [true, false, true]);
     const widenedResume = workerCommand({ ...codexTask, fence: 'full', mode: 'write', worker_session: codexThread }, { settings: defaultSettings, resume: true });
@@ -1682,12 +1808,14 @@ try {
     eq('codex stored full, project full: danger-full-access', [fullBoth.args.includes('danger-full-access'), fullBoth.fenced], [true, false]);
     const fencedStays = workerCommand({ ...codexTask, fence: 'fenced', mode: 'write' }, { settings: defaultSettings });
     eq('codex stored fenced, project full: stays workspace-write', [fencedStays.args.includes('workspace-write'), fencedStays.fenced], [true, true]);
-    setProjectFence({ agy: 'soft' });
+    setProjectFence({ agy: 'fenced' });
     const agyWidened = workerCommand({ ...agyTask, fence: 'none', mode: 'write' }, { settings: defaultSettings });
-    truthy('agy stored none, project soft: the soft preamble', agyWidened.stdinText.startsWith(workerPreamble(agyWidened.cwd, true, 'agy', 'soft')) && !/You may work outside it/.test(agyWidened.stdinText));
+    truthy('agy stored none, project fenced: the fenced preamble', agyWidened.stdinText.startsWith(workerPreamble(agyWidened.cwd, true, 'agy', 'fenced', 'agy')) && !/You may work outside it/.test(agyWidened.stdinText));
 
     // local (pi)
     const keySentinel = 'sk-test-sentinel-not-a-real-key';
+    const piTemp = { root: 'T', sessions: 'T\\pi-sessions', agent: 'T\\agent', tmp: 'T\\tmp' };
+    const guardLayer = { kind: 'guard', reason: 'Codex is not installed', temp: piTemp };
     const originalKey = process.env.LLAMA_SWAP_API_KEY;
     process.env.LLAMA_SWAP_API_KEY = keySentinel;
     try {
@@ -1701,38 +1829,72 @@ try {
       ] });
       const localTask = createTask(sampleSpec({ worker: 'local', mode: 'write' }));
       eq('createTask: a local task gets a pi session uuid, other workers none', [/^[0-9a-f-]{36}$/.test(localTask.pi_session), codexTask.pi_session], [true, null]);
-      const localCommand = workerCommand({ ...localTask, model: 'fast' }, { settings: defaultSettings, runner: swapRunner, inventory: swapInventory });
+      const localCommand = workerCommand({ ...localTask, model: 'fast' }, { settings: defaultSettings, runner: swapRunner, inventory: swapInventory, piLayer: guardLayer });
       const taskDir = taskFolder(localTask.id);
       eq('local: pi json print mode with the extension, the resolved model and a fresh session id',
         [localCommand.args.slice(0, 7), argAfter(localCommand.args, '-e'), argAfter(localCommand.args, '--provider'), argAfter(localCommand.args, '--model'), argAfter(localCommand.args, '--session-dir'), argAfter(localCommand.args, '--session-id'), localCommand.args.includes('--session')],
-        [['--mode', 'json', '-p', '--no-mcp', '--no-skills', '--no-extensions', '--no-prompt-templates'], path.resolve(path.dirname(fileURLToPath(import.meta.url)), 'lib', 'pi-provider.js'), 'consult-local', 'qwen3.5-4b', path.join(taskDir, 'pi-sessions'), localTask.pi_session, false]);
+        [['--mode', 'json', '-p', '--no-mcp', '--no-skills', '--no-extensions', '--no-prompt-templates'], path.resolve(path.dirname(fileURLToPath(import.meta.url)), 'lib', 'pi-provider.js'), 'consult-local', 'qwen3.5-4b', 'T\\pi-sessions', localTask.pi_session, false]);
       eq('local: --no-approve, and the brief file is the last argument', [localCommand.args.includes('--no-approve'), localCommand.args.at(-1)], [true, `@${path.join(taskDir, 'prompt.md')}`]);
-      eq('local: the brief is a file with the preamble, stdin is empty, not fenced',
+      eq('local: the brief is a file with the preamble, stdin is empty, fenced by value',
         [localCommand.briefFile, localCommand.stdinText, localCommand.fenced, mentionsBrief(localCommand.args), localCommand.cwd],
-        [{ path: path.join(taskDir, 'prompt.md'), text: `${workerPreamble(localTask.project)}\n\n${briefText}` }, null, false, false, localTask.project]);
+        [{ path: path.join(taskDir, 'prompt.md'), text: `${workerPreamble(localTask.project, true, 'local', 'fenced', 'guard')}\n\n${briefText}` }, null, false, false, localTask.project]);
       eq('local: env names the runner, the model, the context and the key VARIABLE',
-        localCommand.env, { CONSULT_PI_BASE_URL: 'http://127.0.0.1:9292/v1', CONSULT_PI_MODEL: 'qwen3.5-4b', CONSULT_PI_KEY_ENV: 'LLAMA_SWAP_API_KEY', CONSULT_PI_CONTEXT: '32768' });
+        localCommand.env, { CONSULT_PI_BASE_URL: 'http://127.0.0.1:9292/v1', CONSULT_PI_MODEL: 'qwen3.5-4b', CONSULT_PI_KEY_ENV: 'LLAMA_SWAP_API_KEY', CONSULT_PI_CONTEXT: '32768',
+          PI_CODING_AGENT_DIR: 'T\\agent', TEMP: 'T', TMP: 'T', GIT_OPTIONAL_LOCKS: '0', CONSULT_FENCE_DIR: localTask.project, CONSULT_FENCE_PROTECTED: '[]' });
       eq('local: the key value is nowhere in the command', JSON.stringify(localCommand).includes(keySentinel), false);
       eq('local: no warning for a roomy model', localCommand.warning, null);
       const localReadTask = createTask(sampleSpec({ worker: 'local', mode: 'read' }));
-      const localReadCommand = workerCommand({ ...localReadTask, model: 'fast' }, { settings: defaultSettings, runner: swapRunner, inventory: swapInventory });
-      eq('local read: the brief file starts with the read-only preamble', localReadCommand.briefFile.text.startsWith(workerPreamble(localReadTask.project, false)), true);
+      const localReadCommand = workerCommand({ ...localReadTask, model: 'fast' }, { settings: defaultSettings, runner: swapRunner, inventory: swapInventory, piLayer: guardLayer });
+      eq('local read: the brief file starts with the read-only preamble', localReadCommand.briefFile.text.startsWith(workerPreamble(localReadTask.project, false, 'local', 'fenced', 'guard')), true);
       setProjectFence({ local: 'none' });
-      const localNoneRead = workerCommand({ ...localReadTask, fence: 'none', model: 'fast' }, { settings: defaultSettings, runner: swapRunner, inventory: swapInventory });
+      const localNoneRead = workerCommand({ ...localReadTask, fence: 'none', model: 'fast' }, { settings: defaultSettings, runner: swapRunner, inventory: swapInventory, piLayer: guardLayer });
       truthy('local none read: still read tools only, brief unfenced', localNoneRead.args.includes('read,grep,find,ls') && /may read files anywhere on this PC/.test(localNoneRead.briefFile.text));
-      const bigCommand = workerCommand(localTask, { settings: defaultSettings, runner: swapRunner, inventory: swapInventory });
+      const bigCommand = workerCommand(localTask, { settings: defaultSettings, runner: swapRunner, inventory: swapInventory, piLayer: guardLayer });
       eq('local: the default nickname resolves, and a small context warns', [bigCommand.model, bigCommand.env.CONSULT_PI_CONTEXT, typeof bigCommand.warning], ['qwen3.5-27b', '8192', 'string']);
-      const wordCommand = workerCommand({ ...localTask, worker: 'local:fast' }, { settings: defaultSettings, runner: swapRunner, inventory: swapInventory });
+      const wordCommand = workerCommand({ ...localTask, worker: 'local:fast' }, { settings: defaultSettings, runner: swapRunner, inventory: swapInventory, piLayer: guardLayer });
       eq('local: a local:<nickname> worker word picks the nickname', wordCommand.model, 'qwen3.5-4b');
-      const localResumed = workerCommand(localTask, { settings: defaultSettings, runner: swapRunner, inventory: swapInventory, resume: true, followUp: 'More.' });
+      const localResumed = workerCommand(localTask, { settings: defaultSettings, runner: swapRunner, inventory: swapInventory, resume: true, followUp: 'More.', piLayer: guardLayer });
       eq('local resume: --session with the same uuid, the follow-up as a file',
         [argAfter(localResumed.args, '--session'), localResumed.args.includes('--session-id'), localResumed.args.at(-1), localResumed.briefFile],
         [localTask.pi_session, false, `@${path.join(taskDir, 'followup.md')}`, { path: path.join(taskDir, 'followup.md'), text: 'More.' }]);
       const keylessRunner = { ...swapRunner, key_env: null };
-      const keylessCommand = workerCommand(localTask, { settings: defaultSettings, runner: keylessRunner, inventory: swapInventory });
+      const keylessCommand = workerCommand(localTask, { settings: defaultSettings, runner: keylessRunner, inventory: swapInventory, piLayer: guardLayer });
       eq('local: a runner without a key sets no key variable', 'CONSULT_PI_KEY_ENV' in keylessCommand.env, false);
-      throws('local: a key variable with a runner that is not on this machine is refused', () => workerCommand(localTask, { settings: defaultSettings, runner: { ...swapRunner, url: 'http://example.com/v1' }, inventory: swapInventory }));
-      throws('local: a key held in local_api_key cannot reach pi and is refused', () => workerCommand(localTask, { settings: defaultSettings, runner: { ...swapRunner, legacy: true, type: null, key_env: null, api_key: keySentinel }, inventory: null }));
+      throws('local: a key variable with a runner that is not on this machine is refused', () => workerCommand(localTask, { settings: defaultSettings, runner: { ...swapRunner, url: 'http://example.com/v1' }, inventory: swapInventory, piLayer: guardLayer }));
+      throws('local: a key held in local_api_key cannot reach pi and is refused', () => workerCommand(localTask, { settings: defaultSettings, runner: { ...swapRunner, legacy: true, type: null, key_env: null, api_key: keySentinel }, inventory: null, piLayer: guardLayer }));
+      {
+        const sandboxLayer = { kind: 'sandbox', codexPath: 'C:\\c\\codex.exe', launcherPath: 'C:\\pi\\pi-launcher.js', temp: piTemp };
+        const fencedWrite = { ...localTask, fence: 'fenced' };
+        const sandboxed = workerCommand(fencedWrite, { settings: defaultSettings, runner: swapRunner, inventory: swapInventory, piLayer: sandboxLayer });
+        // Ruling 16: the environment policy is pinned per run, so a user's ~/.codex/config.toml cannot strip pi's variables.
+        eq('pi sandboxed: wrapper', sandboxed.wrapper, { program: 'C:\\c\\codex.exe', launcherPath: 'C:\\pi\\pi-launcher.js', args: ['sandbox', '-c', 'sandbox_mode=workspace-write', '-c', 'shell_environment_policy.inherit=all', '-c', 'shell_environment_policy.ignore_default_excludes=true', '--', process.execPath, 'C:\\pi\\pi-launcher.js'] });
+        // F1: consult's own files inside the work folder reach the guard; an ordinary project has none.
+        eq('pi sandboxed: CONSULT_FENCE_PROTECTED is an empty JSON list for an ordinary project', sandboxed.env.CONSULT_FENCE_PROTECTED, '[]');
+        const holdingProject = workerCommand({ ...fencedWrite, project: scratch }, { settings: defaultSettings, runner: swapRunner, inventory: swapInventory, piLayer: guardLayer });
+        let holdingList = null;
+        try { holdingList = JSON.parse(holdingProject.env.CONSULT_FENCE_PROTECTED); } catch (_) { /* stays null */ }
+        eq('pi guard: a work folder holding consult\'s files passes them to the guard', Array.isArray(holdingList) && holdingList.includes(dataHome()) && holdingList.includes(process.env.CONSULT_PROJECTS_FILE), true);
+        eq('pi sandboxed: env', [sandboxed.env.PI_CODING_AGENT_DIR, sandboxed.env.TEMP, sandboxed.env.TMP, sandboxed.env.GIT_OPTIONAL_LOCKS, sandboxed.env.CONSULT_FENCE_DIR], ['T\\agent', 'T', 'T', '0', localTask.project]);
+        eq('pi sandboxed: guard extension and temp sessions', [sandboxed.args.filter((a) => a.endsWith('pi-fence.js')).length, sandboxed.args[sandboxed.args.indexOf('--session-dir') + 1]], [1, 'T\\pi-sessions']);
+        eq('pi sandboxed: the guard follows the provider extension', sandboxed.args.indexOf('-e', sandboxed.args.indexOf('-e') + 1) - sandboxed.args.indexOf('-e'), 2);
+        eq('pi sandboxed: fenced and layer', [sandboxed.fenced, sandboxed.fenceLayer], [true, 'sandbox']);
+        truthy('pi sandboxed: the brief says writes outside are refused', sandboxed.briefFile.text.includes('Writes outside this folder are refused.'));
+        const guarded = workerCommand(fencedWrite, { settings: defaultSettings, runner: swapRunner, inventory: swapInventory, piLayer: guardLayer });
+        eq('pi guard: no wrapper, guard on, not fenced', [guarded.wrapper ?? null, guarded.args.some((a) => a.endsWith('pi-fence.js')), guarded.fenced, guarded.fenceLayer], [null, true, false, 'guard']);
+        truthy('pi guard: the brief says file edits outside are refused', guarded.briefFile.text.includes('File edits outside this folder are refused.'));
+        const sandboxedRead = workerCommand({ ...localReadTask, fence: 'fenced' }, { settings: defaultSettings, runner: swapRunner, inventory: swapInventory, piLayer: sandboxLayer });
+        eq('pi read sandboxed: still workspace-write, read tools', [sandboxedRead.wrapper.args[2], sandboxedRead.args.includes('read,grep,find,ls')], ['sandbox_mode=workspace-write', true]);
+        const lifted = workerCommand({ ...localTask, fence: 'none' }, { settings: defaultSettings, runner: swapRunner, inventory: swapInventory });
+        eq('pi lifted: today\'s command', [lifted.wrapper ?? null, lifted.args[lifted.args.indexOf('--session-dir') + 1], lifted.fenceLayer, lifted.args.some((a) => a.endsWith('pi-fence.js')), lifted.env.CONSULT_FENCE_DIR ?? null], [null, path.join(taskDir, 'pi-sessions'), null, false, null]);
+        eq('pi lifted: no protected list either', lifted.env.CONSULT_FENCE_PROTECTED ?? null, null);
+        const givenNone = workerCommand(fencedWrite, { settings: defaultSettings, runner: swapRunner, inventory: swapInventory, fence: 'none' });
+        eq('pi: a fence handed in wins over the project file, with no piLayer needed', [givenNone.fenceLayer, givenNone.wrapper ?? null], [null, null]);
+        throws('pi fenced: piLayer is required', () => workerCommand(fencedWrite, { settings: defaultSettings, runner: swapRunner, inventory: swapInventory }));
+        const wrapperProgram = path.join(scratch, 'codex dir', 'codex.exe');
+        eq('pi wrapper: shellSafeArgs keeps every wrapper arg, spawnableCmd passes a .exe path through (quoted under cmd.exe)',
+          [shellSafeArgs(sandboxed.wrapper.args), spawnableCmd(wrapperProgram)],
+          [sandboxed.wrapper.args.map((arg) => (SPAWN_OPTS.shell && /\s/.test(arg) ? `"${arg}"` : arg)), SPAWN_OPTS.shell ? `"${wrapperProgram}"` : wrapperProgram]);
+      }
       throws('local: no runner is refused', () => workerCommand(localTask, { settings: defaultSettings }));
     } finally {
       if (originalKey === undefined) delete process.env.LLAMA_SWAP_API_KEY; else process.env.LLAMA_SWAP_API_KEY = originalKey;
@@ -1746,17 +1908,17 @@ try {
         nicknames: { default: 'qwen3.5-4b', fast: null, vision: null, vision_best: null, big: null }
       };
       const fixInventory = swapFacts({ data: [{ id: 'qwen3.5-4b', context_length: 32768 }] });
-      const readLocal = workerCommand(createTask(sampleSpec({ worker: 'local', mode: 'read' })), { settings: defaultSettings, runner: fixRunner, inventory: fixInventory });
+      const readLocal = workerCommand(createTask(sampleSpec({ worker: 'local', mode: 'read' })), { settings: defaultSettings, runner: fixRunner, inventory: fixInventory, piLayer: guardLayer });
       eq('local read: pi gets only its read-only built-in tools', argAfter(readLocal.args, '--tools'), 'read,grep,find,ls');
       eq('local read: no write, edit, bash or powershell tool, and project files stay ignored',
         [['write', 'edit', 'bash', 'powershell'].some((name) => argAfter(readLocal.args, '--tools').split(',').includes(name)), readLocal.args.includes('--no-approve')], [false, true]);
-      const writeLocal = workerCommand(createTask(sampleSpec({ worker: 'local', mode: 'write' })), { settings: defaultSettings, runner: fixRunner, inventory: fixInventory });
+      const writeLocal = workerCommand(createTask(sampleSpec({ worker: 'local', mode: 'write' })), { settings: defaultSettings, runner: fixRunner, inventory: fixInventory, piLayer: guardLayer });
       eq('local write: the default tools (no --tools), project files still ignored', [writeLocal.args.includes('--tools'), writeLocal.args.includes('--no-approve')], [false, true]);
 
       throws('codex: a model id starting with - is refused', () => workerCommand(createTask(sampleSpec({ worker: 'codex', model: '-evil' })), { settings: defaultSettings }));
       throws('agy: a model id starting with - is refused', () => workerCommand(createTask(sampleSpec({ worker: 'agy', model: '--sandbox' })), { settings: defaultSettings }));
       throws('local: a model id starting with - (after the nickname resolves) is refused',
-        () => workerCommand(createTask(sampleSpec({ worker: 'local' })), { settings: defaultSettings, runner: { ...fixRunner, nicknames: { ...fixRunner.nicknames, default: '-evil' } }, inventory: null }));
+        () => workerCommand(createTask(sampleSpec({ worker: 'local' })), { settings: defaultSettings, runner: { ...fixRunner, nicknames: { ...fixRunner.nicknames, default: '-evil' } }, inventory: null, piLayer: guardLayer }));
       throws('codex resume: a session id starting with - is refused', () => workerCommand({ ...codexTask, worker_session: '--------' }, { settings: defaultSettings, resume: true }));
 
       const printSeconds = Number(argAfter(agyWrite.args, '--print-timeout').replace('s', ''));
@@ -1768,7 +1930,7 @@ try {
         try { workerCommand({ ...agyTask, worktree: ampersandFolder }, { settings: defaultSettings }); } catch (error) { agyRefusal = error.message; }
         truthy('agy: a folder cmd.exe cannot pass is refused naming the folder and the character', agyRefusal.includes(ampersandFolder) && agyRefusal.includes('&'));
         let localRefusal = '';
-        try { workerCommand({ ...createTask(sampleSpec({ worker: 'local' })), dir: path.join(scratch, 'a%b') }, { settings: defaultSettings, runner: fixRunner, inventory: fixInventory }); } catch (error) { localRefusal = error.message; }
+        try { workerCommand({ ...createTask(sampleSpec({ worker: 'local' })), dir: path.join(scratch, 'a%b') }, { settings: defaultSettings, runner: fixRunner, inventory: fixInventory, piLayer: guardLayer }); } catch (error) { localRefusal = error.message; }
         truthy('local: a task folder cmd.exe cannot pass is refused naming the folder and the character', localRefusal.includes('a%b') && localRefusal.includes('%'));
         const codexInAmpersand = workerCommand({ ...codexTask, worktree: ampersandFolder }, { settings: defaultSettings });
         eq('codex: the folder is only the cwd, so any folder works', codexInAmpersand.cwd, ampersandFolder);
@@ -2118,7 +2280,15 @@ try {
         const report = JSON.parse(fs.readFileSync(reportFile, 'utf8'));
         eq('supervisor ok: the brief came on stdin, with the preamble', report.promptStart.startsWith('You are working alone on a delegated task.'), true);
         eq('supervisor ok: the worker ran in the copy', sameFolder(report.cwd, done.worktree), true);
-        eq('supervisor ok: index.json shows the task done', JSON.parse(fs.readFileSync(path.join(supervisorHome, 'index.json'), 'utf8')).tasks.find((row) => row.id === task.id)?.state, 'done');
+        // state.json says done a moment before the index is rebuilt (the same on main): give the rebuild a moment.
+        const indexGiveUpAt = Date.now() + 5000;
+        let indexedState = null;
+        while (Date.now() < indexGiveUpAt) {
+          indexedState = JSON.parse(fs.readFileSync(path.join(supervisorHome, 'index.json'), 'utf8')).tasks.find((row) => row.id === task.id)?.state;
+          if (indexedState === 'done') break;
+          await sleep(50);
+        }
+        eq('supervisor ok: index.json shows the task done', indexedState, 'done');
       } });
 
       scenarios.push({ name: 'ok in a subfolder of a repository', run: async () => {
@@ -2610,6 +2780,25 @@ try {
         eq('agy read edits: the git index is untouched', gitSync(repo, 'diff', '--cached', '--name-only'), '');
       } });
 
+      scenarios.push({ name: 'a fenced agy task gets its settings file and reports refused writes', run: async () => {
+        const repo = makeRepo('Имя agy fenced', { 'readme.txt': 'hello\n' });
+        const task = newTask({ worker: 'agy', project: repo });
+        const outsidePath = path.join(scratch, 'outside-the-folder.txt');
+        const step = (target) => JSON.stringify({ event: 'step_update', step_update: { state: 'DONE', step_type: 'tool', tool_name: 'write_file', tool_info: { name: 'write_file', parameters: { Path: target } } } });
+        const streamFile = path.join(scratch, 'agy-fenced-stream.jsonl');
+        fs.writeFileSync(streamFile, [
+          JSON.stringify({ event: 'init', conversation_id: '3a0f6b2e-5c1d-4e7a-9b8c-2d4e6f801234' }),
+          step(path.join(repo, 'inside.txt')), step(outsidePath),
+          JSON.stringify({ event: 'result', result: { status: 'SUCCESS', response: 'Done, one write was refused.', denied_actions: [{ action: 'write_file', display_name: 'WriteFile' }] } })
+        ].join('\n') + '\n');
+        const reportFile = reportFileFor(task);
+        launchWith(task, { FAKE_SCENARIO: 'agy-replay', FAKE_STREAM_FILE: streamFile, FAKE_REPORT_FILE: reportFile });
+        const done = await waitForTask(task.id, hasEnded);
+        const report = JSON.parse(fs.readFileSync(reportFile, 'utf8'));
+        eq('agy fenced supervisor: the settings file existed when the worker started', JSON.parse(report.settingsText), { trustedWorkspaces: [repo] });
+        eq('agy fenced supervisor: done, layer recorded, only the outside write refused', [done.state, done.fence_layer, done.refused_paths], ['done', 'agy', [outsidePath]]);
+      } });
+
       scenarios.push({ name: 'an agy copy write task refused a command after writing', run: async () => {
         const repo = makeRepo('Имя agy denied', { 'readme.txt': 'hello\n' });
         const task = await newCopyTask(repo, { worker: 'agy' });
@@ -3074,7 +3263,7 @@ try {
         setEnv('FAKE_KEY_VARIABLE', 'CONSULT_FAKE_PI_KEY');
         setEnv('FAKE_ECHO_KEY', '1');
         setEnv('CONSULT_FAKE_PI_KEY', KEY);
-        await runSupervisor(task.id, { settings: localSettings, inventoryFor, pollMs: 100, admit: async (admittedTask) => { admitted.push(admittedTask.id); } });
+        await runSupervisor(task.id, { settings: localSettings, inventoryFor, pollMs: 100, findCodex: () => ({ path: 'codex', found: false }), admit: async (admittedTask) => { admitted.push(admittedTask.id); } });
         const piTask = readTask(task.id);
         eq('supervisor local: admission was asked once, for this task', admitted, [task.id]);
         eq('supervisor local: pi\'s answer is the summary and the task is done', [piTask.state, piTask.summary], ['done', 'Wrote the file with pi.']);
@@ -3092,6 +3281,298 @@ try {
         eq('supervisor local: the key value is in no file the supervisor wrote', leakedIn, []);
         eq('supervisor local: the worker echoed it and the log shows it redacted', fs.readFileSync(path.join(folder, 'log.jsonl'), 'utf8').includes('my key is [key]'), true);
         restoreEnv();
+      }
+
+      {
+        // A fenced pi task, run through the fake worker with the Codex lookup and the sandbox check injected.
+        const piSettings = { timeout_ms: 180000, local_runner: 'llama-swap', 'llama-swap.url': 'http://127.0.0.1:9292/v1', delegate: { time_limit_ms: BACKSTOP_MS } };
+        const piOptions = (overrides = {}) => ({
+          settings: piSettings, pollMs: 100, admit: async () => {}, inventoryFor: async () => swapFacts({ data: [{ id: 'fake-model' }] }),
+          findCodex: () => ({ path: 'C:\\fake codex\\codex.exe', found: true }),
+          findPi: () => ({ path: 'C:\\fake pi\\pi.cmd', found: true }),
+          findLauncher: () => 'C:\\fake pi\\pi-launcher.js',
+          sandboxCheck: async () => ({ ok: true, failed: null, cached: false }),
+          ...overrides
+        });
+        const wrapperArgs = ['sandbox', '-c', 'sandbox_mode=workspace-write', '-c', 'shell_environment_policy.inherit=all', '-c', 'shell_environment_policy.ignore_default_excludes=true', '--', process.execPath, 'C:\\fake pi\\pi-launcher.js'];
+
+        await runCase('pi: the fake worker\'s argv starts with the wrapper args, and sessions come back', async () => {
+          const task = newTask({ worker: 'local', model: 'fake-model', mode: 'read' });
+          const sessionsFolder = path.join(taskFolder(task.id), 'pi-sessions');
+          fs.mkdirSync(sessionsFolder, { recursive: true });
+          fs.writeFileSync(path.join(sessionsFolder, 'old.jsonl'), 'an earlier session\n');
+          const reportFile = reportFileFor(task);
+          useFakeWorker('pi', { FAKE_REPORT_FILE: reportFile });
+          await runSupervisor(task.id, piOptions());
+          const done = readTask(task.id);
+          const report = JSON.parse(fs.readFileSync(reportFile, 'utf8'));
+          eq('supervisor pi: the fake worker\'s argv starts with the wrapper args', report.args.slice(0, wrapperArgs.length), wrapperArgs);
+          eq('supervisor pi: done, sandbox layer recorded, fenced', [done.state, done.fence_layer, done.fenced, done.fence_layer_changed ?? null], ['done', 'sandbox', true, null]);
+          eq('supervisor pi: sessions written by the worker reach <taskDir>/pi-sessions', fs.readFileSync(path.join(sessionsFolder, 's.jsonl'), 'utf8'), 'a session line\n');
+          eq('supervisor pi: the authority was copied in before the run', fs.readFileSync(path.join(sessionsFolder, 'seen.txt'), 'utf8').split(',').includes('old.jsonl'), true);
+          eq('supervisor pi: the worker ran in the work folder', sameFolder(report.cwd, task.project), true);
+        });
+
+        await runCase('pi: a killed run still copies sessions back', async () => {
+          const task = newTask({ worker: 'local', model: 'fake-model', mode: 'read' });
+          useFakeWorker('pi-hang');
+          const finished = runSupervisor(task.id, piOptions());
+          await waitForTask(task.id, isRunning, 10000);
+          // The worker writes its session file just after it starts.
+          await waitForTask(task.id, (current) => current.worker_session === 'hanging', 10000);
+          fs.writeFileSync(path.join(taskFolder(task.id), 'cancel'), '');
+          await within(finished, 8000);
+          eq('supervisor pi: a killed run still copies sessions back', fs.existsSync(path.join(taskFolder(task.id), 'pi-sessions', 's.jsonl')), true);
+          eq('supervisor pi: and the task is cancelled', readTask(task.id).state, 'cancelled');
+        });
+
+        await runCase('pi: launch failure fails with the sandbox line', async () => {
+          const task = newTask({ worker: 'local', model: 'fake-model', mode: 'read' });
+          useFakeWorker('pi-launch-fail');
+          await runSupervisor(task.id, piOptions());
+          const failed = readTask(task.id);
+          eq('supervisor pi: launch failure fails with the sandbox line', [failed.state, failed.summary], ['failed', "Failed: Codex's sandbox could not start pi: windows sandbox failed: runner failed during SpawnChild"]);
+        });
+
+        await runCase('pi: a failed check means guard only, recorded', async () => {
+          const task = newTask({ worker: 'local', model: 'fake-model', mode: 'read' });
+          const reportFile = reportFileFor(task);
+          useFakeWorker('pi', { FAKE_REPORT_FILE: reportFile });
+          await runSupervisor(task.id, piOptions({ sandboxCheck: async () => ({ ok: false, failed: 'homeRefused', cached: false }) }));
+          const done = readTask(task.id);
+          const report = JSON.parse(fs.readFileSync(reportFile, 'utf8'));
+          eq('supervisor pi: check failed → guard, recorded', [done.state, done.fence_layer, done.fenced, done.fence_layer_reason], ['done', 'guard', false, 'the sandbox check failed: homeRefused']);
+          eq('supervisor pi: guard only means no wrapper, but the guard extension and the fence folder', [report.args[0] === 'sandbox', report.args.some((arg) => arg.endsWith('pi-fence.js'))], [false, true]);
+        });
+
+        await runCase('pi: a check that throws, no Codex, no launcher', async () => {
+          const thrown = newTask({ worker: 'local', model: 'fake-model', mode: 'read' });
+          useFakeWorker('pi');
+          await runSupervisor(thrown.id, piOptions({ sandboxCheck: async () => { throw new Error('disk full'); } }));
+          eq('supervisor pi: a rejected check is guard only with its message', [readTask(thrown.id).fence_layer, readTask(thrown.id).fence_layer_reason], ['guard', 'the sandbox check failed: disk full']);
+          const noCodex = newTask({ worker: 'local', model: 'fake-model', mode: 'read' });
+          await runSupervisor(noCodex.id, piOptions({ findCodex: () => ({ path: 'codex.cmd', found: false }) }));
+          eq('supervisor pi: no Codex is guard only with its reason', [readTask(noCodex.id).fence_layer, readTask(noCodex.id).fence_layer_reason], ['guard', 'Codex is not installed']);
+          const noLauncher = newTask({ worker: 'local', model: 'fake-model', mode: 'read' });
+          await runSupervisor(noLauncher.id, piOptions({ findLauncher: () => null }));
+          eq('supervisor pi: no launcher is guard only with its reason', [readTask(noLauncher.id).fence_layer, readTask(noLauncher.id).fence_layer_reason], ['guard', "pi's launcher was not found next to pi.cmd"]);
+          // With the test variable set and no overrides, the library itself finds no Codex: no real Codex runs and no cache is written.
+          eq('choosePiLayer: CONSULT_DELEGATE_TEST_NO_CODEX with no overrides is guard, and no check ran', [await supervisorModule.choosePiLayer({}, scratch), fs.existsSync(process.env.CONSULT_SANDBOX_CHECK_FILE)], [{ kind: 'guard', reason: 'Codex is not installed' }, false]);
+          // A codex or pi inside the project is refused before the check can run it.
+          if (process.platform === 'win32') {
+            let checkRan = false;
+            const never = async () => { checkRan = true; return { ok: true, failed: null, cached: false }; };
+            const insideReason = 'a codex or pi program inside the project was refused';
+            const projectFolder = 'C:\\proj with codex';
+            const codexInside = await supervisorModule.choosePiLayer({ findCodex: () => ({ path: projectFolder + '\\bin\\codex.cmd', found: true }), findPi: () => ({ path: 'C:\\tools\\pi.cmd', found: true }), findLauncher: () => 'C:\\tools\\pi-launcher.js', sandboxCheck: never }, projectFolder);
+            eq('choosePiLayer: a codex inside the project is guard, and the check never runs', [codexInside, checkRan], [{ kind: 'guard', reason: insideReason }, false]);
+            const piInside = await supervisorModule.choosePiLayer({ findCodex: () => ({ path: 'C:\\tools\\codex.cmd', found: true }), findPi: () => ({ path: projectFolder + '\\pi.cmd', found: true }), findLauncher: () => projectFolder + '\\pi-launcher.js', sandboxCheck: never }, projectFolder);
+            eq('choosePiLayer: a pi inside the project is guard, and the check never runs', [piInside, checkRan], [{ kind: 'guard', reason: insideReason }, false]);
+            // A copy task: the work folder is the copy, and the codex sits in the original project.
+            const copyFolder = 'C:\\data\\worktrees\\abc123';
+            const originalProject = 'C:\\original project';
+            const inProject = { findCodex: () => ({ path: originalProject + '\\bin\\codex.cmd', found: true }), findPi: () => ({ path: 'C:\\tools\\pi.cmd', found: true }), findLauncher: () => 'C:\\tools\\pi-launcher.js', sandboxCheck: never };
+            const copyRefused = await supervisorModule.choosePiLayer(inProject, copyFolder, [copyFolder, originalProject]);
+            eq('choosePiLayer: a copy task refuses a codex inside the original project, and the check never runs', [copyRefused, checkRan], [{ kind: 'guard', reason: insideReason }, false]);
+            const copyAlone = await supervisorModule.choosePiLayer(inProject, copyFolder);
+            eq('choosePiLayer: without the project listed the work folder alone does not see it (why callers pass it)', copyAlone.kind, 'sandbox');
+            // The same with the real sandbox check and a stub codex.cmd in the original project: it is never started.
+            const stubProject = path.join(scratch, 'copy task original project');
+            const stubCopy = path.join(scratch, 'copy task copy');
+            fs.mkdirSync(path.join(stubProject, 'bin'), { recursive: true });
+            fs.mkdirSync(stubCopy, { recursive: true });
+            const stubMarker = path.join(stubProject, 'bin', 'ran.txt');
+            fs.writeFileSync(path.join(stubProject, 'bin', 'codex.cmd'), '@echo off\r\necho ran>>"%~dp0ran.txt"\r\necho codex-cli 9.9.9-test\r\n');
+            const realCheckOptions = { findCodex: () => ({ path: path.join(stubProject, 'bin', 'codex.cmd'), found: true }), findPi: () => ({ path: 'C:\\tools\\pi.cmd', found: true }), findLauncher: () => 'C:\\tools\\pi-launcher.js' };
+            const realRefused = await supervisorModule.choosePiLayer(realCheckOptions, stubCopy, [stubCopy, stubProject]);
+            eq('choosePiLayer: a copy task with a codex.cmd inside the original project is guard, and the stub never runs', [realRefused, fs.existsSync(stubMarker)], [{ kind: 'guard', reason: insideReason }, false]);
+            checkRan = false;
+            const outside = await supervisorModule.choosePiLayer({ findCodex: () => ({ path: 'C:\\tools\\codex.cmd', found: true }), findPi: () => ({ path: 'C:\\tools\\pi.cmd', found: true }), findLauncher: () => 'C:\\tools\\pi-launcher.js', sandboxCheck: never }, projectFolder);
+            eq('choosePiLayer: programs beside the project (not inside it) still reach the check', [outside.kind, checkRan], ['sandbox', true]);
+          }
+        });
+
+        await runCase('pi: a lifted task runs as today', async () => {
+          const task = newTask({ worker: 'local', model: 'fake-model', mode: 'read', fence: 'none' });
+          const reportFile = reportFileFor(task);
+          useFakeWorker('pi', { FAKE_REPORT_FILE: reportFile });
+          let asked = 0;
+          // A lifted task needs the project to lift it too: the narrower fence wins.
+          fs.writeFileSync(process.env.CONSULT_PROJECTS_FILE, JSON.stringify({ [projectKey(task.project)]: { fence: { local: 'none' } } }));
+          try {
+            await runSupervisor(task.id, piOptions({ sandboxCheck: async () => { asked++; return { ok: true, failed: null, cached: false }; } }));
+          } finally {
+            fs.rmSync(process.env.CONSULT_PROJECTS_FILE, { force: true });
+          }
+          const report = JSON.parse(fs.readFileSync(reportFile, 'utf8'));
+          eq('supervisor pi: lifted: no check, no wrapper, no guard, sessions in the task folder',
+            [asked, report.args[0] === 'sandbox', report.args.some((arg) => arg.endsWith('pi-fence.js')), readTask(task.id).fence_layer ?? null, fs.existsSync(path.join(taskFolder(task.id), 'pi-sessions', 's.jsonl'))], [0, false, false, null, true]);
+        });
+
+        await runCase('pi: a layer change is recorded', async () => {
+          const task = newTask({ worker: 'local', model: 'fake-model', mode: 'read' });
+          useFakeWorker('pi');
+          await runSupervisor(task.id, piOptions());
+          eq('supervisor pi: the first run is sandbox', readTask(task.id).fence_layer, 'sandbox');
+          updateTask(task.id, { followup: 'Also check the tests.', state: 'queued' });
+          await runSupervisor(task.id, piOptions({ sandboxCheck: async () => ({ ok: false, failed: 'internetRefused', cached: false }) }));
+          const second = readTask(task.id);
+          eq('supervisor pi: layer change is recorded', [second.fence_layer, second.fence_layer_changed], ['guard', 'sandbox → guard']);
+          updateTask(task.id, { followup: 'And once more.', state: 'queued' });
+          await runSupervisor(task.id, piOptions({ sandboxCheck: async () => ({ ok: false, failed: 'internetRefused', cached: false }) }));
+          eq('supervisor pi: an unchanged layer records no change', readTask(task.id).fence_layer_changed ?? null, null);
+        });
+
+        const liftLocalFence = (task) => fs.writeFileSync(process.env.CONSULT_PROJECTS_FILE, JSON.stringify({ [projectKey(task.project)]: { fence: { local: 'none' } } }));
+        const restoreProjects = () => fs.rmSync(process.env.CONSULT_PROJECTS_FILE, { force: true });
+        const sessionsOf = (task) => path.join(taskFolder(task.id), 'pi-sessions');
+        const plantAuthority = (task) => {
+          fs.mkdirSync(sessionsOf(task), { recursive: true });
+          fs.writeFileSync(path.join(sessionsOf(task), 'old.jsonl'), 'an earlier session\n');
+        };
+
+        await runCase('pi: the fence is decided once, even if the project lifts it during the check', async () => {
+          const task = newTask({ worker: 'local', model: 'fake-model', mode: 'read', fence: 'none' });
+          plantAuthority(task);
+          const reportFile = reportFileFor(task);
+          useFakeWorker('pi', { FAKE_REPORT_FILE: reportFile });
+          try {
+            await runSupervisor(task.id, piOptions({ sandboxCheck: async () => { liftLocalFence(task); return { ok: true, failed: null, cached: false }; } }));
+          } finally {
+            restoreProjects();
+          }
+          const report = JSON.parse(fs.readFileSync(reportFile, 'utf8'));
+          eq('supervisor pi: lifted during the check, the run stays sandboxed', [readTask(task.id).fence_layer, report.args[0]], ['sandbox', 'sandbox']);
+          eq('supervisor pi: and its sessions survive the copy back', fs.readdirSync(sessionsOf(task)).sort(), ['old.jsonl', 's.jsonl', 'seen.txt']);
+        });
+
+        // R1: a temp copy left by an earlier run (a failed copy-back, a crashed supervisor) is the newest one.
+        const plantLeftover = (task) => {
+          fs.mkdirSync(piTempFolders(task.id).sessions, { recursive: true });
+          fs.writeFileSync(path.join(piTempFolders(task.id).sessions, 'old.jsonl'), 'an earlier session\n');
+          fs.writeFileSync(path.join(piTempFolders(task.id).sessions, 'newer.jsonl'), 'left by the last run');
+        };
+
+        await runCase('pi: a fenced run first copies a leftover temp copy back, then stages it', async () => {
+          const task = newTask({ worker: 'local', model: 'fake-model', mode: 'read' });
+          plantAuthority(task);
+          plantLeftover(task);
+          useFakeWorker('pi');
+          await runSupervisor(task.id, piOptions());
+          eq('supervisor pi: the worker saw the leftover copy\'s newer session', fs.readFileSync(path.join(sessionsOf(task), 'seen.txt'), 'utf8').split(',').sort(), ['newer.jsonl', 'old.jsonl']);
+          eq('supervisor pi: and it is in the authority after the run', fs.readdirSync(sessionsOf(task)).sort(), ['newer.jsonl', 'old.jsonl', 's.jsonl', 'seen.txt']);
+          eq('supervisor pi: with no warning', readTask(task.id).warning ?? null, null);
+        });
+
+        await runCase('pi: a fenced run whose leftover copy-back fails runs on the leftover copy', async () => {
+          const task = newTask({ worker: 'local', model: 'fake-model', mode: 'read' });
+          plantAuthority(task);
+          plantLeftover(task);
+          useFakeWorker('pi');
+          await runSupervisor(task.id, piOptions({ returnPiSessions: () => 'disk full' }));
+          const done = readTask(task.id);
+          const tempSessions = piTempFolders(task.id).sessions;
+          eq('supervisor pi: the newer temp session survives, and the worker saw it',
+            [fs.existsSync(path.join(tempSessions, 'newer.jsonl')), fs.readFileSync(path.join(tempSessions, 'seen.txt'), 'utf8').split(',').sort()], [true, ['newer.jsonl', 'old.jsonl']]);
+          eq('supervisor pi: done, with the copy-back warning', [done.state, done.warning], ['done', "pi's session files could not be copied back: disk full"]);
+        });
+
+        if (SPAWN_OPTS.shell) {
+          await runCase('pi: a throw while building the command still copies back and leaves the authority whole', async () => {
+            const task = newTask({ worker: 'local', model: 'fake-model', mode: 'read' });
+            plantAuthority(task);
+            useFakeWorker('pi');
+            // An ampersand in the launcher path makes workerCommand refuse, after the sessions were staged.
+            await runSupervisor(task.id, piOptions({ findLauncher: () => 'C:\\fake&pi\\pi-launcher.js' }));
+            eq('supervisor pi: the task failed', readTask(task.id).state, 'failed');
+            eq('supervisor pi: the authority is whole and nothing is left beside it', fs.readdirSync(taskFolder(task.id)).filter((name) => name.startsWith('pi-sessions')), ['pi-sessions']);
+            eq('supervisor pi: the earlier session is still there', fs.readdirSync(sessionsOf(task)), ['old.jsonl']);
+          });
+        }
+
+        await runCase('pi: a broad work folder gets the guard only', async () => {
+          const task = newTask({ worker: 'local', model: 'fake-model', mode: 'read', project: os.homedir() });
+          useFakeWorker('pi');
+          let asked = 0;
+          await runSupervisor(task.id, piOptions({ sandboxCheck: async () => { asked++; return { ok: true, failed: null, cached: false }; } }));
+          const done = readTask(task.id);
+          eq('supervisor pi: the home folder is guard only with its reason, and no check was asked', [done.fence_layer, done.fence_layer_reason, asked],
+            ['guard', "the work folder is your home folder or a drive root, which Codex's sandbox must not be given", 0]);
+        });
+
+        await runCase('pi: a work folder holding consult\'s own files gets the guard only', async () => {
+          let asked = 0;
+          const counting = { findCodex: () => ({ path: 'C:\\tools\\codex.exe', found: true }), findPi: () => ({ path: 'C:\\tools\\pi.cmd', found: true }), findLauncher: () => 'C:\\tools\\pi-launcher.js', sandboxCheck: async () => { asked++; return { ok: true, failed: null, cached: false }; } };
+          const holding = await supervisorModule.choosePiLayer(counting, path.dirname(dataHome()));
+          eq('choosePiLayer: a work folder holding consult\'s data is guard, and no check was asked', [holding, asked], [{ kind: 'guard', reason: "the work folder holds consult's own files" }, 0]);
+          const copyUnderData = path.join(dataHome(), 'worktrees', 'abc123');
+          fs.mkdirSync(copyUnderData, { recursive: true });
+          const copyLayer = await supervisorModule.choosePiLayer(counting, copyUnderData);
+          fs.rmSync(path.join(dataHome(), 'worktrees', 'abc123'), { recursive: true, force: true });
+          eq('choosePiLayer: a copy under <data>/worktrees still gets the sandbox', [copyLayer.kind, asked], ['sandbox', 1]);
+        });
+
+        await runCase('pi: a lifted run whose leftover copy-back fails stops before pi starts', async () => {
+          const task = newTask({ worker: 'local', model: 'fake-model', mode: 'read', fence: 'none' });
+          plantAuthority(task);
+          fs.mkdirSync(piTempFolders(task.id).sessions, { recursive: true });
+          fs.writeFileSync(path.join(piTempFolders(task.id).sessions, 'crash.jsonl'), 'kept by the crash');
+          liftLocalFence(task);
+          const reportFile = reportFileFor(task);
+          fs.rmSync(reportFile, { force: true });
+          useFakeWorker('pi', { FAKE_REPORT_FILE: reportFile });
+          try {
+            await runSupervisor(task.id, piOptions({ returnPiSessions: () => 'disk full' }));
+          } finally {
+            restoreProjects();
+          }
+          const done = readTask(task.id);
+          eq('supervisor pi lifted: a failed leftover copy-back fails the task with the spec\'s words',
+            [done.state, done.summary], ['failed', "Failed: pi's session files from the last run could not be copied back (disk full). Nothing was run, so try again."]);
+          eq('supervisor pi lifted: the worker never started, and the temp copy is kept', [fs.existsSync(reportFile), fs.existsSync(path.join(piTempFolders(task.id).sessions, 'crash.jsonl'))], [false, true]);
+        });
+
+        await runCase('pi: a lifted run with an empty temp sessions folder runs on the authority', async () => {
+          const task = newTask({ worker: 'local', model: 'fake-model', mode: 'read', fence: 'none' });
+          plantAuthority(task);
+          fs.mkdirSync(piTempFolders(task.id).sessions, { recursive: true });
+          liftLocalFence(task);
+          useFakeWorker('pi');
+          try {
+            await runSupervisor(task.id, piOptions());
+          } finally {
+            restoreProjects();
+          }
+          eq('supervisor pi lifted: an empty temp folder is no leftover, so the authority is kept and seen', fs.readFileSync(path.join(sessionsOf(task), 'seen.txt'), 'utf8').split(','), ['old.jsonl']);
+        });
+
+        await runCase('pi: a copy-back failure reaches the task warning and stderr.log', async () => {
+          const task = newTask({ worker: 'local', model: 'fake-model', mode: 'read' });
+          useFakeWorker('pi');
+          await runSupervisor(task.id, piOptions({ returnPiSessions: () => 'disk full' }));
+          const done = readTask(task.id);
+          eq('supervisor pi: done, with the warning', [done.state, done.warning], ['done', "pi's session files could not be copied back: disk full"]);
+          eq('supervisor pi: and stderr.log has the line', fs.readFileSync(path.join(taskFolder(task.id), 'stderr.log'), 'utf8').includes('disk full'), true);
+        });
+
+        await runCase('pi: a lifted run first takes back the sessions a crash left in temp', async () => {
+          const task = newTask({ worker: 'local', model: 'fake-model', mode: 'read', fence: 'none' });
+          plantAuthority(task);
+          fs.mkdirSync(piTempFolders(task.id).sessions, { recursive: true });
+          fs.writeFileSync(path.join(piTempFolders(task.id).sessions, 'crash.jsonl'), 'kept by the crash');
+          liftLocalFence(task);
+          const reportFile = reportFileFor(task);
+          fs.rmSync(reportFile, { force: true });
+          useFakeWorker('pi', { FAKE_REPORT_FILE: reportFile });
+          try {
+            await runSupervisor(task.id, piOptions());
+          } finally {
+            restoreProjects();
+          }
+          eq('supervisor pi lifted: with the leftover copied back, the worker started', [readTask(task.id).state, fs.existsSync(reportFile)], ['done', true]);
+          eq('supervisor pi: the lifted worker saw the crash session in the task folder', fs.readFileSync(path.join(sessionsOf(task), 'seen.txt'), 'utf8').split(',').includes('crash.jsonl'), true);
+          eq('supervisor pi: and the temp folder is gone, so it cannot overwrite a newer copy later', fs.existsSync(piTempFolders(task.id).root), false);
+        });
       }
 
       {
@@ -4260,8 +4741,16 @@ try {
     const realLaunchedPids = [];
     const stubLaunch = (taskId) => { launchedIds.push(taskId); return 4242; };
     const contextFor = (project, overrides = {}) => ({
-      settings: fakeSettings(), project, sessionId: 'session-a', instanceId: 'instance-a', launch: stubLaunch, startWaitMs: 0, pollMs: 50, ...overrides
+      settings: fakeSettings(), project, sessionId: 'session-a', instanceId: 'instance-a', launch: stubLaunch, startWaitMs: 0, pollMs: 50,
+      // the pre-start layer check never touches real Codex or pi: it reads the scratch cache file, and asks the fake Codex's version here
+      findCodex: () => ({ path: 'fake-codex', found: true }), findPi: () => ({ path: 'fake-pi', found: true }),
+      findLauncher: () => 'fake-pi-launcher.js', readCodexVersion: async () => FAKE_CODEX_VERSION,
+      ...overrides
     });
+    // R4: what the sandbox-check cache says of the fake Codex. The pre-start reads it and never probes.
+    const FAKE_CODEX_VERSION = 'codex-cli 0.0.0-fake';
+    const cacheFakeCodexCheck = (entry) => fs.writeFileSync(process.env.CONSULT_SANDBOX_CHECK_FILE, JSON.stringify({ ['fake-codex|' + FAKE_CODEX_VERSION]: entry }));
+    const clearCheckCache = () => fs.rmSync(process.env.CONSULT_SANDBOX_CHECK_FILE, { force: true });
 
     let toolsModule = null;
     try {
@@ -4380,8 +4869,8 @@ try {
           eq('delegate: on_close keep, the time limit, hold, model and effort are recorded', [keepingTask.keep_running, keepingTask.time_limit_ms, keepingTask.hold, keepingTask.model, keepingTask.effort], [true, 600000, true, 'gpt-6.1-sol', 'high']);
           eq('delegate: a read task works in the project itself', [started.location, gptWord.value.location, gptWord.value.folder], ['here', 'here', project]);
           eq('delegate: the stub was asked to launch each started task', launchedIds.includes(gptWord.value.id) && launchedIds.includes(tableReview.value.id), true);
-          eq('delegate: fenced is known up front', [gptWord.value.fenced, geminiWord.value.fenced, localFast.value.fenced], [true, false, false]);
-          eq('delegate: nothing saved starts fenced, with no note', [gptWord.value.fence, geminiWord.value.fence, localFast.value.fence, gptWord.value.fence_note, readTask(gptWord.value.id).fence], ['fenced', 'soft', 'soft', undefined, 'fenced']);
+          eq('delegate: fenced is known up front', [gptWord.value.fenced, geminiWord.value.fenced, localFast.value.fenced], [true, true, true]);
+          eq('delegate: nothing saved starts fenced, with no note', [gptWord.value.fence, geminiWord.value.fence, localFast.value.fence, gptWord.value.fence_note, readTask(gptWord.value.id).fence], ['fenced', 'fenced', 'fenced', undefined, 'fenced']);
         });
 
         await guardedAsync('delegate: a lifted fence', async () => {
@@ -4391,10 +4880,13 @@ try {
           eq('delegate: a lifted codex fence is reported and stored', [lifted.value.fence, lifted.value.fenced, readTask(lifted.value.id).fence], ['full', false, 'full']);
           truthy('delegate: and comes with a note', /full access/.test(lifted.value.fence_note));
           const liftedLocal = await call('delegate', briefArgs({ worker: 'local:fast', mode: 'read' }), contextFor(project));
-          eq('delegate: a lifted local fence is none, with a note naming the worker', [liftedLocal.value.fence, liftedLocal.value.fenced, liftedLocal.value.fence_note], ['none', false, 'This project\'s fence is lifted: local is not asked to stay in the project folder.']);
+          eq('delegate: a lifted local fence is none, with a note naming the worker', [liftedLocal.value.fence, liftedLocal.value.fenced, liftedLocal.value.fence_note], ['none', false, 'This project\'s fence is lifted: local may change files outside the project folder.']);
           const liftedCodexRead = await call('delegate', briefArgs({ worker: 'codex', mode: 'read' }), contextFor(project));
           const liftedAgy = await call('delegate', briefArgs({ worker: 'agy', mode: 'read' }), contextFor(project));
-          eq('delegate: agy stays soft when only codex and local were lifted', [liftedAgy.value.fence, liftedAgy.value.fence_note], ['soft', undefined]);
+          eq('delegate: agy stays fenced when only codex and local were lifted', [liftedAgy.value.fence, liftedAgy.value.fence_note], ['fenced', undefined]);
+          updateTask(liftedAgy.value.id, { state: 'done', refused_paths: ['C:\\Users\\user\\a.txt', 'C:\\b.txt'] });
+          const refusedResult = await call('delegate_result', { id: liftedAgy.value.id }, contextFor(project));
+          truthy('delegate_result: an agy task names the writes its fence refused', refusedResult.value.note.includes("agy was kept in its folder and refused these writes: C:\\Users\\user\\a.txt, C:\\b.txt. Only the user can lift agy's fence, in the Delegated tab."));
           updateTask(lifted.value.id, { state: 'done' });
           updateTask(liftedCodexRead.value.id, { state: 'done' });
           updateTask(liftedLocal.value.id, { state: 'done' });
@@ -4410,6 +4902,167 @@ try {
           updateTask(liftedAgyRead.value.id, { state: 'done' });
           const agyReadResult = await call('delegate_result', { id: liftedAgyRead.value.id }, contextFor(project));
           truthy('delegate_result: a lifted agy read task has the sentence (its shell can write)', /could change files outside its folder/.test(agyReadResult.value.note));
+        });
+
+        await guardedAsync('delegate: how each task is fenced', async () => {
+          const project = makePlainFolder('fence layers');
+          cacheFakeCodexCheck({ ok: true, failed: null, checkedAt: new Date().toISOString() });
+          let sandboxed;
+          try {
+            sandboxed = await call('delegate', briefArgs({ worker: 'local:fast', mode: 'read' }), contextFor(project));
+          } finally {
+            clearCheckCache();
+          }
+          eq('delegate start: local fenced with sandbox (a cached pass)', [sandboxed.value.fence, sandboxed.value.fenced, sandboxed.value.fence_layer, sandboxed.value.fence_note], ['fenced', true, 'sandbox', undefined]);
+          // R4: the start never probes. A cached failure that is still fresh is the guard; no entry is pending.
+          let probes = 0;
+          const countingProbe = async () => { probes++; return { ok: true, failed: null, cached: false }; };
+          let versionReads = 0;
+          const countingVersion = async () => { versionReads++; return FAKE_CODEX_VERSION; };
+          cacheFakeCodexCheck({ ok: false, failed: 'homeRefused', checkedAt: new Date().toISOString() });
+          let cachedFailure;
+          try {
+            cachedFailure = await call('delegate', briefArgs({ worker: 'local:fast', mode: 'read' }), contextFor(project, { sandboxCheck: countingProbe, readCodexVersion: countingVersion }));
+          } finally {
+            clearCheckCache();
+          }
+          eq('delegate start: a fresh cached failure is guard, with the check named', [cachedFailure.value.fenced, cachedFailure.value.fence_layer, cachedFailure.value.fence_note, readTask(cachedFailure.value.id).fence_layer_reason],
+            [false, 'guard', "The local worker's fence is checked by consult only (the sandbox check failed: homeRefused): file edits outside the folder are refused, commands are not.", 'the sandbox check failed: homeRefused']);
+          eq('delegate start: an entry for this Codex asks its version once (a codex that is no .exe), and never probes', [versionReads, probes], [1, 0]);
+          const pending = await call('delegate', briefArgs({ worker: 'local:fast', mode: 'read' }), contextFor(project, { sandboxCheck: countingProbe, readCodexVersion: countingVersion }));
+          const pendingTask = readTask(pending.value.id);
+          eq('delegate start: nothing cached is pending, fenced, with the pending note',
+            [pending.value.fenced, pending.value.fence_layer, pending.value.fence_note],
+            [true, 'pending', "consult checks Codex's sandbox as the task starts; delegate_status and delegate_result name the layer it got (Codex's sandbox, or consult's own check)."]);
+          eq('delegate start: pending stores no layer and no reason, and nothing probed or ran Codex', [pendingTask.fence_layer, pendingTask.fence_layer_reason ?? null, probes, versionReads], [null, null, 0, 1]);
+          const guarded = await call('delegate', briefArgs({ worker: 'local:fast', mode: 'read' }), contextFor(project, { findCodex: () => ({ path: 'codex', found: false }) }));
+          eq('delegate start: local guard', [guarded.value.fenced, guarded.value.fence_layer, guarded.value.fence_note],
+            [false, 'guard', "The local worker's fence is checked by consult only (Codex is not installed): file edits outside the folder are refused, commands are not."]);
+          const agyFenced = await call('delegate', briefArgs({ worker: 'agy', mode: 'read' }), contextFor(project));
+          eq('delegate start: agy fenced', [agyFenced.value.fenced, agyFenced.value.fence_layer], [true, 'agy']);
+          const codexFenced = await call('delegate', briefArgs({ worker: 'codex', mode: 'read' }), contextFor(project));
+          eq('delegate start: codex has no layer', [codexFenced.value.fenced, codexFenced.value.fence_layer], [true, null]);
+          fs.writeFileSync(process.env.CONSULT_PROJECTS_FILE, JSON.stringify({ [projectKey(project)]: { fence: { agy: 'none', local: 'none' } } }));
+          const agyNone = await call('delegate', briefArgs({ worker: 'agy', mode: 'read' }), contextFor(project));
+          eq('delegate start: agy none', [agyNone.value.fenced, agyNone.value.fence_layer, agyNone.value.fence_note], [false, null, "This project's fence is lifted: agy may change files outside the project folder."]);
+          updateTask(sandboxed.value.id, { state: 'done', fence_layer: 'guard', fence_layer_changed: 'sandbox → guard' });
+          const changed = await call('delegate_result', { id: sandboxed.value.id }, contextFor(project));
+          eq('delegate_result: layer change line', [changed.value.fence_layer, changed.value.note.includes('The fence changed between runs: sandbox → guard.')], ['guard', true]);
+          const description = toolsModule.DELEGATE_TOOLS[0].description;
+          eq('delegate description: no "soft"', [description.includes('`soft`'), description.includes('Never change a fence yourself')], [false, true]);
+        });
+
+        // F1c (Ruling 15): a fenced agy write task never trusts a folder that holds consult's own files.
+        await guardedAsync('delegate: agy in a folder holding consult\'s files', async () => {
+          // toolsRoot holds this section's data home and the projects file.
+          const holdingFolder = toolsRoot;
+          // Tool errors reach Claude through scrubPii, which writes the home folder as ~.
+          const { scrubPii: scrubForTool } = await import('./lib/util.js');
+          const refusal = scrubForTool(`agy can't be fenced in a folder that holds consult's own files (${holdingFolder}). Run it in a project folder, or lift agy's fence for this project in the Delegated tab.`);
+          const tasksBefore = listTasks({ project: holdingFolder }).length;
+          const refused = await call('delegate', briefArgs({ worker: 'agy', mode: 'write', location: 'here' }), contextFor(holdingFolder));
+          eq('delegate: a fenced agy write task there is refused with the spec\'s words', [refused.isError, refused.text], [true, refusal]);
+          eq('delegate: and no task was made', listTasks({ project: holdingFolder }).length, tasksBefore);
+          const readThere = await call('delegate', briefArgs({ worker: 'agy', mode: 'read' }), contextFor(holdingFolder));
+          eq('delegate: an agy read task there still starts (it trusts no folder)', [readThere.isError, readThere.value?.started], [false, true]);
+          // Ruling 20: the same refusal for a fenced Codex write task; its read tasks (read-only sandbox) start.
+          const codexRefusal = scrubForTool(`Codex can't be fenced in a folder that holds consult's own files (${holdingFolder}). Run it in a project folder, or lift Codex's fence for this project in the Delegated tab.`);
+          const codexThere = await call('delegate', briefArgs({ worker: 'codex', mode: 'write', location: 'here' }), contextFor(holdingFolder));
+          eq('delegate: a fenced codex write task there is refused with its own words, and no task was made', [codexThere.isError, codexThere.text, listTasks({ project: holdingFolder }).length], [true, codexRefusal, tasksBefore + 1]);
+          const codexReadThere = await call('delegate', briefArgs({ worker: 'codex', mode: 'read' }), contextFor(holdingFolder));
+          eq('delegate: a codex read task there still starts', [codexReadThere.isError, codexReadThere.value?.started], [false, true]);
+          const earlierCodex = createTask({ worker: 'codex', mode: 'write', location: 'here', project: holdingFolder, title: 'earlier codex', brief: 'b\n', fence: 'fenced', owner_instance: 'instance-a' });
+          updateTask(earlierCodex.id, { state: 'done', worker_session: 'codex-thread-1' });
+          const codexSendRefused = await call('delegate_send', { id: earlierCodex.id, message: 'Once more.' }, contextFor(holdingFolder));
+          eq('delegate_send: a fenced codex write follow-up there is refused the same way, and the task is untouched', [codexSendRefused.isError, codexSendRefused.text, readTask(earlierCodex.id).state, readTask(earlierCodex.id).followup ?? null], [true, codexRefusal, 'done', null]);
+          // A task started while the fence was lifted, then the project fenced again: its follow-up is refused the same way.
+          const earlier = createTask({ worker: 'agy', mode: 'write', location: 'here', project: holdingFolder, title: 'earlier', brief: 'b\n', fence: 'fenced', owner_instance: 'instance-a' });
+          updateTask(earlier.id, { state: 'done', worker_session: 'agy-session-1' });
+          const sendRefused = await call('delegate_send', { id: earlier.id, message: 'Once more.' }, contextFor(holdingFolder));
+          eq('delegate_send: a fenced agy write follow-up there is refused the same way, and the task is untouched', [sendRefused.isError, sendRefused.text, readTask(earlier.id).state, readTask(earlier.id).followup ?? null], [true, refusal, 'done', null]);
+          fs.writeFileSync(process.env.CONSULT_PROJECTS_FILE, JSON.stringify({ [projectKey(holdingFolder)]: { fence: { agy: 'none', codex: 'full' } } }));
+          try {
+            const liftedThere = await call('delegate', briefArgs({ worker: 'agy', mode: 'write', location: 'here' }), contextFor(holdingFolder));
+            eq('delegate: with agy\'s fence lifted for the project, the write task starts', [liftedThere.isError, liftedThere.value?.started, liftedThere.value?.fence], [false, true, 'none']);
+            const liftedCodexThere = await call('delegate', briefArgs({ worker: 'codex', mode: 'write', location: 'here' }), contextFor(holdingFolder));
+            eq('delegate: with Codex at full access for the project, the write task starts', [liftedCodexThere.isError, liftedCodexThere.value?.started, liftedCodexThere.value?.fence], [false, true, 'full']);
+          } finally {
+            fs.rmSync(process.env.CONSULT_PROJECTS_FILE, { force: true });
+          }
+        });
+
+        // R8: the refusal comes before anything is written: git_setup "no" in a folder holding consult's files
+        // leaves the project's git answer as it was.
+        await guardedAsync('delegate: a refused start saves no git answer', async () => {
+          const holdingFolder = toolsRoot;
+          fs.rmSync(process.env.CONSULT_PROJECTS_FILE, { force: true });
+          const asked = await call('delegate', briefArgs({ worker: 'agy', mode: 'write' }), contextFor(holdingFolder));
+          eq('delegate: the folder has no git, so a write task there asks about git setup first', [asked.value?.started, asked.value?.ask], [false, 'git-setup']);
+          const refused = await call('delegate', briefArgs({ worker: 'agy', mode: 'write', git_setup: 'no' }), contextFor(holdingFolder));
+          eq('delegate: git_setup no there is refused, and the git answer is unchanged', [refused.isError, /consult's own files/.test(refused.text), projectSettings(holdingFolder).git], [true, true, 'ask']);
+        });
+
+        // F6.4: a throw in the pre-start layer check falls back to the guard; the task still gets its supervisor.
+        await guardedAsync('delegate: the pre-start fence check throws', async () => {
+          const project = makePlainFolder('fence check throws');
+          const thrown = await call('delegate', briefArgs({ worker: 'local', model: 'fake-model', mode: 'read' }), contextFor(project, { findCodex: () => { throw new Error('lookup exploded'); } }));
+          eq('delegate start: a throwing fence check is guard with its message, and the task was launched',
+            [thrown.isError, thrown.value?.fence_layer, thrown.value?.fence_note, launchedIds.includes(thrown.value?.id)],
+            [false, 'guard', "The local worker's fence is checked by consult only (the fence check failed: lookup exploded): file edits outside the folder are refused, commands are not.", true]);
+        });
+
+        // F4 (Ruling 18): the start's layer is stored, so a supervisor that drops to the guard is reported.
+        const runFakePiSupervisor = async (taskId, sandboxCheck) => {
+          const keptEnv = { CONSULT_DELEGATE_TEST_BIN: process.env.CONSULT_DELEGATE_TEST_BIN, FAKE_SCENARIO: process.env.FAKE_SCENARIO };
+          process.env.CONSULT_DELEGATE_TEST_BIN = fakeWorkerPath;
+          process.env.FAKE_SCENARIO = 'pi';
+          try {
+            await runSupervisor(taskId, {
+              settings: { timeout_ms: 180000, local_runner: 'llama-swap', 'llama-swap.url': 'http://127.0.0.1:9292/v1', delegate: { time_limit_ms: 25000 } },
+              pollMs: 100, admit: async () => {}, inventoryFor: async () => swapFacts({ data: [{ id: 'fake-model' }] }),
+              findCodex: () => ({ path: 'C:\\fake codex\\codex.exe', found: true }), findPi: () => ({ path: 'C:\\fake pi\\pi.cmd', found: true }),
+              findLauncher: () => 'C:\\fake pi\\pi-launcher.js', sandboxCheck
+            });
+          } finally {
+            for (const [name, value] of Object.entries(keptEnv)) {
+              if (value === undefined) delete process.env[name]; else process.env[name] = value;
+            }
+          }
+        };
+        const guardNoteText = "The local worker's fence is checked by consult only (the sandbox check failed: homeRefused): file edits outside the folder are refused, commands are not.";
+        await guardedAsync('delegate: a later drop to the guard is reported', async () => {
+          const project = makePlainFolder('later guard');
+          cacheFakeCodexCheck({ ok: true, failed: null, checkedAt: new Date().toISOString() });
+          let started;
+          try {
+            started = await call('delegate', briefArgs({ worker: 'local', model: 'fake-model', mode: 'read' }), contextFor(project));
+          } finally {
+            clearCheckCache();
+          }
+          eq('delegate start: sandbox, and the layer is on the task before launch', [started.value?.fence_layer, readTask(started.value.id).fence_layer], ['sandbox', 'sandbox']);
+          await runFakePiSupervisor(started.value.id, async () => ({ ok: false, failed: 'homeRefused', cached: false }));
+          const ran = readTask(started.value.id);
+          eq('supervisor: the guard was used and the change from the start recorded', [ran.state, ran.fence_layer, ran.fence_layer_changed], ['done', 'guard', 'sandbox → guard']);
+          const result = await call('delegate_result', { id: started.value.id }, contextFor(project));
+          const note = result.value?.note ?? '';
+          eq('delegate_result: names the change and carries the guard note',
+            [note.includes('The fence changed between runs: sandbox → guard.'), note.includes(guardNoteText)],
+            [true, true]);
+        });
+
+        // R4: a pending start leaves the probe to the supervisor; its guard outcome reaches delegate_result as the guard note.
+        await guardedAsync('delegate: a pending start that the supervisor puts on the guard', async () => {
+          const project = makePlainFolder('pending then guard');
+          let probes = 0;
+          const countingProbe = async () => { probes++; return { ok: false, failed: 'homeRefused', cached: false }; };
+          const started = await call('delegate', briefArgs({ worker: 'local', model: 'fake-model', mode: 'read' }), contextFor(project, { sandboxCheck: countingProbe }));
+          eq('delegate start: pending, and the start did not probe', [started.value?.fence_layer, readTask(started.value.id).fence_layer, probes], ['pending', null, 0]);
+          await runFakePiSupervisor(started.value.id, countingProbe);
+          const ran = readTask(started.value.id);
+          eq('supervisor: it probed once and used the guard, with no change recorded from pending', [probes, ran.state, ran.fence_layer, ran.fence_layer_changed ?? null], [1, 'done', 'guard', null]);
+          const result = await call('delegate_result', { id: started.value.id }, contextFor(project));
+          const note = result.value?.note ?? '';
+          eq('delegate_result: the guard note, and no change line', [result.value?.fence_layer, note.includes(guardNoteText), note.includes('The fence changed between runs')], ['guard', true, false]);
         });
 
         await guardedAsync('delegate: git', async () => {
@@ -5489,14 +6142,15 @@ try {
         failed++;
       }
     };
-    const runDoor = (project, ...args) => new Promise((resolve) => {
-      const env = { ...process.env, HOME: doorHome, USERPROFILE: doorHome };
-      execFile(process.execPath, [doorScript, project, ...args], { cwd: os.tmpdir(), env, encoding: 'utf8', timeout: 60000 }, (error, stdout, stderr) => {
+    const runDoorWith = (extraEnv, cwd, project, ...args) => new Promise((resolve) => {
+      const env = { ...process.env, HOME: doorHome, USERPROFILE: doorHome, ...extraEnv };
+      execFile(process.execPath, [doorScript, project, ...args], { cwd, env, encoding: 'utf8', timeout: 60000 }, (error, stdout, stderr) => {
         let json;
         try { json = JSON.parse(stdout); } catch (_) { json = { unparsed: stdout, stderr }; }
         resolve({ code: error ? error.code : 0, stdout, stderr, json });
       });
     });
+    const runDoor = (project, ...args) => runDoorWith({}, os.tmpdir(), project, ...args);
     const gitIn = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
     const makePlain = (name) => {
       const folder = path.join(doorRoot, name);
@@ -5597,10 +6251,12 @@ try {
         const runningRow = shown.json.rows?.find((row) => row.id === running.id) ?? {};
         truthy('door show: a running row\'s elapsed time counts from its start', runningRow.elapsed_ms >= 5000 && runningRow.elapsed_ms < 120000);
         eq('door show: other projects are only counts (finished and not yet reported, running)', shown.json.elsewhere, [{ project: projectB, finished: 2, running: 2 }]);
-        const { local_slots: defaultSlots, ...defaultSettings } = shown.json.settings;
+        const { local_slots: defaultSlots, local_fence_check: defaultFenceCheck, ...defaultSettings } = shown.json.settings;
         eq('door show: the defaults', defaultSettings, {
-          workers_edit: 'auto', table: { code: 'codex', research_review: 'agy', private: 'local' }, fence: { codex: 'fenced', agy: 'soft', local: 'soft' }, local_at_once: 'auto', on_close: 'stop', time_limit_min: 180
+          workers_edit: 'auto', table: { code: 'codex', research_review: 'agy', private: 'local' }, fence: { codex: 'fenced', agy: 'fenced', local: 'fenced' }, local_at_once: 'auto', on_close: 'stop', time_limit_min: 180
         });
+        // The door's home folder is its own, so no check is cached: unchecked, or guard when Codex or pi is not installed here.
+        truthy('door show: local_fence_check is guard or unchecked with nothing cached', ['guard', 'unchecked'].includes(defaultFenceCheck));
         truthy('door show: with local_at_once auto, local_slots is what auto comes to now (a whole number, at least 1)', Number.isInteger(defaultSlots) && defaultSlots >= 1);
         eq('door show: usage limits start out ok for every worker', ['codex', 'agy', 'local'].map((worker) => [worker, shown.json.limits?.[worker]?.level, shown.json.limits?.[worker]?.note]), [['codex', 'ok', ''], ['agy', 'ok', ''], ['local', 'ok', '']]);
         eq('door show: a folder with no git', shown.json.git, { isRepo: false, declined: false, setupAllowed: true });
@@ -5623,12 +6279,80 @@ try {
         fs.writeFileSync(globalSettingsPath, '---\ndelegate.research: codex\ndelegate.review: agy\ndelegate.private: agy\ndelegate.on_close: keep\ndelegate.time_limit_min: 45\ndelegate.local_at_once: 2\n---\n');
         saveProjectSettings(projectA, { workers_edit: 'copy', git: 'declined' });
         const configured = await runDoor(projectA, 'show');
-        eq('door show: the saved settings, research and review differing show as mixed', configured.json.settings, {
-          workers_edit: 'copy', table: { code: 'codex', research_review: 'mixed', private: 'agy' }, fence: { codex: 'fenced', agy: 'soft', local: 'soft' }, local_at_once: 2, on_close: 'keep', time_limit_min: 45, local_slots: null
+        const { local_fence_check: configuredFenceCheck, ...configuredSettings } = configured.json.settings;
+        truthy('door show: the saved settings carry local_fence_check', ['guard', 'unchecked', 'sandbox'].includes(configuredFenceCheck));
+        eq('door show: the saved settings, research and review differing show as mixed', configuredSettings, {
+          workers_edit: 'copy', table: { code: 'codex', research_review: 'mixed', private: 'agy' }, fence: { codex: 'fenced', agy: 'fenced', local: 'fenced' }, local_at_once: 2, on_close: 'keep', time_limit_min: 45, local_slots: null
         });
         eq('door show: git declined', configured.json.git?.declined, true);
         fs.writeFileSync(globalSettingsPath, '---\ndelegate.research: local\ndelegate.review: local\n---\n');
         eq('door show: research and review the same show as that value', (await runDoor(projectA, 'show')).json.settings?.table?.research_review, 'local');
+      });
+
+      // ---- local_fence_check against a stub codex and pi on PATH ----
+      // The stub codex.cmd prints a version and leaves a marker file when it runs. PATH starts with
+      // the stub folder; the door runs from another folder so resolveCmd does not refuse the stubs.
+      await doorSection('door: local_fence_check reads the cached sandbox check', async () => {
+        if (process.platform !== 'win32') return;
+        const stubVersion = 'codex-cli 9.9.9-test';
+        const checkFile = path.join(scratch, 'door-check.json');
+        const doorCwd = path.join(scratch, 'door cwd');
+        fs.mkdirSync(doorCwd, { recursive: true });
+        const makeStubs = (folder, withLauncher) => {
+          fs.mkdirSync(folder, { recursive: true });
+          fs.writeFileSync(path.join(folder, 'codex.cmd'), '@echo off\r\necho ran>>"%~dp0ran.txt"\r\necho ' + stubVersion + '\r\n');
+          fs.writeFileSync(path.join(folder, 'pi.cmd'), '@echo off\r\necho pi\r\n');
+          if (withLauncher) fs.writeFileSync(path.join(folder, 'pi-launcher.js'), '');
+          fs.rmSync(path.join(folder, 'ran.txt'), { force: true });
+          return folder;
+        };
+        // These cases need the door to find the stub Codex, so the test run's no-Codex flag is cleared for them.
+        const checkOf = async (stubs, project, cacheEntries, noCodexFlag = '') => {
+          fs.writeFileSync(checkFile, JSON.stringify(cacheEntries));
+          const env = { PATH: stubs + path.delimiter + process.env.PATH, CONSULT_SANDBOX_CHECK_FILE: checkFile, CONSULT_DELEGATE_TEST_NO_CODEX: noCodexFlag };
+          return (await runDoorWith(env, doorCwd, project, 'show')).json.settings?.local_fence_check;
+        };
+        const project = makePlain('door fence project');
+        const stubs = makeStubs(path.join(scratch, 'door stubs'), true);
+        const keyOf = (folder, version) => path.join(folder, 'codex.cmd') + '|' + version;
+        eq('door show: a cached ok check for this codex and version is sandbox (a codex.cmd is read too)', await checkOf(stubs, project, { [keyOf(stubs, stubVersion)]: { ok: true, failed: null } }), 'sandbox');
+        eq('door show: a cached failed check is guard', await checkOf(stubs, project, { [keyOf(stubs, stubVersion)]: { ok: false, failed: 'homeRefused', checkedAt: new Date().toISOString() } }), 'guard');
+        // R5: Codex is run for its version only when the cache has an entry for its path that still counts.
+        const ranStub = (folder) => fs.existsSync(path.join(folder, 'ran.txt'));
+        fs.rmSync(path.join(stubs, 'ran.txt'), { force: true });
+        eq('door show: a check cached for another version is unchecked, and Codex was asked its version', [await checkOf(stubs, project, { [keyOf(stubs, 'codex-cli 1.0.0')]: { ok: true, failed: null } }), ranStub(stubs)], ['unchecked', true]);
+        fs.rmSync(path.join(stubs, 'ran.txt'), { force: true });
+        eq('door show: no cache entry at all is unchecked, and Codex is not run', [await checkOf(stubs, project, {}), ranStub(stubs)], ['unchecked', false]);
+        const hourAndMinuteAgo = new Date(Date.now() - 61 * 60 * 1000).toISOString();
+        eq('door show: only an expired failure is unchecked, and Codex is not run', [await checkOf(stubs, project, { [keyOf(stubs, stubVersion)]: { ok: false, failed: 'homeRefused', checkedAt: hourAndMinuteAgo } }), ranStub(stubs)], ['unchecked', false]);
+        const noLauncher = makeStubs(path.join(scratch, 'door stubs no launcher'), false);
+        eq('door show: no pi launcher beside pi.cmd is guard', await checkOf(noLauncher, project, { [keyOf(noLauncher, stubVersion)]: { ok: true, failed: null } }), 'guard');
+        const inside = makeStubs(path.join(project, 'bin'), true);
+        eq('door show: a codex inside the project is guard, and is never run', [await checkOf(inside, project, { [keyOf(inside, stubVersion)]: { ok: true, failed: null } }), fs.existsSync(path.join(inside, 'ran.txt'))], ['guard', false]);
+        // F3 (Ruling 17): the door honours the test flag through the same lookup as the supervisor, so the stub never runs.
+        fs.rmSync(path.join(stubs, 'ran.txt'), { force: true });
+        eq('door show: with CONSULT_DELEGATE_TEST_NO_CODEX set, no Codex is found and the stub never runs', [await checkOf(stubs, project, { [keyOf(stubs, stubVersion)]: { ok: true, failed: null } }, '1'), fs.existsSync(path.join(stubs, 'ran.txt'))], ['guard', false]);
+        // F6.5: a broad project (the door's home folder) or one that holds consult's files gets the guard hint, even with a cached pass.
+        const passing = { [keyOf(stubs, stubVersion)]: { ok: true, failed: null } };
+        eq('door show: the home folder as the project is guard, not sandbox', await checkOf(stubs, doorHome, passing), 'guard');
+        eq('door show: a project holding consult\'s data folder is guard, not sandbox', await checkOf(stubs, path.dirname(process.env.CONSULT_DELEGATE_HOME), passing), 'guard');
+        // R7: when the project's write tasks run in copies, the folder checks are about the copy, which is never
+        // broad and never holds consult's files. With "here" they are about the project again.
+        const checkInRepo = async (repo, extraEnv) => {
+          const env = { PATH: stubs + path.delimiter + process.env.PATH, CONSULT_DELEGATE_TEST_NO_CODEX: '', ...extraEnv };
+          fs.writeFileSync(env.CONSULT_SANDBOX_CHECK_FILE, JSON.stringify(passing));
+          return (await runDoorWith(env, doorCwd, repo, 'show')).json.settings?.local_fence_check;
+        };
+        const holdingRepo = makeRepo('door repo holding the check file');
+        const holdingEnv = { CONSULT_SANDBOX_CHECK_FILE: path.join(holdingRepo, 'consult-sandbox-check.json') };
+        eq('door show: a repo holding consult\'s files, whose write tasks use copies, shows the cached check', await checkInRepo(holdingRepo, holdingEnv), 'sandbox');
+        saveProjectSettings(holdingRepo, { workers_edit: 'here' });
+        eq('door show: the same repo with "here" is guard', await checkInRepo(holdingRepo, holdingEnv), 'guard');
+        const homeRepo = makeRepo('door repo as home');
+        const homeEnv = { HOME: homeRepo, USERPROFILE: homeRepo, CONSULT_SANDBOX_CHECK_FILE: checkFile };
+        eq('door show: a repo that is the home folder, whose write tasks use copies, shows the cached check', await checkInRepo(homeRepo, homeEnv), 'sandbox');
+        saveProjectSettings(homeRepo, { workers_edit: 'here' });
+        eq('door show: the same home repo with "here" is guard', await checkInRepo(homeRepo, homeEnv), 'guard');
       });
 
       // ---- cancel and stop-all ----
@@ -5901,7 +6625,9 @@ try {
         eq('door save: on_close goes to the global file as delegate.on_close, every other byte kept', [keep.json.error, fs.readFileSync(globalSettingsPath, 'utf8')], [undefined, '---\r\n# my notes\r\ntimeout_ms: 600000\r\nlocal_runner: llama-swap\r\ndelegate.on_close: keep\r\n---\r\nBody text\r\n']);
         eq('door save: a save that wrote the global file says so', keep.json.global_written, true);
         eq('door save: the first save keeps a .bak of the file as it was', fs.readFileSync(`${globalSettingsPath}.bak`, 'utf8'), original);
-        eq('door save: the settings come back as show reads them', keep.json.settings, { workers_edit: 'copy', table: { code: 'codex', research_review: 'agy', private: 'local' }, fence: { codex: 'fenced', agy: 'soft', local: 'soft' }, local_at_once: 'auto', on_close: 'keep', time_limit_min: 180 });
+        const { local_fence_check: keptFenceCheck, ...keptSettings } = keep.json.settings;
+        eq('door save: the reply leaves out local_fence_check (only show reads Codex)', keptFenceCheck, undefined);
+        eq('door save: the settings come back as show reads them', keptSettings, { workers_edit: 'copy', table: { code: 'codex', research_review: 'agy', private: 'local' }, fence: { codex: 'fenced', agy: 'fenced', local: 'fenced' }, local_at_once: 'auto', on_close: 'keep', time_limit_min: 180 });
         const second = await runDoor(projectA, 'save', JSON.stringify({ time_limit_min: 45, local_at_once: 3, keep_backup: true }));
         eq('door save: keep_backup leaves the first .bak alone and still saves', [second.json.error, fs.readFileSync(`${globalSettingsPath}.bak`, 'utf8'), fs.readFileSync(globalSettingsPath, 'utf8').includes('delegate.time_limit_min: 45\r\n'), fs.readFileSync(globalSettingsPath, 'utf8').includes('delegate.local_at_once: 3\r\n')], [undefined, original, true, true]);
         eq('door save: the numbers come back as numbers', [second.json.settings?.time_limit_min, second.json.settings?.local_at_once], [45, 3]);
@@ -5961,7 +6687,7 @@ try {
         const declined = await runDoor(projectA, 'save', JSON.stringify({ git: 'declined' }));
         eq('door save: git declined is saved and shows', [declined.json.error, projectSettings(projectA).git, (await runDoor(projectA, 'show')).json.git?.declined], [undefined, 'declined', true]);
         const asked = await runDoor(projectA, 'save', JSON.stringify({ git: null, workers_edit: null }));
-        eq('door save: null puts git back to ask and workers_edit to auto', [asked.json.error, projectSettings(projectA), asked.json.settings?.workers_edit, (await runDoor(projectA, 'show')).json.git?.declined], [undefined, { workers_edit: 'auto', git: 'ask', fence: { codex: 'fenced', agy: 'soft', local: 'soft' } }, 'auto', false]);
+        eq('door save: null puts git back to ask and workers_edit to auto', [asked.json.error, projectSettings(projectA), asked.json.settings?.workers_edit, (await runDoor(projectA, 'show')).json.git?.declined], [undefined, { workers_edit: 'auto', git: 'ask', fence: { codex: 'fenced', agy: 'fenced', local: 'fenced' } }, 'auto', false]);
         const fenceSaved = await runDoor(projectA, 'save', JSON.stringify({ fence: { codex: 'full' } }));
         eq('door save: a fence is saved for the project', [fenceSaved.json.error, projectSettings(projectA).fence.codex, fenceSaved.json.settings?.fence?.codex], [undefined, 'full', 'full']);
         const projectsBeforeSoftCodex = fs.readFileSync(doorProjectsFile, 'utf8');
@@ -5973,7 +6699,7 @@ try {
           saveProjectSettings(projectB, { git: 'declined', workers_edit: 'copy' });
           return saveProjectSettings(projectB, { git: null, workers_edit: null });
         })();
-        eq('saveProjectSettings: null resets', nullStore, { workers_edit: 'auto', git: 'ask', fence: { codex: 'fenced', agy: 'soft', local: 'soft' } });
+        eq('saveProjectSettings: null resets', nullStore, { workers_edit: 'auto', git: 'ask', fence: { codex: 'fenced', agy: 'fenced', local: 'fenced' } });
 
         fs.rmSync(globalSettingsPath);
         fs.rmSync(`${globalSettingsPath}.bak`, { force: true });
@@ -6047,6 +6773,13 @@ try {
         eq('removeTaskWhen: a refusing check leaves the task', [storeNamespace.removeTaskWhen(task.id, () => false), fs.existsSync(taskFolder(task.id)), indexIds().includes(task.id)], [false, true, true]);
         eq('removeTaskWhen: the check sees the task as it is under the lock', storeNamespace.removeTaskWhen(task.id, (current) => current.state === 'failed' && current.id === task.id), true);
         eq('removeTaskWhen: the folder and the index row are gone', [fs.existsSync(taskFolder(task.id)), indexIds().includes(task.id)], [false, false]);
+        const fenceNamespace = await import('./lib/delegate-fence.js');
+        const piTask = addTask(repo, {}, { state: 'failed' });
+        const piFolders = fenceNamespace.piTempFolders(piTask.id);
+        fs.mkdirSync(piFolders.sessions, { recursive: true });
+        fs.writeFileSync(path.join(piFolders.sessions, 's.jsonl'), 'x');
+        eq('removeTaskWhen: a refusing check keeps the pi temp folder', [storeNamespace.removeTaskWhen(piTask.id, () => false), fs.existsSync(piFolders.root)], [false, true]);
+        eq('removeTaskWhen: removing the task also removes its pi temp folder', [storeNamespace.removeTaskWhen(piTask.id, () => true), fs.existsSync(piFolders.root)], [true, false]);
         eq('removeTaskWhen: a task that is already gone is false', storeNamespace.removeTaskWhen(task.id, () => true), false);
         const delegateModule = await import('./lib/delegate.js');
         eq('delegate.js exports cancelTask and sameProject for the door', [typeof delegateModule.cancelTask, typeof delegateModule.sameProject], ['function', 'function']);

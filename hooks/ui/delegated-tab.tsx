@@ -16,6 +16,7 @@ import {
   dropConfirm,
   editSetting,
   fenceChosen,
+  fenceHint,
   fenceNote,
   fencesOf,
   hasChanges,
@@ -81,9 +82,9 @@ const STOPPING_LABEL = 'Stopping…'
 const SETTING_COLUMN = 25
 const TABLE_INDENT = 2
 const TABLE_LABELS: Record<(typeof TABLE_ROWS)[number], string> = { code: 'code', research_review: 'research & review', private: 'private' }
-// agy and Local are only asked to stay in the project folder.
-const SOFT_FENCE_OPTIONS = [
-  { value: 'soft', label: 'stay in folder' },
+// agy and Local are held in the project folder, or let go anywhere.
+const WORKER_FENCE_OPTIONS = [
+  { value: 'fenced', label: 'fenced' },
   { value: 'none', label: 'anywhere' },
 ]
 const WORKER_OPTIONS = [
@@ -102,10 +103,9 @@ const FENCE_ROWS = [
       { value: 'fenced', label: 'fenced' },
       { value: 'full', label: 'full access' },
     ],
-    hint: "enforced by Codex's sandbox",
   },
-  { worker: 'agy', label: 'agy', field: 'fence_agy', options: SOFT_FENCE_OPTIONS, hint: 'asked only, not enforced' },
-  { worker: 'local', label: 'Local', field: 'fence_local', options: SOFT_FENCE_OPTIONS, hint: 'asked only, not enforced' },
+  { worker: 'agy', label: 'agy', field: 'fence_agy', options: WORKER_FENCE_OPTIONS },
+  { worker: 'local', label: 'Local', field: 'fence_local', options: WORKER_FENCE_OPTIONS },
 ] as const
 const WORKERS_EDIT_OPTIONS = [
   { value: 'auto', label: 'Auto' },
@@ -472,7 +472,10 @@ export function drawDelegatedTab($: EngineInterface, table: Table, surface: stri
             value={fenceChosen(view, fenceRow.worker)}
             onSelect={value => editSetting($, fenceRow.field, value)}
           />,
-          <Text dimColor>{`${' '.repeat(SETTING_COLUMN)}${fenceRow.hint}`}</Text>,
+          // The note wraps at words, under its own column, so a narrow tab never cuts a word.
+          <Box paddingLeft={SETTING_COLUMN}>
+            <Text dimColor wrap="wrap">{fenceHint(fenceRow.worker, settings.local_fence_check)}</Text>
+          </Box>,
         )
       }
       const liftText = liftWarning(view)

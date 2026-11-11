@@ -6,7 +6,7 @@ import type { DelegateTaskRow } from '../types'
 
 function row(overrides: Partial<DelegateTaskRow>): DelegateTaskRow {
   return {
-    id: 'aaa111', worker: 'local', model: null, title: 't', state: 'running', location: 'copy', mode: 'write', summary: null, fenced: null, fence: null,
+    id: 'aaa111', worker: 'local', model: null, title: 't', state: 'running', location: 'copy', mode: 'write', summary: null, fenced: null, fence: null, fence_layer: null,
     stop_reason: null, queue_model: null, reported_at: null, keep_running: false, ended_at: null, started_at: null, elapsed_ms: null,
     folder: null, log_path: null, report_path: null, merged_files: null, first_conflict: null, clear_kind: 'refuse',
     ...overrides,

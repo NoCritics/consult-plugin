@@ -8,6 +8,9 @@
 //         "limits":{"codex":{"level","note",...},"agy":{...},"local":{...}},
 //         "settings":{"workers_edit","table":{"code","research_review","private"},   (each codex, agy,
 //                     local or ask; research_review is "mixed" when the two differ)
+//                     "fence":{"codex","agy","local"}, "local_fence_check": "sandbox", "guard" or
+//                     "unchecked" (what holds a fenced Local task: Codex's sandbox, consult's guard, or
+//                     no cached check yet),
 //                     "local_at_once","local_slots","on_close","time_limit_min"},
 //                     local_slots: what auto comes to now, null when local_at_once is a number or
 //                     the runner did not answer in 2.5 s
@@ -58,7 +61,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { loadSettings, DELEGATE_WORKERS } from '../../mcp/lib/settings.js';
 import { saveDelegateSettings, keepBackup } from '../../mcp/lib/local-runners.js';
-import { gitState, setupAllowed, removeCopy, deleteTaskBranch } from '../../mcp/lib/delegate-git.js';
+import { gitState, setupAllowed, removeCopy, deleteTaskBranch, decideLocation } from '../../mcp/lib/delegate-git.js';
 import {
   listTasks, readTask, indexRow, projectSettings, saveProjectSettings, MAX_INDEX_ROWS, isTaskId, dataHome, taskFolder, ACTIVE_STATES
 } from '../../mcp/lib/delegate-store.js';
@@ -66,6 +69,8 @@ import {
   cancelTask, sameProject, needsAttention, limitsView, claimForClear, keepClaim, finishClear, releaseClear, clearPlan
 } from '../../mcp/lib/delegate.js';
 import { autoLocalSlots } from '../../mcp/lib/delegate-local.js';
+import { readCodexVersion } from '../../mcp/lib/delegate-fence.js';
+import { cachedPiLayer } from '../../mcp/lib/delegate-supervisor.js';
 
 const TABLE_ROWS = {
   code: ['delegate.code'],
@@ -166,13 +171,29 @@ function countsElsewhere(tasks, project) {
   return shown;
 }
 
+// What holds a fenced Local task, for the tab's note: 'sandbox' (Codex's sandbox: Codex and
+// pi's launcher are there and the cached check of this Codex passed), 'guard' (consult's guard
+// alone: the supervisor's own pre-checks rule the sandbox out, or the cached check failed) or
+// 'unchecked' (no cached check for this Codex yet). It is the start reply's cachedPiLayer, so Codex
+// is found the supervisor's way (findCodexForFence, which the test suites turn off) and never probed.
+// Write tasks are what the note is about (pi read tasks have no tool that writes): when the project's
+// write tasks run in a copy, the checks on the work folder itself are left out, as a copy never fails them.
+// Codex's version comes from the sync readCodexVersion (5 s), only when the cache cannot answer without it.
+async function localFenceCheck(project, git) {
+  const saved = projectSettings(project);
+  const layer = await cachedPiLayer({ readCodexVersion }, project, [], {
+    skipFolderChecks: decideLocation({ mode: 'write', projectSetting: saved.workers_edit, git, gitSetting: saved.git }).location === 'copy'
+  });
+  return layer.kind ?? 'unchecked';
+}
+
 // The delegate settings are global-only, so the project's own settings file
 // has nothing to add and nothing needs to run inside the project.
 function settingsView(project) {
   const delegate = loadSettings().delegate;
   const { research, review } = delegate.table;
   const shownProject = projectSettings(project);
-  return {
+  const view = {
     workers_edit: shownProject.workers_edit,
     table: { code: delegate.table.code, research_review: research === review ? research : 'mixed', private: delegate.table.private },
     fence: shownProject.fence,
@@ -180,6 +201,7 @@ function settingsView(project) {
     on_close: delegate.on_close,
     time_limit_min: delegate.time_limit_ms / 60000
   };
+  return view;
 }
 
 // What `local_at_once: auto` comes to now, for the tab's "auto (n)"; null when the
@@ -197,8 +219,7 @@ async function localSlotsFor(settings) {
   }
 }
 
-async function gitView(project) {
-  const state = await gitState(project);
+function gitView(project, state) {
   // Setting git up is offered only for a folder that is not a repository.
   return { isRepo: state.isRepo, declined: projectSettings(project).git === 'declined', setupAllowed: state.isRepo ? false : setupAllowed(project) };
 }
@@ -212,8 +233,11 @@ async function show(project) {
     if (sameProject(task.project, project)) rows.push(rowOf(task, now, project));
   }
   const settings = settingsView(project);
-  const [localSlots, git] = await Promise.all([localSlotsFor(settings), gitView(project)]);
+  const [localSlots, state] = await Promise.all([localSlotsFor(settings), gitState(project)]);
   settings.local_slots = localSlots;
+  // Only the tab's show needs local_fence_check (a save's reply is not drawn from; the tab shows again after it).
+  settings.local_fence_check = await localFenceCheck(project, state);
+  const git = gitView(project, state);
   return {
     rows,
     elsewhere: countsElsewhere(tasks, project),

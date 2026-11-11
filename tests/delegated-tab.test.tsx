@@ -2,6 +2,7 @@ import { describe, expect, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 
 import type { DelegateClearKind, DelegateShow, DelegateTaskRow } from '../types'
+import { fenceNote } from '../hooks/mod/delegated'
 import { paint, picture } from './paint'
 import { DELEGATE_DATA, PLUGIN, beatInstance, delegateRow, setDelegateIndex, world } from './world'
 import type { World, WorldOptions } from './world'
@@ -43,6 +44,7 @@ function task(overrides: Partial<DelegateTaskRow> & { id: string }): DelegateTas
     summary: null,
     fenced: true,
     fence: null,
+    fence_layer: null,
     stop_reason: null,
     queue_model: null,
     reported_at: null,
@@ -69,7 +71,8 @@ const DONE_READ = task({ id: 'eee555', worker: 'agy', title: 'review CSS', state
 const SETTINGS: DelegateShow['settings'] = {
   workers_edit: 'auto',
   table: { code: 'codex', research_review: 'agy', private: 'local' },
-  fence: { codex: 'fenced', agy: 'soft', local: 'soft' },
+  fence: { codex: 'fenced', agy: 'fenced', local: 'fenced' },
+  local_fence_check: 'unchecked',
   local_at_once: 'auto',
   // what auto comes to now
   local_slots: 1,
@@ -727,23 +730,28 @@ describe('delegated tab', () => {
       await ui.unmount()
     })
 
-    test('a local row says "not fenced"; a Codex row does not', async ($, on) => {
-      const { ui } = await mountWith($, on, () => SKETCH)
+    test('a local row run under the guard says "edits checked"; a Codex row and a sandboxed local row say nothing', async ($, on) => {
+      const guarded = task({ id: 'ccc333', worker: 'local', title: 'fix auth test', fenced: false, fence: 'fenced', fence_layer: 'guard' })
+      const sandboxed = task({ id: 'ccc444', worker: 'local', title: 'other test', fenced: true, fence: 'fenced', fence_layer: 'sandbox' })
+      const { ui } = await mountWith($, on, () => shown([RUNNING, guarded, sandboxed]))
       await ui.press({ key: 'delegated:row:ccc333' })
-      expect(lineWith(await lines(ui, 100), /^\s+not fenced$/)).toBeDefined()
-      expect(lineWith(await lines(ui, 100), /^\s+not fenced · /)).toBeUndefined()
-      expect(lineWith(await lines(ui, 100), /can't run commands/)).toBeUndefined()
-      await ui.press({ key: 'delegated:row:aaa111' })
+      expect(lineWith(await lines(ui, 100), /^\s+edits checked$/)).toBeDefined()
+      expect(lineWith(await lines(ui, 100), /^\s+edits checked · /)).toBeUndefined()
       expect(lineWith(await lines(ui, 100), /not fenced/)).toBeUndefined()
+      await ui.press({ key: 'delegated:row:ccc444' })
+      expect(lineWith(await lines(ui, 100), /edits checked|not fenced/)).toBeUndefined()
+      await ui.press({ key: 'delegated:row:aaa111' })
+      expect(lineWith(await lines(ui, 100), /edits checked|not fenced/)).toBeUndefined()
       await ui.unmount()
     })
 
-    test('an agy row says "not fenced · can\'t run commands" on one warning line', async ($, on) => {
+    test('an agy row says "can\'t run commands" on one warning line, and nothing about the fence', async ($, on) => {
       const { ui } = await mountWith($, on, () => SKETCH)
       await ui.press({ key: 'delegated:row:eee555' })
       const all = await lines(ui, 100)
-      expect(lineWith(all, /^\s+not fenced · can't run commands$/)).toBeDefined()
-      expect((await ui.find({ type: 'Text', text: /^not fenced · can't run commands$/ }))?.props.color).toBe('warning')
+      expect(lineWith(all, /^\s+can't run commands$/)).toBeDefined()
+      expect(lineWith(all, /not fenced/)).toBeUndefined()
+      expect((await ui.find({ type: 'Text', text: /^can't run commands$/ }))?.props.color).toBe('warning')
       await ui.unmount()
     })
 
@@ -752,7 +760,7 @@ describe('delegated tab', () => {
       const stopsOnClose = task({ id: 'ggg777', worker: 'local', title: 'other job', state: 'running', keep_running: false, fenced: false })
       const { ui } = await mountWith($, on, () => shown([keepsRunning, stopsOnClose]))
       await ui.press({ key: 'delegated:row:fff666' })
-      expect(lineWith(await lines(ui, 100), /^\s+not fenced · keeps the GPU busy and its model loaded$/)).toBeDefined()
+      expect(lineWith(await lines(ui, 100), /^\s+keeps the GPU busy and its model loaded$/)).toBeDefined()
       await ui.press({ key: 'delegated:row:ggg777' })
       expect(lineWith(await lines(ui, 100), /keeps the GPU busy/)).toBeUndefined()
       await ui.unmount()
@@ -977,6 +985,8 @@ describe('delegated tab', () => {
       location: 'here',
       mode: 'read',
       fenced: false,
+      fence: 'fenced',
+      fence_layer: 'guard',
       reported_at: 5,
       started_at: NOW - 60000,
       elapsed_ms: 48000,
@@ -995,7 +1005,7 @@ describe('delegated tab', () => {
       expect(all[at + 1]).toBe('    folder  C:/proj')
       expect(all[at + 2]).toBe('    log     C:/Users/me/.claude/consult-delegate/tasks/ad4749/log.jsonl')
       expect(all[at + 3]).toBe('    [ Open folder ]  [ Open report ]  [ Show log ]')
-      expect(all[at + 4]).toBe('    not fenced')
+      expect(all[at + 4]).toBe('    edits checked')
       await ui.unmount()
     })
 
@@ -1486,17 +1496,95 @@ describe('delegated tab', () => {
       const lifted = (fence: Partial<DelegateShow['settings']['fence']>) => shown([RUNNING], { settings: { ...SETTINGS, fence: { ...SETTINGS.fence, ...fence } } })
       const savesOf = (w: World): string[] => commandsRun(w).filter(command => command.startsWith('save '))
 
-      test('the fences show for this project, enforced and asked-only', async ($, on) => {
+      // The test painter cuts a long line at the width, mid-word; the real one wraps at words. Compare without spaces.
+      const squash = (text: string) => text.replace(/\s+/g, '')
+      const withCheck = (check: 'sandbox' | 'guard' | 'unchecked') => shown([RUNNING], { settings: { ...SETTINGS, local_fence_check: check } })
+      const AGY_NOTE = 'enforced by agy (trusted folder: this project only)'
+      const LOCAL_NOTES = {
+        sandbox: "enforced by Codex's sandbox",
+        guard: 'checked by consult: file edits only, commands not',
+        unchecked: 'checked on the next task',
+      } as const
+
+      for (const columns of [89, 44]) {
+        test(`tab: agy note (${columns} columns)`, async ($, on) => {
+          const { ui } = await mountWith($, on, () => SKETCH, {}, columns)
+          await ui.press({ key: 'delegated:fold' })
+          const all = await lines(ui, columns)
+          expect(lineWith(all, /Fences \(this project\)/)).toBeDefined()
+          expect(squash(all.join(' '))).toContain(squash(AGY_NOTE))
+          expect(lineWith(all, /asked only|not enforced/)).toBeUndefined()
+          for (const line of all) expect(line.length, line).toBeLessThanOrEqual(columns)
+          await ui.unmount()
+        })
+
+        for (const check of ['sandbox', 'guard', 'unchecked'] as const) {
+          test(`tab: local note ${check} (${columns} columns)`, async ($, on) => {
+            const { ui } = await mountWith($, on, () => withCheck(check), {}, columns)
+            await ui.press({ key: 'delegated:fold' })
+            const all = await lines(ui, columns)
+            expect(squash(all.join(' '))).toContain(squash(LOCAL_NOTES[check]))
+            // Codex's note is there too, so the sandbox note shows twice; the other two only once, and not together.
+            const joined = squash(all.join(' '))
+            expect(joined.split(squash("enforced by Codex's sandbox")).length - 1).toBe(check === 'sandbox' ? 2 : 1)
+            for (const other of ['guard', 'unchecked'] as const) {
+              if (other !== check) expect(joined).not.toContain(squash(LOCAL_NOTES[other]))
+            }
+            for (const line of all) expect(line.length, line).toBeLessThanOrEqual(columns)
+            await ui.unmount()
+          })
+        }
+      }
+
+      test('the fences show for this project, fenced for every worker', async ($, on) => {
         const { ui } = await mountWith($, on, () => SKETCH)
         await ui.press({ key: 'delegated:fold' })
-        const all = await lines(ui, 100)
-        expect(lineWith(all, /Fences \(this project\)/)).toBeDefined()
-        expect(lineWith(all, /enforced by Codex's sandbox/)).toBeDefined()
-        expect(lineWith(all, /asked only, not enforced/)).toBeDefined()
         expect((await ui.find({ key: 'delegated:set:fence:codex' }))?.props.value).toBe('fenced')
-        expect((await ui.find({ key: 'delegated:set:fence:agy' }))?.props.value).toBe('soft')
-        expect((await ui.find({ key: 'delegated:set:fence:local' }))?.props.value).toBe('soft')
+        expect((await ui.find({ key: 'delegated:set:fence:agy' }))?.props.value).toBe('fenced')
+        expect((await ui.find({ key: 'delegated:set:fence:local' }))?.props.value).toBe('fenced')
         await ui.unmount()
+      })
+
+      test('tab: agy and local options read fenced / anywhere', async ($, on) => {
+        const { ui } = await mountWith($, on, () => SKETCH)
+        await ui.press({ key: 'delegated:fold' })
+        for (const worker of ['agy', 'local']) {
+          const options = (await ui.find({ key: `delegated:set:fence:${worker}` }))?.props.options as { value: string; label: string }[]
+          expect(options).toEqual([
+            { value: 'fenced', label: 'fenced' },
+            { value: 'none', label: 'anywhere' },
+          ])
+        }
+        await ui.unmount()
+      })
+
+      test('tab: an old atom with agy soft draws as fenced, and saving another setting leaves it out', async ($, on) => {
+        const { w, ui } = await mountWith($, on, args => (args[0] === 'show' ? lifted({ agy: 'soft' as never, local: 'soft' as never }) : { settings: SETTINGS, global_written: false }))
+        await ui.press({ key: 'delegated:fold' })
+        expect((await ui.find({ key: 'delegated:set:fence:agy' }))?.props.value).toBe('fenced')
+        expect((await ui.find({ key: 'delegated:set:fence:local' }))?.props.value).toBe('fenced')
+        expect(lineWith(await lines(ui, 100), /anywhere|stay in folder/)).toBeUndefined()
+        await ui.select({ key: 'delegated:set:fence:codex', value: 'full' })
+        await ui.press({ key: 'delegated:save' })
+        await w.clock.settle()
+        expect(savesOf(w)).toEqual(['save {"fence":{"codex":"full"}}'])
+        await ui.unmount()
+      })
+
+      test('fenceNote: guard row says edits checked', () => {
+        const guardRow = (more: Partial<DelegateTaskRow>) => task({ id: 'n00001', worker: 'local', fence: 'fenced', fence_layer: 'guard', ...more })
+        expect(fenceNote(guardRow({}))).toBe('edits checked')
+        expect(fenceNote(guardRow({ fence_layer: 'sandbox' }))).toBeNull()
+        expect(fenceNote(guardRow({ worker: 'agy', fence_layer: 'agy' }))).toBeNull()
+        expect(fenceNote(guardRow({ fence: 'none', fence_layer: null }))).toBe('anywhere')
+        expect(fenceNote(guardRow({ worker: 'codex', fence: 'full', fence_layer: null }))).toBe('full access')
+        expect(fenceNote(guardRow({ worker: 'codex', fence: 'fenced', fence_layer: null }))).toBeNull()
+      })
+
+      test('fenceNote: soft row has no note', () => {
+        expect(fenceNote(task({ id: 'n00002', worker: 'local', fence: 'soft', fenced: false }))).toBeNull()
+        expect(fenceNote(task({ id: 'n00003', worker: 'agy', fence: 'soft', fenced: false }))).toBeNull()
+        expect(fenceNote(task({ id: 'n00004', worker: 'agy', fence: null, fenced: false }))).toBeNull()
       })
 
       test("lifting Codex's fence warns before saving", async ($, on) => {
@@ -1512,15 +1600,42 @@ describe('delegated tab', () => {
         await ui.unmount()
       })
 
-      test('lifting agy or Local warns with the Anywhere text, and both lifted give both lines', async ($, on) => {
+      const AGY_LIFT =
+        "Anywhere: agy may change files in every folder your agy settings trust (today: your home folder), without asking. Changes outside the project don't go through the copy and can't be undone."
+      const LOCAL_LIFT =
+        "Anywhere: the local model may change or delete any file you can and run any command, without asking. Changes outside the project don't go through the copy and can't be undone."
+
+      test('tab: lifting local shows the local warning', async ($, on) => {
         const { ui } = await mountWith($, on, () => SKETCH)
         await ui.press({ key: 'delegated:fold' })
         await ui.select({ key: 'delegated:set:fence:local', value: 'none' })
-        expect(await ui.find({ type: 'Text', text: /Anywhere: agy and Local are no longer asked to stay in the project folder/ })).toBeDefined()
+        expect((await ui.find({ type: 'Text', text: /^Anywhere: the local model may change or delete any file you can/ }))?.props.color).toBe('warning')
+        expect(await ui.find({ type: 'Text', text: /^Anywhere: agy may change files/ })).toBeUndefined()
+        expect(await ui.find({ type: 'Text', text: /Full access: Codex can read/ })).toBeUndefined()
+        expect(squash((await lines(ui, 100)).join(' '))).toContain(squash(LOCAL_LIFT))
+        await ui.unmount()
+      })
+
+      test('tab: lifting agy shows the agy warning', async ($, on) => {
+        const { ui } = await mountWith($, on, () => SKETCH)
+        await ui.press({ key: 'delegated:fold' })
+        await ui.select({ key: 'delegated:set:fence:agy', value: 'none' })
+        expect(await ui.find({ type: 'Text', text: /^Anywhere: agy may change files/ })).toBeDefined()
+        expect(await ui.find({ type: 'Text', text: /^Anywhere: the local model/ })).toBeUndefined()
+        expect(squash((await lines(ui, 100)).join(' '))).toContain(squash(AGY_LIFT))
+        await ui.unmount()
+      })
+
+      test('lifting agy and Local gives both lines, and Codex too gives all three', async ($, on) => {
+        const { ui } = await mountWith($, on, () => SKETCH)
+        await ui.press({ key: 'delegated:fold' })
+        await ui.select({ key: 'delegated:set:fence:agy', value: 'none' })
+        await ui.select({ key: 'delegated:set:fence:local', value: 'none' })
+        expect(await ui.find({ type: 'Text', text: /^Anywhere: agy may change files/ })).toBeDefined()
+        expect(await ui.find({ type: 'Text', text: /^Anywhere: the local model/ })).toBeDefined()
         expect(await ui.find({ type: 'Text', text: /Full access: Codex can read/ })).toBeUndefined()
         await ui.select({ key: 'delegated:set:fence:codex', value: 'full' })
         expect(await ui.find({ type: 'Text', text: /Full access: Codex can read/ })).toBeDefined()
-        expect(await ui.find({ type: 'Text', text: /Anywhere: agy and Local/ })).toBeDefined()
         await ui.unmount()
       })
 
@@ -1591,9 +1706,12 @@ describe('delegated tab', () => {
         expect(lineWith(await lines(ui, 100), /full access|anywhere/)).toBeUndefined()
         await ui.press({ key: 'delegated:fold' })
         expect((await ui.find({ key: 'delegated:set:fence:codex' }))?.props.value).toBe('fenced')
-        expect((await ui.find({ key: 'delegated:set:fence:agy' }))?.props.value).toBe('soft')
+        expect((await ui.find({ key: 'delegated:set:fence:agy' }))?.props.value).toBe('fenced')
+        expect((await ui.find({ key: 'delegated:set:fence:local' }))?.props.value).toBe('fenced')
         await ui.select({ key: 'delegated:set:fence:codex', value: 'full' })
         expect(await ui.find({ type: 'Text', text: /Full access: Codex can read/ })).toBeDefined()
+        // Local's note, with no check in the old atom, waits for the next task.
+        expect(squash((await lines(ui, 100)).join(' '))).toContain(squash('checked on the next task'))
         await ui.unmount()
       })
 
@@ -1604,6 +1722,7 @@ describe('delegated tab', () => {
           task({ id: 'f00003', worker: 'agy', title: 'third job', fence: null, fenced: false }),
           task({ id: 'f00004', worker: 'codex', title: 'fourth job', fence: null }),
           task({ id: 'f00005', worker: 'local', title: 'fifth job', fence: 'soft', fenced: false }),
+          task({ id: 'f00006', worker: 'agy', title: 'sixth job', fence: 'fenced', fence_layer: 'agy' }),
         ]
         const { ui } = await mountWith($, on, () => shown(rows))
         await ui.press({ key: 'delegated:row:f00001' })
@@ -1611,11 +1730,14 @@ describe('delegated tab', () => {
         await ui.press({ key: 'delegated:row:f00002' })
         expect(lineWith(await lines(ui, 100), /^\s+anywhere · can't run commands$/)).toBeDefined()
         await ui.press({ key: 'delegated:row:f00003' })
-        expect(lineWith(await lines(ui, 100), /^\s+not fenced · can't run commands$/)).toBeDefined()
+        expect(lineWith(await lines(ui, 100), /^\s+can't run commands$/)).toBeDefined()
+        expect(lineWith(await lines(ui, 100), /not fenced/)).toBeUndefined()
         await ui.press({ key: 'delegated:row:f00004' })
         expect(lineWith(await lines(ui, 100), /fenced|full access|anywhere/)).toBeUndefined()
         await ui.press({ key: 'delegated:row:f00005' })
-        expect(lineWith(await lines(ui, 100), /^\s+not fenced$/)).toBeDefined()
+        expect(lineWith(await lines(ui, 100), /not fenced|anywhere|edits checked/)).toBeUndefined()
+        await ui.press({ key: 'delegated:row:f00006' })
+        expect(lineWith(await lines(ui, 100), /^\s+can't run commands$/)).toBeDefined()
         await ui.unmount()
       })
 

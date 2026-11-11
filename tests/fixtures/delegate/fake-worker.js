@@ -20,7 +20,9 @@
 //   agy-edit    an agy stream that writes FAKE_WRITE_FILE and deletes FAKE_DELETE_FILE first, exits 0
 //   agy-denied  an agy stream that writes FAKE_WRITE_FILE (if set), then ends with an empty response and one denied RunCommand, exits 0
 //   agy-replay  prints the lines of the file FAKE_STREAM_FILE as they are, then exits with FAKE_EXIT_CODE (default 0)
-//   pi          a pi stream (session from --session-id), exits 0
+//   pi          a pi stream (session from --session-id), exits 0; it notes what was in --session-dir and writes s.jsonl there
+//   pi-hang     as pi, then hangs
+//   pi-launch-fail  prints Codex's sandbox launch failure on stderr and exits 1
 //
 // FAKE_START_LOG: a line with the pid is appended to this file at every start.
 //
@@ -63,6 +65,7 @@ if (process.env.FAKE_REPORT_FILE) {
     promptStart: prompt.slice(0, 60),
     promptLength: prompt.length,
     briefFileStart: briefArgument ? fs.readFileSync(briefArgument.slice(1), 'utf8').slice(0, 60) : null,
+    settingsText: args.includes('--settings') ? fs.readFileSync(args[args.indexOf('--settings') + 1], 'utf8') : null,
     cwd: process.cwd(),
     keyVariablePresent: Boolean(process.env.FAKE_KEY_VARIABLE && process.env[process.env.FAKE_KEY_VARIABLE])
   };
@@ -171,8 +174,20 @@ if (scenario === 'ok') {
   // A recorded agy stream, printed unchanged; agy 1.2.10+ exits 3 after an ERROR result.
   process.stdout.write(fs.readFileSync(process.env.FAKE_STREAM_FILE, 'utf8'));
   process.exitCode = Number(process.env.FAKE_EXIT_CODE || 0);
-} else if (scenario === 'pi') {
-  const sessionId = args[args.indexOf('--session-id') + 1];
+} else if (scenario === 'pi-launch-fail') {
+  process.stderr.write('windows sandbox failed: runner failed during SpawnChild\n');
+  process.exitCode = 1;
+} else if (scenario === 'pi' || scenario === 'pi-hang') {
+  // pi's session folder: note what was staged there, and leave a session file.
+  const sessionDir = args[args.indexOf('--session-dir') + 1];
+  fs.mkdirSync(sessionDir, { recursive: true });
+  fs.writeFileSync(path.join(sessionDir, 'seen.txt'), fs.readdirSync(sessionDir).join(','));
+  fs.writeFileSync(path.join(sessionDir, 's.jsonl'), 'a session line\n');
+  if (scenario === 'pi-hang') {
+    emit({ type: 'session', version: 3, id: 'hanging' });
+    hangForever();
+  }
+  const sessionId = args[args.indexOf(args.includes('--session-id') ? '--session-id' : '--session') + 1];
   emit({ type: 'session', version: 3, id: sessionId });
   emit({ type: 'agent_start' });
   emit({ type: 'agent_end', willRetry: false, messages: [{ role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: 'Wrote the file with pi.' }] }] });

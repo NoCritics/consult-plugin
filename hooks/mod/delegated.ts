@@ -102,12 +102,15 @@ export function markOf(row: DelegateTaskRow): { mark: string; color: string } {
   return { mark: '!', color: 'warning' }
 }
 
-// What a row says of the fence it was started under: Codex lifted, agy or Local
-// lifted ('anywhere') or only asked ('not fenced'); null when it is fenced in. A
-// task from before fences (null) is judged by its worker's default.
+// What a row says of the fence it was started under: Codex lifted ('full access'),
+// agy or Local lifted ('anywhere'), or a Local run held by consult's guard alone
+// ('edits checked'); null when it is fenced in. A task from before fences (null) or
+// from 0.16.0 ('soft') reads as fenced.
 export function fenceNote(row: DelegateTaskRow): string | null {
   if (row.worker === 'codex') return row.fence === 'full' ? 'full access' : null
-  return row.fence === 'none' ? 'anywhere' : 'not fenced'
+  if (row.fence === 'none') return 'anywhere'
+  if (row.fence_layer === 'guard') return 'edits checked'
+  return null
 }
 
 // The ids of this project's tasks that are running or queued, sorted.
@@ -189,9 +192,23 @@ export type FenceWorker = (typeof FENCE_WORKERS)[number]
 
 // The fences of a shown settings object. A `shown` kept from before 0.16.0 (the
 // atom survives a plugin update in a live session) has none: it reads as the
-// default, every worker fenced.
+// default, every worker fenced. A 'soft' kept from 0.16.0 reads as fenced too.
 export function fencesOf(settings: { fence?: Record<FenceWorker, string> }): Record<FenceWorker, string> {
-  return settings.fence ?? { codex: 'fenced', agy: 'soft', local: 'soft' }
+  const fences: Record<FenceWorker, string> = { codex: 'fenced', agy: 'fenced', local: 'fenced' }
+  if (settings.fence === undefined) return fences
+  for (const worker of FENCE_WORKERS) {
+    fences[worker] = settings.fence[worker] === 'soft' ? 'fenced' : settings.fence[worker]
+  }
+  return fences
+}
+
+// The note under a worker's fence in the settings: what holds it.
+export function fenceHint(worker: FenceWorker, localFenceCheck: 'sandbox' | 'guard' | 'unchecked' | undefined): string {
+  if (worker === 'codex') return "enforced by Codex's sandbox"
+  if (worker === 'agy') return 'enforced by agy (trusted folder: this project only)'
+  if (localFenceCheck === 'sandbox') return "enforced by Codex's sandbox"
+  if (localFenceCheck === 'guard') return 'checked by consult: file edits only, commands not'
+  return 'checked on the next task'
 }
 
 // The fence the fold holds for a worker: the edit, or the shown value.
@@ -204,8 +221,10 @@ export function fenceChosen(view: DelegatedView, worker: FenceWorker): string {
 
 const CODEX_LIFT_WARNING =
   "Full access: Codex can read, change or delete any file you can, and run any command, without asking. Changes outside the project don't go through the copy and can't be undone."
-const OTHER_LIFT_WARNING =
-  'Anywhere: agy and Local are no longer asked to stay in the project folder. They could already reach any file you can; now their brief no longer holds them back.'
+const AGY_LIFT_WARNING =
+  "Anywhere: agy may change files in every folder your agy settings trust (today: your home folder), without asking. Changes outside the project don't go through the copy and can't be undone."
+const LOCAL_LIFT_WARNING =
+  "Anywhere: the local model may change or delete any file you can and run any command, without asking. Changes outside the project don't go through the copy and can't be undone."
 
 // The fences whose edit differs from the shown value, as { worker: value }.
 function fenceChangesOf(view: DelegatedView): Record<string, string> {
@@ -220,12 +239,13 @@ function fenceChangesOf(view: DelegatedView): Record<string, string> {
 
 // What to warn about before Save: a fence edited to a lifted value (full / none).
 // An edit put back to the shown value is no change and warns of nothing. Codex's
-// sentence, then agy and Local's; null when no lift is waiting.
+// sentence, then agy's, then Local's; null when no lift is waiting.
 export function liftWarning(view: DelegatedView): string | null {
   const changed = fenceChangesOf(view)
   const warnings: string[] = []
   if (changed.codex === 'full') warnings.push(CODEX_LIFT_WARNING)
-  if (changed.agy === 'none' || changed.local === 'none') warnings.push(OTHER_LIFT_WARNING)
+  if (changed.agy === 'none') warnings.push(AGY_LIFT_WARNING)
+  if (changed.local === 'none') warnings.push(LOCAL_LIFT_WARNING)
   return warnings.length === 0 ? null : warnings.join('\n')
 }
 

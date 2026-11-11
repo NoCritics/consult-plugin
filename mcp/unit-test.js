@@ -6,6 +6,11 @@ import path from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 
+// The Codex sandbox check cache is a scratch file for the whole run, never the user's ~/.claude one (unless the caller set one).
+const ownsCheckFile = !process.env.CONSULT_SANDBOX_CHECK_FILE;
+if (ownsCheckFile) process.env.CONSULT_SANDBOX_CHECK_FILE = path.join(os.tmpdir(), 'consult-unit-check-' + randomBytes(4).toString('hex') + '.json');
+const topLevelCheckFile = process.env.CONSULT_SANDBOX_CHECK_FILE;
+
 import { scrubPii, readHead, walkAndDelete } from './lib/util.js';
 import { loadSettings, parseFrontmatter, sanitize, frontmatterWarnings, runnerSettings, localConfigured, KNOWN_KEYS } from './lib/settings.js';
 import {
@@ -2664,6 +2669,382 @@ if (SPAWN_OPTS.shell) {
     fs.rmSync(answersFolder, { recursive: true, force: true });
   }
 }
+
+// --- fence helpers: pi temp folders, the Codex sandbox check, the pi guard ---
+{
+  const fenceHelpers = await import('./lib/delegate-fence.js');
+  const { stagePiSessions, returnPiSessions, removePiTemp, piTempFolders, piLauncherFor, sandboxCheck, readSandboxCheck, readCachedSandboxCheck, spawnPlanFor, readCodexVersion } = fenceHelpers;
+  const { default: piFenceExtension } = await import('./lib/pi-fence.js');
+  const fenceScratch = fs.mkdtempSync(path.join(os.tmpdir(), 'consult-fence-test-'));
+  const previousCheckFile = process.env.CONSULT_SANDBOX_CHECK_FILE;
+  const previousFenceDir = process.env.CONSULT_FENCE_DIR;
+  process.env.CONSULT_SANDBOX_CHECK_FILE = path.join(fenceScratch, 'check.json');
+  const previousPiTempRoot = process.env.CONSULT_PI_TEMP_ROOT;
+  process.env.CONSULT_PI_TEMP_ROOT = path.join(fenceScratch, 'consult-pi');
+  const fenceTaskId = (process.pid % 0xffffff).toString(16).padStart(6, '0');
+  try {
+    const taskDirWithSessions = path.join(fenceScratch, 'task');
+    fs.mkdirSync(path.join(taskDirWithSessions, 'pi-sessions'), { recursive: true });
+    fs.writeFileSync(path.join(taskDirWithSessions, 'pi-sessions', 'a.jsonl'), 'a');
+    const staged = stagePiSessions(taskDirWithSessions, fenceTaskId);
+    eq('stage: copies sessions in', fs.readdirSync(staged.sessions), ['a.jsonl']);
+    eq('stage: folders are under consult-pi/<id>', staged.root, path.join(fenceScratch, 'consult-pi', fenceTaskId));
+    eq('stage: agent and tmp exist', [fs.existsSync(staged.agent), fs.existsSync(staged.tmp)], [true, true]);
+    fs.writeFileSync(path.join(staged.agent, 'auth.json'), '{}');
+    fs.writeFileSync(path.join(staged.sessions, 'stale.jsonl'), 'x');
+    const restaged = stagePiSessions(taskDirWithSessions, fenceTaskId);
+    eq('stage: a stale temp copy never survives', fs.readdirSync(restaged.sessions), ['a.jsonl']);
+    eq('stage: agent is kept', fs.existsSync(path.join(restaged.agent, 'auth.json')), true);
+    fs.writeFileSync(path.join(restaged.sessions, 'b.jsonl'), 'y');
+    returnPiSessions(taskDirWithSessions, fenceTaskId);
+    eq('return: copies back', fs.readdirSync(path.join(taskDirWithSessions, 'pi-sessions')).sort(), ['a.jsonl', 'b.jsonl']);
+    removePiTemp(fenceTaskId);
+    eq('removePiTemp: removes the folder', fs.existsSync(piTempFolders(fenceTaskId).root), false);
+    eq('removePiTemp: a missing folder does not throw', (() => { removePiTemp(fenceTaskId); return true; })(), true);
+    eq('return: with nothing staged does not throw and keeps the authority', (() => { returnPiSessions(taskDirWithSessions, fenceTaskId); return fs.readdirSync(path.join(taskDirWithSessions, 'pi-sessions')).length; })(), 2);
+    // F5: the swap never leaves a moment with no pi-sessions, and a crash inside it is recoverable.
+    eq('return: no .old or .incoming is left behind', fs.readdirSync(taskDirWithSessions).sort(), ['pi-sessions']);
+    const crashedTask = path.join(fenceScratch, 'crashed task');
+    fs.mkdirSync(path.join(crashedTask, 'pi-sessions.old'), { recursive: true });
+    fs.writeFileSync(path.join(crashedTask, 'pi-sessions.old', 'kept.jsonl'), 'k');
+    eq('stage: with pi-sessions missing, pi-sessions.old is the authority', fs.readdirSync(stagePiSessions(crashedTask, fenceTaskId).sessions), ['kept.jsonl']);
+    returnPiSessions(crashedTask, fenceTaskId);
+    eq('return: after a crash it restores pi-sessions and clears .old', [fs.readdirSync(path.join(crashedTask, 'pi-sessions')), fs.existsSync(path.join(crashedTask, 'pi-sessions.old'))], [['kept.jsonl'], false]);
+    // F6: only a real task id becomes a path.
+    for (const badId of ['..', '..\\x', 'ABCDEF', 'abc', 'a/b', '', undefined]) {
+      throws('piTempFolders: ' + JSON.stringify(badId) + ' is refused', () => piTempFolders(badId));
+      eq('removePiTemp: ' + JSON.stringify(badId) + ' is a no-op', (() => { removePiTemp(badId); return true; })(), true);
+    }
+    removePiTemp(fenceTaskId);
+
+    // F10: a codex.cmd is started the way spawn-cli.js does, so it works under cmd.exe.
+    const cmdPath = 'C:/Users/Jane Doe/npm/codex.cmd';
+    const nodePath = 'C:/Program Files/nodejs/node.exe';
+    const cmdPlan = spawnPlanFor(cmdPath, ['sandbox', '-c', 'sandbox_mode=workspace-write', '--', nodePath, 'C:/p/probe.js']);
+    // readCodexVersion starts Codex the way sandboxCheck does, so a .cmd works (execFile alone fails on it).
+    if (process.platform === 'win32') {
+      const versionFolder = path.join(fenceScratch, 'version stub');
+      fs.mkdirSync(versionFolder, { recursive: true });
+      fs.writeFileSync(path.join(versionFolder, 'codex.cmd'), '@echo off\r\necho  codex-cli 7.8.9  \r\n');
+      fs.writeFileSync(path.join(versionFolder, 'broken.cmd'), '@echo off\r\nexit /b 3\r\n');
+      fs.writeFileSync(path.join(versionFolder, 'silent.cmd'), '@echo off\r\n');
+      eq('readCodexVersion: a .cmd path answers with the trimmed output', readCodexVersion(path.join(versionFolder, 'codex.cmd')), 'codex-cli 7.8.9');
+      eq('readCodexVersion: a nonzero exit, no output and a missing program are null', [readCodexVersion(path.join(versionFolder, 'broken.cmd')), readCodexVersion(path.join(versionFolder, 'silent.cmd')), readCodexVersion(path.join(versionFolder, 'nothing.cmd'))], [null, null, null]);
+    }
+    eq('spawnPlanFor: a .cmd path is quoted, spaced args are quoted, and the shell is used (Windows)',
+      [cmdPlan.file, cmdPlan.args, cmdPlan.shell],
+      SPAWN_OPTS.shell
+        ? ['"' + cmdPath + '"', ['sandbox', '-c', 'sandbox_mode=workspace-write', '--', '"' + nodePath + '"', 'C:/p/probe.js'], true]
+        : [cmdPath, ['sandbox', '-c', 'sandbox_mode=workspace-write', '--', nodePath, 'C:/p/probe.js'], false]);
+    const { isBroadWorkFolder } = await import('./lib/resolve-cmd.js');
+    eq('isBroadWorkFolder: the home folder, its parent and a drive root are broad; a project under it is not',
+      [isBroadWorkFolder(os.homedir()), isBroadWorkFolder(path.dirname(os.homedir())), isBroadWorkFolder(path.parse(os.homedir()).root), isBroadWorkFolder(path.join(os.homedir(), 'some', 'project'))],
+      [true, true, true, false]);
+
+    const fakePiBin = path.join(fenceScratch, 'pibin');
+    const emptyDir = path.join(fenceScratch, 'empty');
+    fs.mkdirSync(fakePiBin);
+    fs.mkdirSync(emptyDir);
+    fs.writeFileSync(path.join(fakePiBin, 'pi-launcher.js'), '');
+    eq('launcher: found beside pi.cmd', piLauncherFor(path.join(fakePiBin, 'pi.cmd')), path.join(fakePiBin, 'pi-launcher.js'));
+    eq('launcher: absent', piLauncherFor(path.join(emptyDir, 'pi.cmd')), null);
+
+    // sandboxCheck with a fake run
+    const allTrue = JSON.stringify({ cwdWritable: true, homeRefused: true, internetRefused: true, loopbackOpen: true, childHomeRefused: true });
+    function fakeRun(version, probeJson, counter) {
+      return async (command, args) => {
+        if (args.includes('--version')) return { code: 0, stdout: version + '\n', stderr: '', timedOut: false };
+        if (counter) counter.runs += 1;
+        return { code: 0, stdout: probeJson + '\n', stderr: '', timedOut: false };
+      };
+    }
+    eq('check: passes and caches', await sandboxCheck({ codexPath: 'C:\\c\\codex.exe', run: fakeRun('codex-cli 0.167.0', allTrue) }), { ok: true, failed: null, cached: false });
+    eq('check: second call is cached', (await sandboxCheck({ codexPath: 'C:\\c\\codex.exe', run: fakeRun('codex-cli 0.167.0', allTrue) })).cached, true);
+    eq('check: another version checks again', (await sandboxCheck({ codexPath: 'C:\\c\\codex.exe', run: fakeRun('codex-cli 0.168.0', allTrue) })).cached, false);
+    eq('check: the old version stays cached', readSandboxCheck('C:\\c\\codex.exe', 'codex-cli 0.167.0'), { ok: true, failed: null });
+    // A failed entry is trusted for an hour; a pass for the same Codex version never expires.
+    {
+      const clockNow = Date.parse('2026-11-08T12:00:00Z');
+      const minutesAgo = (minutes) => new Date(clockNow - minutes * 60 * 1000).toISOString();
+      const cacheKeyFor = (codexPath) => codexPath + '|codex-cli 0.167.0';
+      fs.writeFileSync(process.env.CONSULT_SANDBOX_CHECK_FILE, JSON.stringify({
+        [cacheKeyFor('C:\\ttl\\fresh.exe')]: { ok: false, failed: 'homeRefused', checkedAt: minutesAgo(59) },
+        [cacheKeyFor('C:\\ttl\\stale.exe')]: { ok: false, failed: 'homeRefused', checkedAt: minutesAgo(61) },
+        [cacheKeyFor('C:\\ttl\\old-pass.exe')]: { ok: true, failed: null, checkedAt: minutesAgo(30 * 24 * 60) }
+      }));
+      const ttlCounter = { runs: 0 };
+      const freshFailure = await sandboxCheck({ codexPath: 'C:\\ttl\\fresh.exe', run: fakeRun('codex-cli 0.167.0', allTrue, ttlCounter), now: () => clockNow });
+      eq('check: a failure 59 min old is used', [freshFailure, ttlCounter.runs], [{ ok: false, failed: 'homeRefused', cached: true }, 0]);
+      const staleFailure = await sandboxCheck({ codexPath: 'C:\\ttl\\stale.exe', run: fakeRun('codex-cli 0.167.0', allTrue, ttlCounter), now: () => clockNow });
+      eq('check: a failure 61 min old is probed again', [staleFailure, ttlCounter.runs], [{ ok: true, failed: null, cached: false }, 1]);
+      const oldPass = await sandboxCheck({ codexPath: 'C:\\ttl\\old-pass.exe', run: fakeRun('codex-cli 0.167.0', allTrue, ttlCounter), now: () => clockNow });
+      eq('check: a pass 30 days old is still used', [oldPass, ttlCounter.runs], [{ ok: true, failed: null, cached: true }, 1]);
+      eq('read: an expired failure reads as no entry', readSandboxCheck('C:\\ttl\\fresh.exe', 'codex-cli 0.167.0', () => clockNow + 2 * 60 * 1000), null);
+    }
+    // readCachedSandboxCheck: what the cache says of a Codex without probing it. The file's mtime and size find
+    // the entry with no `codex --version` run, but only for a real .exe on Windows (R6); with no entry that still
+    // counts, Codex is not run at all (R5). `readVersion` is a spy, so each case shows whether Codex would be run.
+    {
+      const versionSpy = (version) => {
+        const spy = { calls: 0 };
+        spy.read = async () => { spy.calls += 1; return version; };
+        return spy;
+      };
+      const stampTrusted = process.platform === 'win32';
+      const stampedCodex = path.join(fenceScratch, 'stamped-codex.exe');
+      fs.writeFileSync(stampedCodex, 'not a real codex');
+      const stampedNow = Date.now();
+      const stampedCounter = { runs: 0 };
+      await sandboxCheck({ codexPath: stampedCodex, run: fakeRun('codex-cli 0.167.0', allTrue, stampedCounter), now: () => stampedNow });
+      const exeSpy = versionSpy(null);
+      eq('cached: an .exe whose stamp matches is found by the file alone, and Codex is not run',
+        [await readCachedSandboxCheck(stampedCodex, { readVersion: exeSpy.read, now: () => stampedNow }), exeSpy.calls],
+        [stampTrusted ? { ok: true, failed: null } : null, stampTrusted ? 0 : 1]);
+      const writtenEntry = JSON.parse(fs.readFileSync(process.env.CONSULT_SANDBOX_CHECK_FILE, 'utf8'))[stampedCodex + '|codex-cli 0.167.0'];
+      eq('cached: the entry carries the file mtime and size', [writtenEntry.mtimeMs, writtenEntry.size], [fs.statSync(stampedCodex).mtimeMs, fs.statSync(stampedCodex).size]);
+      // A .cmd shim stays the same when Codex updates, so its stamp is not trusted: Codex is asked its version.
+      const stampedShim = path.join(fenceScratch, 'stamped-codex.cmd');
+      fs.writeFileSync(stampedShim, '@echo off\r\n');
+      await sandboxCheck({ codexPath: stampedShim, run: fakeRun('codex-cli 0.167.0', allTrue), now: () => stampedNow });
+      const shimEntry = JSON.parse(fs.readFileSync(process.env.CONSULT_SANDBOX_CHECK_FILE, 'utf8'))[stampedShim + '|codex-cli 0.167.0'];
+      eq('cached: the .cmd entry carries a matching stamp too', [shimEntry.mtimeMs, shimEntry.size], [fs.statSync(stampedShim).mtimeMs, fs.statSync(stampedShim).size]);
+      const updatedShimSpy = versionSpy('codex-cli 0.168.0');
+      eq('cached: a .cmd whose stamp matches still asks Codex its version, and an updated Codex finds nothing',
+        [await readCachedSandboxCheck(stampedShim, { readVersion: updatedShimSpy.read, now: () => stampedNow }), updatedShimSpy.calls], [null, 1]);
+      const sameShimSpy = versionSpy('codex-cli 0.167.0');
+      eq('cached: a .cmd at the cached version is found through its version',
+        [await readCachedSandboxCheck(stampedShim, { readVersion: sameShimSpy.read, now: () => stampedNow }), sameShimSpy.calls], [{ ok: true, failed: null }, 1]);
+      const touched = new Date(Date.now() + 5000);
+      fs.utimesSync(stampedCodex, touched, touched);
+      const touchedSpy = versionSpy(null);
+      eq('cached: an .exe with a changed mtime falls back to its version',
+        [await readCachedSandboxCheck(stampedCodex, { readVersion: touchedSpy.read, now: () => stampedNow }), touchedSpy.calls], [null, 1]);
+      const missingSpy = versionSpy('codex-cli 0.167.0');
+      eq('cached: no entry for the path is null, and Codex is not run',
+        [await readCachedSandboxCheck(path.join(fenceScratch, 'no-such-codex.exe'), { readVersion: missingSpy.read }), missingSpy.calls], [null, 0]);
+      // Hand-written entries: failed ones expire after an hour, the same as readSandboxCheck.
+      const failedCodex = path.join(fenceScratch, 'failed-codex.exe');
+      fs.writeFileSync(failedCodex, 'x');
+      const failedStat = fs.statSync(failedCodex);
+      const failedKey = failedCodex + '|codex-cli 0.167.0';
+      const failedClock = Date.parse('2026-11-08T12:00:00Z');
+      const writeFailedEntry = (minutesOld, withStamp) => fs.writeFileSync(process.env.CONSULT_SANDBOX_CHECK_FILE, JSON.stringify({
+        [failedKey]: { ok: false, failed: 'homeRefused', checkedAt: new Date(failedClock - minutesOld * 60000).toISOString(), ...(withStamp ? { mtimeMs: failedStat.mtimeMs, size: failedStat.size } : {}) }
+      }));
+      writeFailedEntry(59, true);
+      const freshFailureSpy = versionSpy('codex-cli 0.167.0');
+      eq('cached: a failure 59 min old is used',
+        [await readCachedSandboxCheck(failedCodex, { readVersion: freshFailureSpy.read, now: () => failedClock }), freshFailureSpy.calls], [{ ok: false, failed: 'homeRefused' }, stampTrusted ? 0 : 1]);
+      writeFailedEntry(61, true);
+      const expiredSpy = versionSpy('codex-cli 0.167.0');
+      eq('cached: only a failure 61 min old is null, and Codex is not run',
+        [await readCachedSandboxCheck(failedCodex, { readVersion: expiredSpy.read, now: () => failedClock }), expiredSpy.calls], [null, 0]);
+      writeFailedEntry(59, false);
+      const unstampedSpy = versionSpy('codex-cli 0.167.0');
+      eq('cached: an entry written before the stamp existed is found through the version',
+        [await readCachedSandboxCheck(failedCodex, { readVersion: unstampedSpy.read, now: () => failedClock }), unstampedSpy.calls], [{ ok: false, failed: 'homeRefused' }, 1]);
+      const silentSpy = versionSpy(null);
+      eq('cached: a Codex that does not say its version finds nothing',
+        [await readCachedSandboxCheck(failedCodex, { readVersion: silentSpy.read, now: () => failedClock }), silentSpy.calls], [null, 1]);
+    }
+    const homeWritable = JSON.stringify({ cwdWritable: true, homeRefused: false, internetRefused: true, loopbackOpen: true, childHomeRefused: false });
+    eq('check: a failed probe names the first failing check', (await sandboxCheck({ codexPath: 'C:\\d\\codex.exe', run: fakeRun('codex-cli 0.167.0', homeWritable) })).failed, 'homeRefused');
+    const timeoutRun = async (command, args) => (args.includes('--version')
+      ? { code: 0, stdout: 'codex-cli 0.167.0\n', stderr: '', timedOut: false }
+      : { code: null, stdout: '', stderr: '', timedOut: true });
+    eq('check: timeout is not cached', [await sandboxCheck({ codexPath: 'C:\\e\\codex.exe', run: timeoutRun }), readSandboxCheck('C:\\e\\codex.exe', 'codex-cli 0.167.0')], [{ ok: false, failed: 'the check took over 60 s', cached: false }, null]);
+    // F2/F3/F4: what an inconclusive probe is, and what is a real verdict.
+    const inconclusiveCases = [
+      ['internet unreachable (null)', JSON.stringify({ cwdWritable: true, homeRefused: true, internetRefused: null, loopbackOpen: true, childHomeRefused: true }), 'internetInconclusive'],
+      ['no JSON line at all', 'windows sandbox failed: setup refresh', 'the sandbox could not start the check: ']
+    ];
+    for (const [label, probeText, wantedFailed] of inconclusiveCases) {
+      const codexPath = 'C:\\inc-' + label.length + '\\codex.exe';
+      const outcome = await sandboxCheck({ codexPath, run: async (command, args) => (args.includes('--version')
+        ? { code: 0, stdout: 'codex-cli 0.167.0\n', stderr: '', timedOut: false }
+        : { code: 1, stdout: label === 'no JSON line at all' ? '' : probeText + '\n', stderr: label === 'no JSON line at all' ? probeText + '\nmore' : '', timedOut: false }) });
+      eq('check: ' + label + ' is inconclusive and not cached', [outcome.ok, outcome.cached, outcome.failed.startsWith(wantedFailed), readSandboxCheck(codexPath, 'codex-cli 0.167.0')], [false, false, true, null]);
+    }
+    eq('check: the launch failure line is named', (await sandboxCheck({ codexPath: 'C:\\inc-launch\\codex.exe', run: async (command, args) => (args.includes('--version')
+      ? { code: 0, stdout: 'codex-cli 0.167.0\n', stderr: '', timedOut: false }
+      : { code: 1, stdout: '', stderr: 'windows sandbox failed: boom\nmore', timedOut: false }) })).failed, 'the sandbox could not start the check: windows sandbox failed: boom');
+    const internetReached = JSON.stringify({ cwdWritable: true, homeRefused: true, internetRefused: false, loopbackOpen: true, childHomeRefused: true });
+    eq('check: internet reached is a cached failure', [(await sandboxCheck({ codexPath: 'C:\\h\\codex.exe', run: fakeRun('codex-cli 0.167.0', internetReached) })).failed, readSandboxCheck('C:\\h\\codex.exe', 'codex-cli 0.167.0')], ['internetRefused', { ok: false, failed: 'internetRefused' }]);
+    const childNotRefused = JSON.stringify({ cwdWritable: true, homeRefused: true, internetRefused: true, loopbackOpen: true, childHomeRefused: false });
+    eq('check: a child that is not refused is a cached failure', (await sandboxCheck({ codexPath: 'C:\\i\\codex.exe', run: fakeRun('codex-cli 0.167.0', childNotRefused) })).failed, 'childHomeRefused');
+    const counter = { runs: 0 };
+    const sharedRun = fakeRun('codex-cli 0.167.0', allTrue, counter);
+    await Promise.all([
+      sandboxCheck({ codexPath: 'C:\\f\\codex.exe', run: sharedRun }),
+      sandboxCheck({ codexPath: 'C:\\f\\codex.exe', run: sharedRun })
+    ]);
+    eq('check: two at once share one run', counter.runs, 1);
+    const probeCalls = [];
+    await sandboxCheck({ codexPath: 'C:\\g\\codex.exe', run: async (command, args, options) => {
+      if (args.includes('--version')) return { code: 0, stdout: 'codex-cli 0.167.0\n', stderr: '', timedOut: false };
+      probeCalls.push({ args, cwd: options.cwd, temp: options.env?.TEMP, tmp: options.env?.TMP, cwdExisted: fs.existsSync(options.cwd), tempExisted: typeof options.env?.TEMP === 'string' && fs.existsSync(options.env.TEMP) });
+      return { code: 0, stdout: allTrue + '\n', stderr: '', timedOut: false };
+    } });
+    const probeCall = probeCalls[0];
+    const probeFolder = path.dirname(probeCall.cwd);
+    eq('check: the probe runs in <probe>\\work of a temp folder that is removed afterwards', [path.dirname(probeFolder) === os.tmpdir(), path.basename(probeCall.cwd), probeCall.cwdExisted, fs.existsSync(probeFolder)], [true, 'work', true, false]);
+    // Ruling 19: the probe runs in the same shape as pi: cwd is its work folder, TEMP and TMP its own temp folder.
+    eq('check: the probe gets TEMP and TMP = <probe>\\temp, which exists, beside work', [probeCall.temp === path.join(probeFolder, 'temp'), probeCall.tmp === probeCall.temp, probeCall.tempExisted], [true, true, true]);
+    // R3: the probe pins the environment policy the way the pi wrapper does, after sandbox_mode and before `--`.
+    eq('check: the probe runs with the pi wrapper\'s environment policy', probeCall.args.slice(0, probeCall.args.indexOf('--') + 1),
+      ['sandbox', '-c', 'sandbox_mode=workspace-write', '-c', 'shell_environment_policy.inherit=all', '-c', 'shell_environment_policy.ignore_default_excludes=true', '--']);
+
+    // F6.2: a cache that cannot be written still returns the probe's verdict, uncached.
+    {
+      const blockingFile = path.join(fenceScratch, 'a file, not a folder');
+      fs.writeFileSync(blockingFile, 'x');
+      const keptCheckFile = process.env.CONSULT_SANDBOX_CHECK_FILE;
+      process.env.CONSULT_SANDBOX_CHECK_FILE = path.join(blockingFile, 'check.json');
+      let unwritable;
+      try {
+        unwritable = await sandboxCheck({ codexPath: 'C:\\unwritable\\codex.exe', run: fakeRun('codex-cli 0.167.0', allTrue) });
+      } catch (error) {
+        unwritable = 'threw: ' + error.message;
+      } finally {
+        process.env.CONSULT_SANDBOX_CHECK_FILE = keptCheckFile;
+      }
+      eq('check: a cache that cannot be written still gives the verdict, uncached', unwritable, { ok: true, failed: null, cached: false });
+    }
+
+    // F6.3: a home probe that failed some other way than EPERM/EACCES is inconclusive, not a pass.
+    {
+      const homeUnclear = JSON.stringify({ cwdWritable: true, homeRefused: null, internetRefused: true, loopbackOpen: true, childHomeRefused: true });
+      const unclearOutcome = await sandboxCheck({ codexPath: 'C:\\home-unclear\\codex.exe', run: fakeRun('codex-cli 0.167.0', homeUnclear) });
+      eq('check: homeRefused null is inconclusive and not cached', [unclearOutcome, readSandboxCheck('C:\\home-unclear\\codex.exe', 'codex-cli 0.167.0')], [{ ok: false, failed: 'homeInconclusive', cached: false }, null]);
+      // The real probe script, with its write to home failing on purpose and the internet stubbed offline (no network is used).
+      const probeHome = path.join(fenceScratch, 'probe home');
+      fs.mkdirSync(probeHome, { recursive: true });
+      const preload = path.join(fenceScratch, 'probe-preload.mjs');
+      fs.writeFileSync(preload, [
+        "import fs from 'node:fs';",
+        "import https from 'node:https';",
+        "import os from 'node:os';",
+        "import { EventEmitter } from 'node:events';",
+        'const wantedCode = process.env.PROBE_TEST_HOME_ERROR;',
+        'const originalWrite = fs.writeFileSync;',
+        'fs.writeFileSync = function (target, ...rest) {',
+        '  if (String(target).startsWith(os.homedir())) { const error = new Error(wantedCode); error.code = wantedCode; throw error; }',
+        '  return originalWrite.call(this, target, ...rest);',
+        '};',
+        "https.get = () => { const request = new EventEmitter(); request.destroy = () => {}; setImmediate(() => request.emit('error', Object.assign(new Error('offline'), { code: 'ENOTFOUND' }))); return request; };"
+      ].join('\n'));
+      const { fileURLToPath: probeUrlToPath, pathToFileURL: probePathToUrl } = await import('node:url');
+      const probeScript = probeUrlToPath(new URL('./lib/sandbox-probe.js', import.meta.url));
+      const runProbeScript = (errorCode) => {
+        const output = execFileSync(process.execPath, ['--import', probePathToUrl(preload).href, probeScript], {
+          cwd: fenceScratch, encoding: 'utf8', timeout: 30000, windowsHide: true,
+          env: { ...process.env, USERPROFILE: probeHome, HOME: probeHome, PROBE_TEST_HOME_ERROR: errorCode }
+        });
+        return JSON.parse(output.trim().split(/\r?\n/).pop());
+      };
+      eq('probe: a home write refused with EPERM is refused', runProbeScript('EPERM').homeRefused, true);
+      eq('probe: a home write refused with EACCES is refused', runProbeScript('EACCES').homeRefused, true);
+      eq('probe: a home write that failed with EIO is inconclusive (null), not refused', runProbeScript('EIO').homeRefused, null);
+    }
+
+    // pi-fence guard
+    async function guardFor(fenceDir, event, cwd) {
+      if (fenceDir === undefined) delete process.env.CONSULT_FENCE_DIR; else process.env.CONSULT_FENCE_DIR = fenceDir;
+      let handler = null;
+      piFenceExtension({ on(name, registered) { if (name === 'tool_call') handler = registered; } });
+      return handler(event, cwd ? { cwd } : {});
+    }
+    const guardWork = path.join(fenceScratch, 'guard work \u0416');
+    const guardOther = path.join(fenceScratch, 'guard other');
+    fs.mkdirSync(guardWork);
+    fs.mkdirSync(guardOther);
+    fs.symlinkSync(guardOther, path.join(guardWork, 'link'), 'junction');
+    eq('guard: inside, folders not yet existing', await guardFor(guardWork, { toolName: 'write', input: { path: path.join(guardWork, 'sub', 'new', 'f.txt') } }), undefined);
+    const dotDot = await guardFor(guardWork, { toolName: 'edit', input: { path: path.join(guardWork, '..', 'guard other', 'f.txt') } });
+    eq('guard: .. out is blocked', dotDot.block, true);
+    eq('guard: the reason is a sentence naming folder and path', dotDot.reason.startsWith('This task is fenced to ') && dotDot.reason.endsWith(' is outside it.'), true);
+    eq('guard: drive case', await guardFor(guardWork, { toolName: 'write', input: { path: guardWork.toUpperCase().replace('\u0416', '\u0436') + '\\f.txt' } }), undefined);
+    eq('guard: junction out is blocked', (await guardFor(guardWork, { toolName: 'write', input: { path: path.join(guardWork, 'link', 'f.txt') } })).block, true);
+    eq('guard: a sibling sharing a prefix is outside', (await guardFor(guardWork, { toolName: 'write', input: { path: guardWork + ' two\\f.txt' } })).block, true);
+    eq('guard: file_path is read too', (await guardFor(guardWork, { toolName: 'write', input: { file_path: path.join(guardOther, 'f.txt') } })).block, true);
+    eq('guard: a relative path resolves against cwd', await guardFor(process.cwd(), { toolName: 'write', input: { path: 'new.txt' } }), undefined);
+    eq('guard: a fence at the home folder is not treated as empty', await guardFor(os.homedir(), { toolName: 'write', input: { path: path.join(os.homedir(), 'x', 'f.txt') } }), undefined);
+    eq('guard: bash allowed', await guardFor(guardWork, { toolName: 'bash', input: { command: 'echo > C:\\x' } }), undefined);
+    eq('guard: read allowed', await guardFor(guardWork, { toolName: 'read', input: { path: 'C:\\x' } }), undefined);
+    eq('guard: no fence dir blocks writes', (await guardFor(undefined, { toolName: 'write', input: { path: path.join(guardWork, 'f.txt') } })).block, true);
+    // F1: pi normalises a path before writing; the guard must see what pi will write.
+    const homeFile = await guardFor(guardWork, { toolName: 'write', input: { path: '~/x.txt' } });
+    eq('guard: ~/x.txt is home, outside', homeFile.block, true);
+    eq('guard: ~\\x.txt is home, outside', (await guardFor(guardWork, { toolName: 'write', input: { path: '~\\x.txt' } })).block, true);
+    eq('guard: a bare ~ is home, outside', (await guardFor(guardWork, { toolName: 'edit', input: { path: '~' } })).block, true);
+    eq('guard: @ then an outside path is blocked', (await guardFor(guardWork, { toolName: 'write', input: { path: '@' + path.join(guardOther, 'x.txt') } })).block, true);
+    eq('guard: @ then a relative inside path is allowed', await guardFor(guardWork, { toolName: 'write', input: { path: '@sub\\x.txt' } }, guardWork), undefined);
+    eq('guard: @@ is refused outright', (await guardFor(guardWork, { toolName: 'write', input: { path: '@@x.txt' } })).block, true);
+    eq('guard: a non-breaking space is a plain space', await guardFor(guardWork, { toolName: 'write', input: { path: path.join(guardWork, 'a\u00A0b', 'x.txt') } }), undefined);
+    eq('guard: Git Bash /c/ style outside paths are blocked', (await guardFor(guardWork, { toolName: 'write', input: { path: '/c/Windows/x.txt' } })).block, true);
+    eq('guard: a file:// URL outside is blocked', (await guardFor(guardWork, { toolName: 'write', input: { path: 'file:///' + path.join(guardOther, 'x.txt').replaceAll('\\', '/') } })).block, true);
+    // F7: a dangling link inside the fence that points outside is not "missing".
+    const danglingTarget = path.join(fenceScratch, 'does not exist yet');
+    fs.symlinkSync(danglingTarget, path.join(guardWork, 'dangling'), 'junction');
+    eq('guard: a dangling junction out is blocked', (await guardFor(guardWork, { toolName: 'write', input: { path: path.join(guardWork, 'dangling', 'f.txt') } })).block, true);
+    eq('guard: the dangling junction itself is blocked', (await guardFor(guardWork, { toolName: 'write', input: { path: path.join(guardWork, 'dangling') } })).block, true);
+    eq('guard: a write with no path is blocked', (await guardFor(guardWork, { toolName: 'write', input: {} })).block, true);
+    // F1 (Ruling 15): consult's own files are refused even inside the work folder (CONSULT_FENCE_PROTECTED, a JSON array).
+    const consultData = path.join(guardWork, 'consult data');
+    const consultProjects = path.join(guardWork, 'consult-projects.json');
+    process.env.CONSULT_FENCE_PROTECTED = JSON.stringify([consultData, consultProjects]);
+    const stateWrite = await guardFor(guardWork, { toolName: 'write', input: { path: path.join(consultData, 'tasks', 'abc123', 'state.json') } });
+    eq('guard: a write into a protected folder inside the work folder is blocked, naming consult\'s files', [stateWrite?.block, /consult's own files/.test(stateWrite?.reason ?? '')], [true, true]);
+    eq('guard: the protected projects file is blocked, in any case', (await guardFor(guardWork, { toolName: 'edit', input: { path: consultProjects.toUpperCase().replace('Ж', 'ж') } }))?.block, true);
+    eq('guard: a relative path into a protected folder is blocked', (await guardFor(guardWork, { toolName: 'write', input: { path: 'consult data\\index.json' } }, guardWork))?.block, true);
+    eq('guard: the rest of the work folder is still writable', await guardFor(guardWork, { toolName: 'write', input: { path: path.join(guardWork, 'consult data two', 'f.txt') } }), undefined);
+    process.env.CONSULT_FENCE_PROTECTED = JSON.stringify([fenceScratch]);
+    eq('guard: a protected folder that holds the work folder (a copy under consult\'s data) leaves the work folder writable', await guardFor(guardWork, { toolName: 'write', input: { path: path.join(guardWork, 'f.txt') } }), undefined);
+    process.env.CONSULT_FENCE_PROTECTED = JSON.stringify([guardWork]);
+    eq('guard: a protected path equal to the work folder blocks every write in it', (await guardFor(guardWork, { toolName: 'write', input: { path: path.join(guardWork, 'f.txt') } }))?.block, true);
+    process.env.CONSULT_FENCE_PROTECTED = 'not json';
+    eq('guard: an unreadable protected list blocks writes (fails closed)', (await guardFor(guardWork, { toolName: 'write', input: { path: path.join(guardWork, 'f.txt') } }))?.block, true);
+    delete process.env.CONSULT_FENCE_PROTECTED;
+  } finally {
+    delete process.env.CONSULT_FENCE_PROTECTED;
+    if (previousCheckFile === undefined) delete process.env.CONSULT_SANDBOX_CHECK_FILE; else process.env.CONSULT_SANDBOX_CHECK_FILE = previousCheckFile;
+    if (previousFenceDir === undefined) delete process.env.CONSULT_FENCE_DIR; else process.env.CONSULT_FENCE_DIR = previousFenceDir;
+    if (previousPiTempRoot === undefined) delete process.env.CONSULT_PI_TEMP_ROOT; else process.env.CONSULT_PI_TEMP_ROOT = previousPiTempRoot;
+    removePiTemp(fenceTaskId);
+    fs.rmSync(fenceScratch, { recursive: true, force: true });
+  }
+}
+
+// --- F3 (Ruling 17): a test server gets no Codex for the fence and a scratch sandbox-check file by default ---
+{
+  const { isolatedServerEnv } = await import('./test-helpers.js');
+  const namesToClear = ['CONSULT_DELEGATE_TEST_NO_CODEX', 'CONSULT_SANDBOX_CHECK_FILE'];
+  const kept = {};
+  for (const name of namesToClear) {
+    kept[name] = process.env[name];
+    delete process.env[name];
+  }
+  const serverScratch = path.join(os.tmpdir(), 'consult-isolated-env-test');
+  try {
+    if (typeof isolatedServerEnv !== 'function') {
+      eq('isolatedServerEnv: exported', typeof isolatedServerEnv, 'function');
+    } else {
+      const defaults = isolatedServerEnv(serverScratch);
+      eq('isolatedServerEnv: no Codex for the fence, and the check file is in the scratch folder', [defaults.CONSULT_DELEGATE_TEST_NO_CODEX, defaults.CONSULT_SANDBOX_CHECK_FILE], ['1', path.join(serverScratch, 'consult-sandbox-check.json')]);
+      process.env.CONSULT_DELEGATE_TEST_NO_CODEX = '';
+      process.env.CONSULT_SANDBOX_CHECK_FILE = 'X:\\chosen.json';
+      const overridden = isolatedServerEnv(serverScratch);
+      eq('isolatedServerEnv: a caller\'s own values win', [overridden.CONSULT_DELEGATE_TEST_NO_CODEX, overridden.CONSULT_SANDBOX_CHECK_FILE], ['', 'X:\\chosen.json']);
+    }
+  } finally {
+    for (const name of namesToClear) {
+      if (kept[name] === undefined) delete process.env[name]; else process.env[name] = kept[name];
+    }
+  }
+}
+
+// The run's own scratch check file goes with it.
+if (ownsCheckFile) fs.rmSync(topLevelCheckFile, { force: true });
 
 console.log('\n' + (failed === 0 ? 'ALL PASSED' : `${failed} FAIL(S)`));
 process.exit(failed === 0 ? 0 : 1);

@@ -13,5 +13,6 @@ process.on('uncaughtException', (error) => {
 });
 
 // A local task waits here for the runner to have room (lib/delegate-local.js).
+// (Tests that set CONSULT_DELEGATE_TEST_NO_CODEX get no Codex: choosePiLayer's default is findCodexForFence.)
 await runSupervisor(taskId, { admit: admitLocalTask });
 process.exit(0);

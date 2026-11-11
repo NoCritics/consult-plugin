@@ -113,7 +113,9 @@ export type DelegateTaskRow = {
   // null until a worker has started
   fenced: boolean | null
   // what the task was started under; null on a task from before the fence setting
-  fence: 'fenced' | 'full' | 'soft' | 'none' | null
+  fence: 'fenced' | 'full' | 'none' | 'soft' | null
+  // which layer fences an agy or local run; null when it is not a fenced agy/local run
+  fence_layer: 'sandbox' | 'guard' | 'agy' | null
   stop_reason: string | null
   queue_model: string | null
   reported_at: number | null
@@ -138,7 +140,11 @@ export type DelegateSettingsShown = {
   workers_edit: 'auto' | 'here' | 'copy'
   table: { code: string; research_review: string; private: string }
   // this project's fence for each worker
-  fence: { codex: 'fenced' | 'full'; agy: 'soft' | 'none'; local: 'soft' | 'none' }
+  fence: { codex: 'fenced' | 'full'; agy: 'fenced' | 'none'; local: 'fenced' | 'none' }
+  // what holds a fenced Local task: Codex's sandbox (checked and cached), consult's guard (Codex missing,
+  // no pi launcher, or the check failed), or not known yet (nothing cached). A tab state kept from before
+  // 0.17.0 has none.
+  local_fence_check?: 'sandbox' | 'guard' | 'unchecked'
   local_at_once: 'auto' | number
   // what auto comes to now (the slots of what the runner holds); null when the setting is a number or unknown
   // (a save's answer leaves it out)

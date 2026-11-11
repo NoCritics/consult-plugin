@@ -18,14 +18,19 @@ const SERVER_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), 'con
 // it starts, so a test server gets its own delegate data, projects file and
 // project folder unless the test names them, and does no sweeps (a test that
 // wants them sets CONSULT_DELEGATE_TEST_NO_SWEEP=0). Never the user's real files.
+// The fence never finds a Codex (CONSULT_DELEGATE_TEST_NO_CODEX) and the sandbox-check
+// cache is a scratch file, so no test server runs the real codex.exe for a fence or
+// writes the user's ~/.claude/consult-sandbox-check.json.
 // (The codex home stays: the live tests need the user's codex login.)
-function isolatedServerEnv(scratchFolder) {
+export function isolatedServerEnv(scratchFolder) {
   const env = { ...process.env };
   const isolated = {
     CONSULT_DELEGATE_HOME: path.join(scratchFolder, 'delegate'),
     CONSULT_PROJECTS_FILE: path.join(scratchFolder, 'consult-projects.json'),
     CLAUDE_PROJECT_DIR: path.join(scratchFolder, 'project'),
-    CONSULT_DELEGATE_TEST_NO_SWEEP: '1'
+    CONSULT_DELEGATE_TEST_NO_SWEEP: '1',
+    CONSULT_DELEGATE_TEST_NO_CODEX: '1',
+    CONSULT_SANDBOX_CHECK_FILE: path.join(scratchFolder, 'consult-sandbox-check.json')
   };
   for (const [name, value] of Object.entries(isolated)) {
     if (env[name] === undefined) env[name] = value;

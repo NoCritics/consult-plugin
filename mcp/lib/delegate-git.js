@@ -302,7 +302,8 @@ function porcelainStatusEntries(output) {
 
 // ---- did a read-only task change anything? ----
 //
-// agy cannot be fenced, so a read task given to it is checked: the folder is
+// A read task given to agy is checked too: its fence holds writes made through
+// its tools, and this catches any that got through another way. The folder is
 // looked at before the run and after it, and the files that differ are told to
 // the person. In a git project that is the read-only status (no lock, no index
 // write) plus each listed file's size and mtime, so a file that was already

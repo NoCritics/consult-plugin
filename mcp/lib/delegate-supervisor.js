@@ -17,7 +17,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn, execFile, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { ensureCmd, isInsideFolder, missingMessage, SPAWN_OPTS, spawnableCmd } from './resolve-cmd.js';
+import { ensureCmd, resolveCmd, isBroadWorkFolder, isInsideFolder, missingMessage, SPAWN_OPTS, spawnableCmd } from './resolve-cmd.js';
 import { shellSafeArgs, killTree, killPidTree } from './spawn-cli.js';
 import { scrubPii, oneLine } from './util.js';
 import { loadSettings, runnerSettings } from './settings.js';
@@ -25,7 +25,10 @@ import { readKey, runnerInventory } from './local-runners.js';
 import { workerCommand, parseWorkerStream, noteStepEvent, codexRolloutLimits, deniedNames } from './delegate-workers.js';
 import { gitState, endSnapshot, changedFiles, watchFolder, diffWatch, isOutside, worktreesRoot } from './delegate-git.js';
 import { recordLimit, recordLimitHit, hitKindOf } from './delegate-limits.js';
-import { readTask, updateTask, updateTaskWhen, taskFolder, isAlive, isSessionAlive, isProcessAlive, isSupervisorLive, unmergedBase } from './delegate-store.js';
+import {
+  stagePiSessions, returnPiSessions, removePiTemp, makePiTempFolders, hasLeftoverPiSessions, piLauncherFor, sandboxCheck, readCachedSandboxCheck, findCodexForFence
+} from './delegate-fence.js';
+import { readTask, updateTask, updateTaskWhen, taskFolder, taskFence, narrowerFence, projectSettings, isAlive, isSessionAlive, isProcessAlive, isSupervisorLive, unmergedBase, holdsConsultFiles } from './delegate-store.js';
 
 const RUN_SCRIPT_PATH = fileURLToPath(new URL('../delegate-run.js', import.meta.url));
 
@@ -416,7 +419,9 @@ async function recordEnd(context, outcome) {
     if (outcome.limitHit) changes.limit_hit = outcome.limitHit;
     if (context.killAbandoned) summary += ` The worker (pid ${context.workerPid}) may still be running.`;
     if (outcome.denied && outcome.denied.length > 0) changes.denied = outcome.denied;
+    if (outcome.refusedPaths && outcome.refusedPaths.length > 0) changes.refused_paths = outcome.refusedPaths;
     // agy's own error text: scrubbed and capped like a failure summary.
+    if (context.copyBackWarning) addWarning(context.copyBackWarning);
     if (outcome.warning) addWarning(oneLine(scrubPii(context.redact(outcome.warning)), FAILURE_SUMMARY_MAX_CHARS));
     if (outcome.finalMessage) {
       try {
@@ -482,6 +487,19 @@ function recordLearnedLimits(context, outcome) {
   }
 }
 
+// The stderr line that says Codex's sandbox failed to start its child, or null.
+function launchFailureLine(stderrText) {
+  for (const line of String(stderrText).split(/\r?\n/)) {
+    if (line.includes('windows sandbox failed:')) return line.trim();
+  }
+  return null;
+}
+
+// The parts of a run's outcome that come straight from its parsed stream.
+function parsedOutcome(parsed) {
+  return { session: parsed.session, denied: parsed.denied, refusedPaths: parsed.refusedPaths, finalMessage: parsed.finalMessage };
+}
+
 // What a worker that ran to its end left: the state, from the parse first and
 // the exit code second.
 function outcomeOfRun(context, exit, parsed, rolloutLimits) {
@@ -500,11 +518,21 @@ function outcomeOfRun(context, exit, parsed, rolloutLimits) {
     const what = hitKindOf(limitHit.kind).pausedPhrase;
     const resets = typeof limitHit.resets_at === 'number' ? ` (resets ${new Date(limitHit.resets_at).toISOString()})` : '';
     return {
-      session: parsed.session, limit, denied: parsed.denied, finalMessage: parsed.finalMessage,
+      ...parsedOutcome(parsed), limit,
       state: 'paused-limit', summary: `Paused: ${task.worker} ${what}${resets}.`
     };
   }
-  const base = { session: parsed.session, limit: windows, denied: parsed.denied, finalMessage: parsed.finalMessage, limitHit: rolloutLimits.limitHit, warning: parsed.warning ?? null };
+  // Codex's sandbox could not start pi: nothing of pi's ran. The task fails; it is never run again without the sandbox.
+  if (context.sandboxed && !context.piEmitted && exit.code !== 0) {
+    const sandboxLine = launchFailureLine(context.stderrTail);
+    if (sandboxLine !== null) {
+      return {
+        ...parsedOutcome(parsed), limit: windows,
+        state: 'failed', summary: `Failed: Codex's sandbox could not start pi: ${oneLine(scrubPii(context.redact(sandboxLine)), STDERR_SUMMARY_CHARS)}`
+      };
+    }
+  }
+  const base = { ...parsedOutcome(parsed), limit: windows, limitHit: rolloutLimits.limitHit, warning: parsed.warning ?? null };
   if (parsed.error !== null) {
     // An agy run that exited 0 with no summary, only refused commands: recordEnd settles it once the copy is looked at.
     const onlyRefused = parsed.refusedOnly === true && exit.code === 0 && parsed.finalMessage === null;
@@ -539,11 +567,15 @@ function childEnvironment(command, key) {
 
 // Throws when the worker's program lies inside one of the task's folders.
 export function refuseProgramInsideProject(program, name, folders) {
+  if (isInsideAnyFolder(program, folders)) throw new Error(missingMessage(name, program));
+}
+
+// Whether the program lies inside any of the folders (entries that are not folder paths are skipped).
+function isInsideAnyFolder(program, folders) {
   for (const folder of folders) {
-    if (typeof folder === 'string' && folder !== '' && isInsideFolder(program, folder)) {
-      throw new Error(missingMessage(name, program));
-    }
+    if (typeof folder === 'string' && folder !== '' && isInsideFolder(program, folder)) return true;
   }
+  return false;
 }
 
 // Spawns the worker as spawn-cli.js does. CONSULT_DELEGATE_TEST_BIN (the
@@ -553,16 +585,23 @@ function spawnWorker(task, command, environment) {
   const testBin = process.env.CONSULT_DELEGATE_TEST_BIN;
   let program;
   let args;
+  // A sandboxed pi: Codex's sandbox command comes first, then node on pi's launcher, then pi's own arguments.
+  const workerArgs = command.wrapper ? [...command.wrapper.args, ...command.args] : command.args;
   if (testBin) {
     const isScript = /\.[cm]?js$/i.test(testBin);
     program = isScript ? process.execPath : testBin;
-    args = isScript ? [testBin, ...command.args] : command.args;
+    args = isScript ? [testBin, ...workerArgs] : workerArgs;
+  } else if (command.wrapper) {
+    program = command.wrapper.program;
+    refuseProgramInsideProject(program, 'codex', [task.project, task.worktree]);
+    refuseProgramInsideProject(command.wrapper.launcherPath, 'pi', [task.project, task.worktree]);
+    args = workerArgs;
   } else {
     program = ensureCmd(CLI_NAMES[task.worker]);
     // resolveCmd filtered against this process's cwd (the task folder); the
     // project and its copy are what a planted CLI would sit in.
     refuseProgramInsideProject(program, CLI_NAMES[task.worker], [task.project, task.worktree]);
-    args = command.args;
+    args = workerArgs;
   }
   return spawn(spawnableCmd(program), shellSafeArgs(args), {
     ...SPAWN_OPTS,
@@ -572,6 +611,96 @@ function spawnWorker(task, command, environment) {
     windowsHide: true,
     detached: process.platform !== 'win32'
   });
+}
+
+// A failed copy of pi's sessions goes to stderr.log and, through recordEnd, to the task's warning.
+function noteCopyBack(context, copyBackError) {
+  if (copyBackError === null) return;
+  context.copyBackWarning = `pi's session files could not be copied back: ${copyBackError}`;
+  try { context.io.appendFile(path.join(context.folder, 'stderr.log'), `consult: ${copyBackError}\n`); } catch (_) { /* the log is a courtesy */ }
+}
+
+// '<old> → <new>' when a task's fence layer differs from its previous run's, else null.
+function layerChange(previousLayer, layer) {
+  if (typeof previousLayer !== 'string' || typeof layer !== 'string' || previousLayer === layer) return null;
+  return `${previousLayer} → ${layer}`;
+}
+
+const INSIDE_PROJECT_REASON = 'a codex or pi program inside the project was refused';
+const CONSULT_FILES_REASON = "the work folder holds consult's own files";
+
+// The pure, synchronous checks that decide a fenced pi cannot have the sandbox: a reason string, or null
+// when none of them rules it out. `codex` and `pi` are lookups ({ path, found }), `launcherPath` is pi's
+// launcher or null. The folders are the work folder and the task's other folders (its project, its copy);
+// no codex or pi inside any of them is run. skipFolderChecks leaves out the two checks on the work folder
+// itself (broad, holds consult's files): the tab sets it when the project's write tasks run in a copy, which
+// is never broad and never holds consult's files. The tab uses the same checks (hooks/scripts/delegate.js).
+export function piGuardReason({ codex, pi, launcherPath, workFolder, protectedFolders = [], skipFolderChecks = false }) {
+  const guardedFolders = [workFolder, ...protectedFolders];
+  if (!codex.found) return 'Codex is not installed';
+  // A repository can ship its own codex or pi; none inside the project is ever run.
+  if (isInsideAnyFolder(codex.path, guardedFolders)) return INSIDE_PROJECT_REASON;
+  if (!skipFolderChecks && isBroadWorkFolder(workFolder)) return "the work folder is your home folder or a drive root, which Codex's sandbox must not be given";
+  if (!skipFolderChecks && holdsConsultFiles(workFolder)) return CONSULT_FILES_REASON;
+  if (pi.found && isInsideAnyFolder(pi.path, guardedFolders)) return INSIDE_PROJECT_REASON;
+  if (launcherPath === null) return "pi's launcher was not found next to pi.cmd";
+  return null;
+}
+
+// The lookups and piGuardReason, before any sandbox check: { reason } when they rule the sandbox out,
+// else { codexPath, launcherPath }. (options.findCodex, findPi and findLauncher are for tests.)
+function piLayerPrechecks(options, workFolder, protectedFolders, skipFolderChecks) {
+  // findCodexForFence honours CONSULT_DELEGATE_TEST_NO_CODEX, so no test ever reaches a real Codex.
+  const codex = (options.findCodex ?? findCodexForFence)();
+  const pi = (options.findPi ?? (() => resolveCmd('pi')))();
+  const launcherPath = pi.found ? (options.findLauncher ?? piLauncherFor)(pi.path) : null;
+  const reason = piGuardReason({ codex, pi, launcherPath, workFolder, protectedFolders, skipFolderChecks });
+  if (reason !== null) return { reason };
+  return { codexPath: codex.path, launcherPath };
+}
+
+// The layer a sandbox check's verdict gives, once the pre-checks passed.
+function layerOfCheck(check, prechecked) {
+  if (!check.ok) return { kind: 'guard', reason: `the sandbox check failed: ${check.failed}` };
+  return { kind: 'sandbox', codexPath: prechecked.codexPath, launcherPath: prechecked.launcherPath };
+}
+
+// Which mechanism fences a fenced pi run: Codex's sandbox when Codex is
+// installed, pi's launcher is beside pi.cmd and the sandbox check passes;
+// otherwise consult's guard alone, with the reason. Never throws. Only the supervisor
+// calls this, so it is the only place that probes. (options.sandboxCheck is for tests.)
+// The work folder becomes the sandbox's one write root, so a broad one (home, a parent of it, a drive root) gets the guard only,
+// and so does one that holds consult's own files (Ruling 15): the guard then refuses writes to those files too.
+// protectedFolders: the task's other folders (its project, its copy); no codex or pi inside any of them, nor the work folder, is run.
+export async function choosePiLayer(options, workFolder, protectedFolders = []) {
+  const prechecked = piLayerPrechecks(options, workFolder, protectedFolders, false);
+  if (prechecked.reason !== undefined) return { kind: 'guard', reason: prechecked.reason };
+  let check;
+  try {
+    check = await (options.sandboxCheck ?? sandboxCheck)({ codexPath: prechecked.codexPath });
+  } catch (error) {
+    return { kind: 'guard', reason: `the sandbox check failed: ${oneLine(error.message, 200)}` };
+  }
+  return layerOfCheck(check, prechecked);
+}
+
+// The layer known without probing, for delegate's start reply and the Delegated tab: the same pre-checks,
+// then the sandbox check's cache only. No cached verdict gives { kind: null }: pending, and the supervisor
+// checks as the task starts. (options.readCodexVersion is for tests and the tab; see readCachedSandboxCheck.)
+export async function cachedPiLayer(options, workFolder, protectedFolders = [], { skipFolderChecks = false } = {}) {
+  const prechecked = piLayerPrechecks(options, workFolder, protectedFolders, skipFolderChecks);
+  if (prechecked.reason !== undefined) return { kind: 'guard', reason: prechecked.reason };
+  const cached = await readCachedSandboxCheck(prechecked.codexPath, { readVersion: options.readCodexVersion });
+  if (cached === null) return { kind: null };
+  return layerOfCheck(cached, prechecked);
+}
+
+// Whether any output line is a JSON object, which only pi writes: a sandboxed run that printed one got as far as pi.
+function hasJsonObjectLine(lines) {
+  for (const line of lines) {
+    if (String(line).trimStart().startsWith('{')) return true;
+  }
+  return false;
 }
 
 // Runs the worker to its end (or its stop) and returns how it ended.
@@ -605,8 +734,9 @@ async function runWorker(context, command, childEnvironmentValues) {
   // what a follow-up resumes.
   io.updateTask(task.id, {
     state: 'running', started_at: context.startedAt, ended_at: null, stop_reason: null, supervisor_pid: process.pid,
-    supervisor_beat_at: context.startedAt, worker_pid: child.pid, worker_real_pid: null, log_path: logPath, fenced: command.fenced,
-    followup: null, summary: null, final_path: null, end_commit: null, limit: null, limit_hit: null, denied: null,
+    supervisor_beat_at: context.startedAt, worker_pid: child.pid, worker_real_pid: null, log_path: logPath, fenced: command.fenced, fence_layer: command.fenceLayer,
+    fence_layer_reason: command.fenceReason ?? null, fence_layer_changed: layerChange(task.fence_layer, command.fenceLayer),
+    followup: null, summary: null, final_path: null, end_commit: null, limit: null, limit_hit: null, denied: null, refused_paths: null,
     warning: command.warning ?? null, read_only_edits: null,
     ...(task.model === null && command.model ? { model: command.model } : {})
   });
@@ -791,7 +921,7 @@ export async function runSupervisor(taskId, options = {}) {
     taskId, task: null, folder: taskFolder(taskId), child: null, ended: false, stop: null, signalStop: null,
     startedAt: null, lastOutputAt: null, openSteps: new Set(), stderrTail: '', recordingProblem: null, secrets: [],
     workerPid: null, workerRealPid: null, spawnedAtWall: null, killAbandoned: false, requestStop: null,
-    sawOutput: false, realWorkerSearched: false, preRunBeat: null, readOnlyEdits: [], survivorWarning: null,
+    sawOutput: false, sandboxed: false, piEmitted: false, copyBackWarning: null, realWorkerSearched: false, preRunBeat: null, readOnlyEdits: [], survivorWarning: null,
     timeLimitMs: DEFAULT_TIME_LIMIT_MS,
     now: options.now ?? Date.now,
     io: { updateTask, appendFile: fs.appendFileSync, removeFile: (file) => fs.rmSync(file, { force: true }), killTree, rolloutLimits: codexRolloutLimits, recordLimit, recordLimitHit, ...options.io },
@@ -944,31 +1074,77 @@ async function superviseTask(context, options) {
   if (workFolder !== null) fs.mkdirSync(workFolder, { recursive: true });
   // A follow-up continues the worker's session with its text.
   const isFollowUp = typeof task.followup === 'string' && task.followup !== '';
-  const command = workerCommand(workFolder === null ? task : { ...task, worktree: workFolder }, {
-    settings, runner, inventory, resume: isFollowUp, followUp: isFollowUp ? task.followup : null
-  });
-  if (command.briefFile !== null) {
-    fs.mkdirSync(path.dirname(command.briefFile.path), { recursive: true });
-    fs.writeFileSync(command.briefFile.path, command.briefFile.text);
+  // A fenced pi run: pick the layer, then stage the sessions in a temp folder.
+  // They are copied back in the finally below, whatever happens to the run.
+  // The fence is decided here, once: workerCommand is handed it, so a project setting changed while the
+  // sandbox check runs cannot make the command and the session copying disagree.
+  // A temp copy an earlier run left behind is newer than <taskDir>/pi-sessions: it is copied back first.
+  // If that fails, a fenced run continues on it and a lifted run (which reads <taskDir>) stops.
+  let piLayer = null;
+  let sessionsStaged = false;
+  let fence;
+  if (task.worker === 'local') {
+    fence = narrowerFence('local', taskFence(task), projectSettings(task.project).fence.local);
+    const copyBack = options.returnPiSessions ?? returnPiSessions;
+    if (fence === 'fenced') {
+      const chosen = await choosePiLayer(options, workFolder ?? task.worktree ?? task.project, [task.worktree, task.project]);
+      const leftoverError = hasLeftoverPiSessions(task.id) ? copyBack(context.folder, task.id) : null;
+      noteCopyBack(context, leftoverError);
+      const temp = leftoverError === null ? stagePiSessions(context.folder, task.id) : makePiTempFolders(task.id);
+      sessionsStaged = true;
+      piLayer = { ...chosen, temp };
+    } else if (hasLeftoverPiSessions(task.id)) {
+      const leftoverError = copyBack(context.folder, task.id);
+      if (leftoverError !== null) {
+        await recordEnd(context, {
+          state: 'failed',
+          summary: `Failed: pi's session files from the last run could not be copied back (${leftoverError}). Nothing was run, so try again.`
+        });
+        return;
+      }
+      // Gone once it is back, so it can never be copied over a newer <taskDir>/pi-sessions later.
+      removePiTemp(task.id);
+    }
   }
-
-  // A worker that cannot be started (the tool is missing, an argument cannot be
-  // passed safely) throws here, and ends in the catch of runSupervisor.
-  // agy cannot be fenced: a read task is checked for files it changed anyway.
-  const checksReadOnly = task.worker === 'agy' && task.mode === 'read';
-  const folderBefore = checksReadOnly ? await watchFolder(command.cwd) : null;
-  const run = await runWorker(context, command, childEnvironment(command, key));
-  if (checksReadOnly) context.readOnlyEdits = diffWatch(folderBefore, await watchFolder(command.cwd)) ?? [];
-
-  const parsed = parseWorkerStream(task.worker, run.lines, { stderr: context.stderrTail });
+  let run;
+  let command;
+  let parsed;
   let rolloutLimits = { limit: null, limitHit: null };
-  if (task.worker === 'codex' && parsed.session !== null) {
-    rolloutLimits = context.io.rolloutLimits(parsed.session, { codexHome: options.codexHome });
+  try {
+    command = workerCommand(workFolder === null ? task : { ...task, worktree: workFolder }, {
+      settings, runner, inventory, resume: isFollowUp, followUp: isFollowUp ? task.followup : null, piLayer, fence
+    });
+    if (command.briefFile !== null) {
+      fs.mkdirSync(path.dirname(command.briefFile.path), { recursive: true });
+      fs.writeFileSync(command.briefFile.path, command.briefFile.text);
+    }
+    for (const file of command.files) {
+      fs.mkdirSync(path.dirname(file.path), { recursive: true });
+      fs.writeFileSync(file.path, file.text);
+    }
+
+    // A worker that cannot be started (the tool is missing, an argument cannot be
+    // passed safely) throws here, and ends in the catch of runSupervisor.
+    // An agy read task is also checked for files it changed: its fence holds writes made through its
+    // tools, and this catches any that got through another way.
+    const checksReadOnly = task.worker === 'agy' && task.mode === 'read';
+    const folderBefore = checksReadOnly ? await watchFolder(command.cwd) : null;
+    context.sandboxed = command.wrapper !== undefined;
+    run = await runWorker(context, command, childEnvironment(command, key));
+    context.piEmitted = context.sandboxed && hasJsonObjectLine(run.lines);
+    if (checksReadOnly) context.readOnlyEdits = diffWatch(folderBefore, await watchFolder(command.cwd)) ?? [];
+
+    parsed = parseWorkerStream(task.worker, run.lines, { stderr: context.stderrTail, workFolder: command.fenced ? command.cwd : null });
+    if (task.worker === 'codex' && parsed.session !== null) {
+      rolloutLimits = context.io.rolloutLimits(parsed.session, { codexHome: options.codexHome });
+    }
+  } finally {
+    if (sessionsStaged) noteCopyBack(context, (options.returnPiSessions ?? returnPiSessions)(context.folder, task.id));
   }
   if (context.stop !== null) {
     await recordEnd(context, {
       state: context.stop.state, stopReason: context.stop.stopReason, summary: context.stop.summary,
-      session: parsed.session, limit: rolloutLimits.limit ?? undefined, denied: parsed.denied, finalMessage: parsed.finalMessage
+      ...parsedOutcome(parsed), limit: rolloutLimits.limit ?? undefined
     });
     return;
   }

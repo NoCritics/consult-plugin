@@ -12,7 +12,14 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { randomBytes, randomUUID } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 import { DELEGATE_WORKERS } from './settings.js';
+import { removePiTemp, checkFilePath } from './delegate-fence.js';
+import { realPathOfTarget, isInside } from './pi-fence.js';
+import { isTaskId, sleepSync, lockLostError, writeFileAtomic, writeJsonAtomic, readJsonOrNull } from './json-file.js';
+
+// The file helpers live in json-file.js (the fence needs them too); callers keep importing them from here.
+export { isTaskId, writeJsonAtomic, readJsonOrNull };
 
 const TASK_STATES = Object.freeze([
   'queued', 'running', 'done', 'merged', 'conflict', 'held', 'paused-limit', 'stopped', 'cancelled', 'failed'
@@ -25,7 +32,6 @@ const TASK_MODES = ['read', 'write'];
 const TASK_LOCATIONS = ['here', 'copy'];
 const WORKERS_EDIT_VALUES = ['auto', 'here', 'copy'];
 const GIT_ANSWERS = ['ask', 'declined'];
-const TASK_ID_PATTERN = /^[0-9a-f]{6}$/;
 const INSTANCE_ID_PATTERN = /^[A-Za-z0-9._-]+$/;
 const SESSION_ID_PATTERN = /^[A-Za-z0-9._-]{1,128}$/;
 export const MAX_INDEX_ROWS = 200;
@@ -44,32 +50,37 @@ const BREAKER_STALE_MS = 30000;
 const LOCK_RETRY_MS = 5;
 const LOCK_READ_PATIENCE_MS = 1000;
 const LOCK_ASYNC_RETRY_MS = 20;
-const RENAME_PATIENCE_MS = 5000;
-const RENAME_RETRY_MS = 5;
 
 const INDEX_FIELDS = [
-  'id', 'worker', 'model', 'title', 'project', 'state', 'location', 'mode', 'summary', 'fenced', 'fence',
+  'id', 'worker', 'model', 'title', 'project', 'state', 'location', 'mode', 'summary', 'fenced', 'fence', 'fence_layer',
   'started_at', 'ended_at', 'stop_reason', 'limit', 'queue_model', 'owner_instance', 'reported_at',
   'queue_waiting_long', 'keep_running', 'hold', 'owner_session', 'created_at', 'queued_at', 'read_only_edits', 'time_limit_ms'
 ];
 
 // What each worker's tasks may do beyond the folder they work in. Codex is
-// `fenced` (an enforced sandbox) or `full`; agy and local are `soft` (a rule in
-// the brief) or `none`.
-export const FENCE_VALUES = Object.freeze({ codex: ['fenced', 'full'], agy: ['soft', 'none'], local: ['soft', 'none'] });
-export const DEFAULT_FENCE = Object.freeze({ codex: 'fenced', agy: 'soft', local: 'soft' });
+// `fenced` (an enforced fence) or `full`; agy and local are `fenced` or `none`.
+// A stored `soft` (0.16.0) reads as `fenced`.
+export const FENCE_VALUES = Object.freeze({ codex: ['fenced', 'full'], agy: ['fenced', 'none'], local: ['fenced', 'none'] });
+export const DEFAULT_FENCE = Object.freeze({ codex: 'fenced', agy: 'fenced', local: 'fenced' });
+
+// A fence value as the worker reads it: a valid value as is, `soft` as `fenced`,
+// anything else as the worker's default (`fenced` for an unknown worker).
+export function normalFence(worker, value) {
+  if (!Object.hasOwn(FENCE_VALUES, worker)) return 'fenced';
+  if (FENCE_VALUES[worker].includes(value)) return value;
+  if (value === 'soft') return 'fenced';
+  return DEFAULT_FENCE[worker];
+}
 
 // The task's own fence when it is valid for its worker, else the worker's
 // default (a task from before fences has none). A state.json an unfenced worker
 // rewrote may name any worker: an unknown one reads as fenced.
 export function taskFence(task) {
-  if (!Object.hasOwn(FENCE_VALUES, task.worker)) return 'fenced';
-  if (FENCE_VALUES[task.worker].includes(task.fence)) return task.fence;
-  return DEFAULT_FENCE[task.worker];
+  return normalFence(task.worker, task.fence);
 }
 
 // The more restrictive of two fences for one worker: the first value in
-// FENCE_VALUES (`fenced` or `soft`) wins over the lifted one. A worker that is
+// FENCE_VALUES (`fenced`) wins over the lifted one. A worker that is
 // not fenced can rewrite a task's state.json, so the fence stored there never
 // widens what the project's setting allows.
 export function narrowerFence(worker, first, second) {
@@ -84,57 +95,6 @@ export function dataHome(env = process.env) {
 
 export function taskFolder(id) {
   return path.join(dataHome(), 'tasks', id);
-}
-
-// ---- files ----
-
-function sleepSync(ms) {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-}
-
-// Windows refuses a rename while another process (a virus scanner, a reader)
-// has the target open. A reader looping on the file every few ms held a
-// rename off for up to 2.3 s in a trial, so retry for up to RENAME_PATIENCE_MS.
-// `stillOwned`, when given, is asked right before each rename: a writer whose
-// lock was taken over writes nothing (ELOCKLOST).
-function writeFileAtomic(filePath, text, stillOwned = null) {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  const tempPath = `${filePath}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
-  fs.writeFileSync(tempPath, text);
-  const giveUpAt = Date.now() + RENAME_PATIENCE_MS;
-  while (true) {
-    if (stillOwned !== null && !stillOwned()) {
-      fs.rmSync(tempPath, { force: true });
-      throw lockLostError();
-    }
-    try {
-      fs.renameSync(tempPath, filePath);
-      return;
-    } catch (error) {
-      const isTransient = error.code === 'EPERM' || error.code === 'EBUSY' || error.code === 'EACCES';
-      if (!isTransient || Date.now() >= giveUpAt) {
-        fs.rmSync(tempPath, { force: true });
-        throw error;
-      }
-      sleepSync(RENAME_RETRY_MS);
-    }
-  }
-}
-
-export function writeJsonAtomic(filePath, value, stillOwned = null) {
-  writeFileAtomic(filePath, JSON.stringify(value, null, 2) + '\n', stillOwned);
-}
-
-// The parsed file, or null when it does not exist.
-export function readJsonOrNull(filePath) {
-  let text;
-  try {
-    text = fs.readFileSync(filePath, 'utf8');
-  } catch (error) {
-    if (error.code === 'ENOENT') return null;
-    throw error;
-  }
-  return JSON.parse(text);
 }
 
 // ---- tasks ----
@@ -195,6 +155,7 @@ export function createTask(spec) {
     limit: null,
     fenced: null,
     fence,
+    fence_layer: null,
     hold: spec.hold ?? false,
     keep_running: spec.keep_running ?? false,
     time_limit_ms: spec.time_limit_ms ?? null,
@@ -215,13 +176,8 @@ export function unmergedBase(task) {
   return typeof task.merged_commit === 'string' && task.merged_commit !== '' ? task.merged_commit : task.start_commit;
 }
 
-// Whether this is the format of a task id (the name of its folder).
-export function isTaskId(id) {
-  return typeof id === 'string' && TASK_ID_PATTERN.test(id);
-}
-
 export function readTask(id) {
-  if (!TASK_ID_PATTERN.test(id)) return null;
+  if (!isTaskId(id)) return null;
   const state = readJsonOrNull(path.join(taskFolder(id), 'state.json'));
   // A state.json is the task of the folder it is in. One that names another id (a worker can rewrite its
   // own) is no task: it must not stand in for the one it names.
@@ -324,10 +280,6 @@ function lockStillOwned(lockPath, token) {
       sleepSync(LOCK_RETRY_MS);
     }
   }
-}
-
-function lockLostError() {
-  return Object.assign(new Error('The lock was taken over while it was held.'), { code: 'ELOCKLOST' });
 }
 
 // Runs `action(lock)` holding the task's lock: a `.lock` folder in the task
@@ -482,6 +434,7 @@ export function removeTaskWhen(id, allowed) {
     const current = readTask(id);
     if (current === null || !allowed(current)) return false;
     fs.rmSync(taskFolder(id), { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    removePiTemp(id);
     return true;
   });
   if (removed) rewriteIndex();
@@ -703,6 +656,58 @@ function projectsFile() {
   return process.env.CONSULT_PROJECTS_FILE || path.join(os.homedir(), '.claude', 'consult-projects.json');
 }
 
+// ---- consult's own files (Ruling 15) ----
+
+// The folder that holds mcp/: consult's code, pi-fence.js included.
+const PLUGIN_ROOT = path.resolve(fileURLToPath(new URL('../..', import.meta.url)));
+
+// What a fenced worker must never write: the data home (tasks, their state.json,
+// the index), the projects settings file, the sandbox-check file and consult's code.
+export function consultProtectedPaths() {
+  return [dataHome(), projectsFile(), checkFilePath(), PLUGIN_ROOT];
+}
+
+// How the paths below are compared: real paths (junctions resolved, a missing tail
+// kept), case-insensitive, with no broad-folder exemption (unlike isInsideFolder).
+function realOf(folderOrFile) {
+  return realPathOfTarget(path.resolve(folderOrFile));
+}
+
+function isTaskCopy(realWorkFolder) {
+  const copiesFolder = realOf(path.join(dataHome(), 'worktrees'));
+  return isInside(realWorkFolder, copiesFolder) && !isInside(copiesFolder, realWorkFolder);
+}
+
+// The protected paths a fenced worker in `workFolder` could reach: those inside
+// it (or equal to it), and the work folder itself when it sits inside one of them
+// (a project inside consult's data or code). A task's copy, at
+// <data>/worktrees/<id>, is consult's own place for work and is not counted.
+// A path that cannot be resolved (a link loop) fails closed: the whole work folder is guarded.
+export function fenceProtectedPaths(workFolder) {
+  try {
+    const realWorkFolder = realOf(workFolder);
+    const copy = isTaskCopy(realWorkFolder);
+    const reachable = [];
+    for (const protectedPath of consultProtectedPaths()) {
+      const realProtected = realOf(protectedPath);
+      if (isInside(realProtected, realWorkFolder)) {
+        reachable.push(protectedPath);
+        continue;
+      }
+      if (!copy && isInside(realWorkFolder, realProtected) && !reachable.includes(workFolder)) reachable.push(workFolder);
+    }
+    return reachable;
+  } catch (_) {
+    return [workFolder];
+  }
+}
+
+// True when a fenced worker in `workFolder` could rewrite consult's own files:
+// pi then gets the guard only, and a fenced agy write task is refused.
+export function holdsConsultFiles(workFolder) {
+  return fenceProtectedPaths(workFolder).length > 0;
+}
+
 // The key a project is stored under: its absolute path, lower-cased on Windows
 // (paths there ignore case).
 export function projectKey(project) {
@@ -716,7 +721,7 @@ export function projectSettings(project) {
   const saved = all?.[projectKey(project)] ?? {};
   const fence = {};
   for (const worker of Object.keys(FENCE_VALUES)) {
-    fence[worker] = FENCE_VALUES[worker].includes(saved.fence?.[worker]) ? saved.fence[worker] : DEFAULT_FENCE[worker];
+    fence[worker] = normalFence(worker, saved.fence?.[worker]);
   }
   return {
     workers_edit: WORKERS_EDIT_VALUES.includes(saved.workers_edit) ? saved.workers_edit : 'auto',

@@ -114,6 +114,19 @@ function isBroadFolder(projectKey) {
   return false;
 }
 
+// True for the home folder, any parent of it and a drive root: a folder that must never become a sandbox write root.
+export function isBroadWorkFolder(folder) {
+  if (process.platform === 'win32') {
+    for (const key of windowsPathKeys(folder)) {
+      if (isBroadFolder(key)) return true;
+    }
+    return false;
+  }
+  const resolved = path.resolve(folder);
+  const home = os.homedir();
+  return resolved === path.parse(resolved).root || home === resolved || home.startsWith(resolved + path.sep);
+}
+
 // Inside the project in either spelling of either path means inside.
 function isOutsideProject(file, projectFolder) {
   if (!path.win32.isAbsolute(file)) return false;

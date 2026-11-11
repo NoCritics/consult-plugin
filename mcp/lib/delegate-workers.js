@@ -15,14 +15,16 @@ import { CMD_UNSAFE_RE } from './spawn-cli.js';
 import { prepareRunnerCall, isValidEnvName } from './local-runners.js';
 import { isLoopback, validateBaseUrl } from './local.js';
 import { parseWorkerWord } from './delegate-route.js';
-import { taskFolder, taskFence, narrowerFence, projectSettings } from './delegate-store.js';
+import { taskFolder, taskFence, narrowerFence, projectSettings, fenceProtectedPaths, holdsConsultFiles } from './delegate-store.js';
+import { realPathOfTarget, isInside } from './pi-fence.js';
 import { rateLimitsFromTail } from './delegate-limits.js';
+import { SANDBOX_ENV_POLICY_ARGS } from './delegate-fence.js';
 
 export { lastRateLimitsIn } from './delegate-limits.js';
 
 // What every worker is told before the brief. A read task is told, in words,
 // to change nothing: only codex's sandbox and pi's tool set enforce it.
-export function workerPreamble(folder, isWrite = true, worker = null, fence = null) {
+export function workerPreamble(folder, isWrite = true, worker = null, fence = null, layer = null) {
   const noCommands = worker === 'agy' ? " You can't run commands here (no git, tests or builds): check your work by reading the files." : '';
   if (fence === 'full' || fence === 'none') {
     if (!isWrite) {
@@ -35,13 +37,16 @@ export function workerPreamble(folder, isWrite = true, worker = null, fence = nu
       `Do not run git commit, push, stash, checkout or reset.${noCommands} When you finish, end with a short summary: ` +
       `what you changed (files), how you checked it, and anything left undone. List every file you changed outside ${folder} by its full path.`;
   }
+  let refusal = '';
+  if (fence === 'fenced' && (layer === 'agy' || layer === 'sandbox')) refusal = ' Writes outside this folder are refused.';
+  if (fence === 'fenced' && layer === 'guard') refusal = ' File edits outside this folder are refused.';
   if (!isWrite) {
-    return `You are working alone on a delegated task. Work only inside this folder: ${folder}. ` +
+    return `You are working alone on a delegated task. Work only inside this folder: ${folder}.${refusal} ` +
       'This is a read-only task: answer in text. Do not create, edit or delete any files, ' +
       'and do not run git commit, push, stash, checkout or reset.' + noCommands + ' When you finish, end with a short summary of your findings: ' +
       'what you looked at, what you found, and anything you could not check.';
   }
-  return `You are working alone on a delegated task. Work only inside this folder: ${folder}. ` +
+  return `You are working alone on a delegated task. Work only inside this folder: ${folder}.${refusal} ` +
     `Do not run git commit, push, stash, checkout or reset.${noCommands} When you finish, end with a short summary: ` +
     'what you changed (files), how you checked it, and anything left undone.';
 }
@@ -55,6 +60,7 @@ export const READ_ONLY_REMINDER = 'This is still a read-only task: answer in tex
 export const CONTINUE_PROMPT = 'Continue the task from where you stopped, and finish it.';
 
 const PI_PROVIDER_PATH = fileURLToPath(new URL('./pi-provider.js', import.meta.url));
+const PI_FENCE_PATH = fileURLToPath(new URL('./pi-fence.js', import.meta.url));
 const MIN_CONTEXT_TOKENS = 16384;
 
 // pi's own read-only set (createReadOnlyTools in its core/tools/index.js, and
@@ -124,13 +130,37 @@ function codexArgs({ task, isWrite, resume, fence }) {
   ];
 }
 
-function agyArgs({ task, workFolder, isWrite, resume, timeLimitMs }) {
+const AGY_SETTINGS_FILE = 'agy-settings.json';
+
+// Why a fenced agy or Codex write task cannot run in a folder that holds consult's
+// own files (Rulings 15 and 20): the worker may write anywhere in that folder, and
+// with it consult's settings and its tasks' state. Used at start, at a follow-up and here.
+function consultFolderRefusal(worker, folder) {
+  const label = worker === 'codex' ? 'Codex' : worker;
+  return `${label} can't be fenced in a folder that holds consult's own files (${folder}). Run it in a project folder, or lift ${label}'s fence for this project in the Delegated tab.`;
+}
+
+// Throws that refusal when `worker` is agy or Codex, the task writes, its fence is on and `folder`
+// holds consult's files. Each caller decides `fenced` its own way, and whether the folder is the real one.
+export function refuseInConsultFolder({ worker, isWrite, fenced, folder }) {
+  if ((worker === 'agy' || worker === 'codex') && isWrite && fenced && holdsConsultFiles(folder)) {
+    throw new Error(consultFolderRefusal(worker, folder));
+  }
+}
+
+function agyArgs({ task, workFolder, taskDir, isWrite, resume, timeLimitMs, fence }) {
   requireModelId(task.model);
   validateAgyEffort(task.effort);
   requireSpawnablePaths([{ label: 'work folder', value: workFolder }]);
   const args = ['--output-format', 'stream-json', '--disable-slash-commands', '--add-dir', workFolder];
   if (isWrite) args.push('--mode', 'accept-edits');
   args.push('--sandbox');
+  // A fenced agy trusts only its work folder: a per-task settings file says so.
+  if (fence === 'fenced') {
+    const settingsFile = path.join(taskDir, AGY_SETTINGS_FILE);
+    requireSpawnablePaths([{ label: 'agy settings file', value: settingsFile }]);
+    args.push('--settings', settingsFile);
+  }
   if (task.model) args.push('--model', task.model);
   if (task.effort) args.push('--effort', task.effort);
   if (resume) {
@@ -166,7 +196,7 @@ export function contextWarning(fact) {
 // The pi command for a local task. The runner's address and the NAME of its
 // key variable reach the pi extension (pi-provider.js) through env; the key's
 // value stays in the environment pi inherits and is never read here.
-function localCommand({ task, nickname, workFolder, taskDir, isWrite, resume, promptText, settings, runner, inventory, fenced }) {
+function localCommand({ task, nickname, workFolder, taskDir, isWrite, resume, promptText, settings, runner, inventory, fenced, fenceLayer, piLayer }) {
   if (runner === null || runner === undefined) throw new Error('A local task needs the local runner (runnerSettings(settings)).');
   if (runner.key_env && (!isValidEnvName(runner.key_env) || !isLoopback(runner.url))) {
     throw new Error(`The runner's key variable ${JSON.stringify(runner.key_env)} is not a valid name, or ${runner.url} is not on this machine; a key from the environment is only sent to this machine.`);
@@ -179,36 +209,67 @@ function localCommand({ task, nickname, workFolder, taskDir, isWrite, resume, pr
   requireModelId(prepared.model);
   if (!task.pi_session) throw new Error(`Task ${task.id} has no pi_session to run or resume.`);
   requireSessionId(task.pi_session);
-  requireSpawnablePaths([{ label: 'task folder', value: taskDir }, { label: 'pi extension', value: PI_PROVIDER_PATH }]);
+  requireSpawnablePaths([{ label: 'task folder', value: taskDir }, { label: 'pi extension', value: PI_PROVIDER_PATH }, { label: 'pi guard extension', value: PI_FENCE_PATH }]);
   const fact = factFor(inventory, prepared.model);
 
   const env = { CONSULT_PI_BASE_URL: runner.url, CONSULT_PI_MODEL: prepared.model };
   if (runner.key_env) env.CONSULT_PI_KEY_ENV = runner.key_env;
   if (typeof fact?.context === 'number') env.CONSULT_PI_CONTEXT = String(fact.context);
 
+  // A fenced task runs with consult's guard extension and, when the layer is
+  // the sandbox, inside Codex's sandbox. Its sessions live in a temp folder
+  // the supervisor copies back from; a lifted task keeps them in the task folder.
+  let sessionDir = path.join(taskDir, 'pi-sessions');
+  if (fenceLayer !== null) {
+    sessionDir = piLayer.temp.sessions;
+    env.PI_CODING_AGENT_DIR = piLayer.temp.agent;
+    // Codex's sandbox makes only the TEMP of its own process writable, so TEMP is the root
+    // that holds pi-sessions, agent and tmp: all three stay writable, the shared %TEMP% does not.
+    env.TEMP = piLayer.temp.root;
+    env.TMP = piLayer.temp.root;
+    env.GIT_OPTIONAL_LOCKS = '0';
+    env.CONSULT_FENCE_DIR = workFolder;
+    // consult's own files inside the work folder: the guard refuses writes to them too.
+    env.CONSULT_FENCE_PROTECTED = JSON.stringify(fenceProtectedPaths(workFolder));
+  }
   const briefPath = path.join(taskDir, resume ? 'followup.md' : 'prompt.md');
   const args = [
     '--mode', 'json', '-p', '--no-mcp', '--no-skills', '--no-extensions', '--no-prompt-templates', '--no-approve',
-    '-e', PI_PROVIDER_PATH, '--provider', 'consult-local', '--model', prepared.model,
-    '--session-dir', path.join(taskDir, 'pi-sessions'),
-    resume ? '--session' : '--session-id', task.pi_session
+    '-e', PI_PROVIDER_PATH
   ];
+  if (fenceLayer !== null) args.push('-e', PI_FENCE_PATH);
+  args.push(
+    '--provider', 'consult-local', '--model', prepared.model,
+    '--session-dir', sessionDir,
+    resume ? '--session' : '--session-id', task.pi_session
+  );
   // A read task gets pi's read-only tools only. A write task keeps the default
   // tools: pi has no fence, which the user accepted.
   if (!isWrite) args.push('--tools', PI_READ_ONLY_TOOLS);
   args.push(`@${briefPath}`);
-  return {
+  const command = {
     cmd: resolveCmd('pi').path, args, env, stdinText: null,
     briefFile: { path: briefPath, text: promptText },
-    cwd: workFolder, fenced, model: prepared.model, warning: contextWarning(fact)
+    files: [], fenceLayer, fenceReason: fenceLayer !== null ? (piLayer.reason ?? null) : null,
+    cwd: workFolder, fenced: fenceLayer !== null ? fenceLayer === 'sandbox' : fenced, model: prepared.model, warning: contextWarning(fact)
   };
+  if (fenceLayer === 'sandbox') {
+    requireSpawnablePaths([{ label: 'pi launcher', value: piLayer.launcherPath }]);
+    command.wrapper = {
+      program: piLayer.codexPath,
+      launcherPath: piLayer.launcherPath,
+      // The environment policy is pinned (Ruling 16), the same as for the sandbox check.
+      args: ['sandbox', '-c', 'sandbox_mode=workspace-write', ...SANDBOX_ENV_POLICY_ARGS, '--', process.execPath, piLayer.launcherPath]
+    };
+  }
+  return command;
 }
 
 // `task` is a task record (delegate-store.js). The work folder is its
 // worktree, or the project itself for a task that works in place. `brief`
 // defaults to the task's brief.md. A resume continues the worker's session
 // (worker_session, or pi_session for a local task) with `followUp`.
-export function workerCommand(task, { settings, runner = null, inventory = null, resume = false, followUp = null, brief = null }) {
+export function workerCommand(task, { settings, runner = null, inventory = null, resume = false, followUp = null, brief = null, piLayer = null, fence: givenFence = null }) {
   const word = parseWorkerWord(task.worker);
   if (word.worker === null) throw new Error(`Unknown delegate worker ${JSON.stringify(task.worker)}.`);
   const workFolder = task.worktree ?? task.project;
@@ -216,31 +277,44 @@ export function workerCommand(task, { settings, runner = null, inventory = null,
   const isWrite = task.mode === 'write';
   // The stored worker is the plain name; a local:<nickname> word still reads as local.
   // The fence used is the narrower of the task's own and the project's current one.
-  const fence = narrowerFence(word.worker, taskFence({ ...task, worker: word.worker }), projectSettings(task.project).fence[word.worker]);
+  // The supervisor decides the fence once, before it stages anything, and passes it as `fence`.
+  const fence = givenFence ?? narrowerFence(word.worker, taskFence({ ...task, worker: word.worker }), projectSettings(task.project).fence[word.worker]);
   const fenced = fence === 'fenced';
+  // Which mechanism holds the fence: agy's trusted-workspace settings. (Codex and local layers come with their own tasks.)
+  if (word.worker === 'local' && fenced && piLayer === null) throw new Error('A fenced local task needs piLayer (the sandbox or the guard, with its temp folders).');
+  let fenceLayer = null;
+  if (word.worker === 'agy' && fenced) fenceLayer = 'agy';
+  if (word.worker === 'local' && fenced) fenceLayer = piLayer.kind;
   let promptText;
   if (resume) {
     promptText = followUp ?? CONTINUE_PROMPT;
     if (!isWrite) promptText = `${READ_ONLY_REMINDER}\n\n${promptText}`;
   } else {
-    promptText = `${workerPreamble(workFolder, isWrite, word.worker, fence)}\n\n${brief ?? fs.readFileSync(path.join(taskDir, 'brief.md'), 'utf8')}`;
+    promptText = `${workerPreamble(workFolder, isWrite, word.worker, fence, fenceLayer)}\n\n${brief ?? fs.readFileSync(path.join(taskDir, 'brief.md'), 'utf8')}`;
   }
 
   if (word.worker === 'local') {
-    return localCommand({ task, nickname: word.nickname, workFolder, taskDir, isWrite, resume, promptText, settings, runner, inventory, fenced });
+    return localCommand({ task, nickname: word.nickname, workFolder, taskDir, isWrite, resume, promptText, settings, runner, inventory, fenced, fenceLayer, piLayer });
   }
   let cmd;
   let args;
+  const files = [];
   if (word.worker === 'codex') {
+    // The last stop before a fenced Codex write task gets a folder holding consult's files as its write root (Ruling 20).
+    refuseInConsultFolder({ worker: 'codex', isWrite, fenced, folder: workFolder });
     cmd = resolveCmd('codex').path;
     args = codexArgs({ task, isWrite, resume, fence });
   } else {
     const timeLimitMs = task.time_limit_ms ?? settings?.delegate?.time_limit_ms;
+    // The last stop before agy would trust a folder holding consult's files (delegate and delegate_send refuse earlier).
+    refuseInConsultFolder({ worker: 'agy', isWrite, fenced, folder: workFolder });
     cmd = resolveCmd('agy').path;
-    args = agyArgs({ task, workFolder, isWrite, resume, timeLimitMs });
+    args = agyArgs({ task, workFolder, taskDir, isWrite, resume, timeLimitMs, fence });
+    // A read task can write nowhere, so it trusts no folder. agy 1.5.3 was checked live (2026-11-08) to still read its --add-dir folder with an empty list.
+    if (fenced) files.push({ path: path.join(taskDir, AGY_SETTINGS_FILE), text: JSON.stringify({ trustedWorkspaces: isWrite ? [workFolder] : [] }) });
   }
   return {
-    cmd, args, env: {},
+    cmd, args, env: {}, files, fenceLayer,
     stdinText: promptText, briefFile: null, cwd: workFolder, fenced, model: task.model ?? null, warning: null
   };
 }
@@ -317,8 +391,66 @@ export function deniedNames(denied) {
   return names;
 }
 
-function parseAgyStream(events, stderr) {
-  const result = { finalMessage: null, session: null, limit: null, limitHit: null, error: null, warning: null, denied: [], complete: false, refusedOnly: false };
+const AGY_WRITE_ACTIONS = ['write_file', 'edit_file'];
+const AUTO_DENIED_PATTERN = /auto-denied/i;
+
+// True when the run says a write was refused: the result's denied_actions names
+// write_file or edit_file, or stderr has agy's "auto-denied" line.
+function writeWasDenied(events, stderr) {
+  if (typeof stderr === 'string' && AUTO_DENIED_PATTERN.test(stderr)) return true;
+  for (const event of events) {
+    if (event?.event !== 'result' || !Array.isArray(event.result?.denied_actions)) continue;
+    for (const entry of event.result.denied_actions) {
+      if (entry !== null && typeof entry === 'object' && AGY_WRITE_ACTIONS.includes(entry.action)) return true;
+    }
+  }
+  return false;
+}
+
+// The paths of the write_file/edit_file steps that point outside the work
+// folder, once each, in order, in full (a relative path is resolved against the
+// work folder). With the fence on, agy refuses these writes but still emits the
+// step: nothing in the step marks it refused, so a path is reported only when the
+// run also says a write was denied (writeWasDenied). Compared strictly, by real
+// path and ignoring case, with no broad-folder exemption.
+export function refusedOutside(events, workFolder, stderr = '') {
+  const paths = [];
+  if (!writeWasDenied(events, stderr)) return paths;
+  let realWorkFolder;
+  try {
+    realWorkFolder = realPathOfTarget(path.resolve(workFolder));
+  } catch (_) {
+    // A work folder that cannot be resolved (a link loop) is compared as written.
+    realWorkFolder = path.resolve(workFolder);
+  }
+  for (const event of events) {
+    const step = event?.event === 'step_update' ? event.step_update : null;
+    if (step === null || typeof step !== 'object') continue;
+    const toolName = step.tool_info?.name ?? step.tool_name;
+    if (toolName !== 'write_file' && toolName !== 'edit_file') continue;
+    const parameters = step.tool_info?.parameters;
+    if (parameters === null || typeof parameters !== 'object') continue;
+    let target = null;
+    for (const key of ['Path', 'TargetFile', 'AbsolutePath']) {
+      if (typeof parameters[key] === 'string' && parameters[key] !== '') {
+        target = parameters[key];
+        break;
+      }
+    }
+    if (target === null) continue;
+    const resolvedTarget = path.resolve(workFolder, target);
+    let inside = false;
+    try {
+      inside = isInside(realPathOfTarget(resolvedTarget), realWorkFolder);
+    } catch (_) { /* a path that cannot be resolved (a link loop) counts as outside */ }
+    if (inside || paths.includes(resolvedTarget)) continue;
+    paths.push(resolvedTarget);
+  }
+  return paths;
+}
+
+function parseAgyStream(events, { stderr = '', workFolder = null } = {}) {
+  const result = { finalMessage: null, session: null, limit: null, limitHit: null, error: null, warning: null, denied: [], complete: false, refusedOnly: false, refusedPaths: [] };
   let envelope = null;
   let lastStep = null;
   for (const event of events) {
@@ -326,6 +458,7 @@ function parseAgyStream(events, stderr) {
     if (event.event === 'step_update' && event.step_update && typeof event.step_update === 'object') lastStep = event.step_update;
     if (event.event === 'result' && event.result && typeof event.result === 'object') envelope = event.result;
   }
+  if (workFolder !== null) result.refusedPaths = refusedOutside(events, workFolder, stderr);
   const failures = [];
   let refusal = null;
   if (envelope !== null) {
@@ -414,15 +547,17 @@ function parsePiStream(events) {
 
 // `lines` are the worker's stdout lines (an array, or the text). Unknown events
 // are skipped. `stderr` matters for agy only (its quota error is a stderr line).
-// Returns { finalMessage, session, limit, limitHit, error, denied, complete };
+// Returns { finalMessage, session, limit, limitHit, error, denied, complete }, and for
+// agy also { warning, refusedOnly, refusedPaths }: refusedPaths are the writes outside
+// `workFolder` its fence refused (refusedOutside; empty without a workFolder).
 // limitHit is null or { kind: 'exhausted' | 'throttled', resets_at }. `complete`
 // is true only when the worker's terminal event was seen (codex: turn.completed
 // or turn.failed; agy: the result line; pi: agent_settled, or a last agent_end
 // that will not retry), so a stream cut short reads as incomplete.
-export function parseWorkerStream(worker, lines, { stderr = '' } = {}) {
+export function parseWorkerStream(worker, lines, { stderr = '', workFolder = null } = {}) {
   const events = parseJsonLines(lines);
   if (worker === 'codex') return parseCodexStream(events);
-  if (worker === 'agy') return parseAgyStream(events, stderr);
+  if (worker === 'agy') return parseAgyStream(events, { stderr, workFolder });
   if (worker === 'local') return parsePiStream(events);
   throw new Error(`Unknown delegate worker ${JSON.stringify(worker)}.`);
 }
