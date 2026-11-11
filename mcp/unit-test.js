@@ -2751,6 +2751,12 @@ if (SPAWN_OPTS.shell) {
 
     // sandboxCheck with a fake run
     const allTrue = JSON.stringify({ cwdWritable: true, homeRefused: true, internetRefused: true, loopbackOpen: true, childHomeRefused: true });
+    // The cache keys Codex by its real long path, case-folded on Windows, however the caller spells it.
+    function sandboxCacheKey(codexPath, version) {
+      let real = codexPath;
+      try { real = fs.realpathSync.native(codexPath); } catch (_) { /* a path that does not exist keys as written */ }
+      return (process.platform === 'win32' ? real.toLowerCase() : real) + '|' + version;
+    }
     function fakeRun(version, probeJson, counter) {
       return async (command, args) => {
         if (args.includes('--version')) return { code: 0, stdout: version + '\n', stderr: '', timedOut: false };
@@ -2762,11 +2768,27 @@ if (SPAWN_OPTS.shell) {
     eq('check: second call is cached', (await sandboxCheck({ codexPath: 'C:\\c\\codex.exe', run: fakeRun('codex-cli 0.167.0', allTrue) })).cached, true);
     eq('check: another version checks again', (await sandboxCheck({ codexPath: 'C:\\c\\codex.exe', run: fakeRun('codex-cli 0.168.0', allTrue) })).cached, false);
     eq('check: the old version stays cached', readSandboxCheck('C:\\c\\codex.exe', 'codex-cli 0.167.0'), { ok: true, failed: null });
+    // The server, the supervisor and the tab can find one Codex file through different spellings of its path.
+    if (process.platform === 'win32') {
+      const spellingFolder = fs.mkdtempSync(path.join(os.tmpdir(), 'consult-long-folder-name-'));
+      try {
+        const longPath = path.join(spellingFolder, 'codex.exe');
+        fs.writeFileSync(longPath, '');
+        const shortFolder = execFileSync('cmd.exe', ['/d', '/s', '/c', `"for %I in ("${spellingFolder}") do @echo %~sI"`], { encoding: 'utf8', windowsVerbatimArguments: true }).trim();
+        const shortPath = path.join(shortFolder, 'codex.exe');
+        eq('check: the test really has two spellings of one file', [shortPath.toLowerCase() !== longPath.toLowerCase(), fs.existsSync(shortPath)], [true, true]);
+        await sandboxCheck({ codexPath: shortPath, run: fakeRun('codex-cli 0.167.0', allTrue) });
+        eq('check: a verdict cached under the 8.3 short spelling is found under the long one', readSandboxCheck(longPath, 'codex-cli 0.167.0'), { ok: true, failed: null });
+        eq('check: and under a different letter case', readSandboxCheck(longPath.toUpperCase(), 'codex-cli 0.167.0'), { ok: true, failed: null });
+      } finally {
+        fs.rmSync(spellingFolder, { recursive: true, force: true });
+      }
+    }
     // A failed entry is trusted for an hour; a pass for the same Codex version never expires.
     {
       const clockNow = Date.parse('2026-11-08T12:00:00Z');
       const minutesAgo = (minutes) => new Date(clockNow - minutes * 60 * 1000).toISOString();
-      const cacheKeyFor = (codexPath) => codexPath + '|codex-cli 0.167.0';
+      const cacheKeyFor = (codexPath) => sandboxCacheKey(codexPath, 'codex-cli 0.167.0');
       fs.writeFileSync(process.env.CONSULT_SANDBOX_CHECK_FILE, JSON.stringify({
         [cacheKeyFor('C:\\ttl\\fresh.exe')]: { ok: false, failed: 'homeRefused', checkedAt: minutesAgo(59) },
         [cacheKeyFor('C:\\ttl\\stale.exe')]: { ok: false, failed: 'homeRefused', checkedAt: minutesAgo(61) },
@@ -2800,13 +2822,13 @@ if (SPAWN_OPTS.shell) {
       eq('cached: an .exe whose stamp matches is found by the file alone, and Codex is not run',
         [await readCachedSandboxCheck(stampedCodex, { readVersion: exeSpy.read, now: () => stampedNow }), exeSpy.calls],
         [stampTrusted ? { ok: true, failed: null } : null, stampTrusted ? 0 : 1]);
-      const writtenEntry = JSON.parse(fs.readFileSync(process.env.CONSULT_SANDBOX_CHECK_FILE, 'utf8'))[stampedCodex + '|codex-cli 0.167.0'];
+      const writtenEntry = JSON.parse(fs.readFileSync(process.env.CONSULT_SANDBOX_CHECK_FILE, 'utf8'))[sandboxCacheKey(stampedCodex, 'codex-cli 0.167.0')];
       eq('cached: the entry carries the file mtime and size', [writtenEntry.mtimeMs, writtenEntry.size], [fs.statSync(stampedCodex).mtimeMs, fs.statSync(stampedCodex).size]);
       // A .cmd shim stays the same when Codex updates, so its stamp is not trusted: Codex is asked its version.
       const stampedShim = path.join(fenceScratch, 'stamped-codex.cmd');
       fs.writeFileSync(stampedShim, '@echo off\r\n');
       await sandboxCheck({ codexPath: stampedShim, run: fakeRun('codex-cli 0.167.0', allTrue), now: () => stampedNow });
-      const shimEntry = JSON.parse(fs.readFileSync(process.env.CONSULT_SANDBOX_CHECK_FILE, 'utf8'))[stampedShim + '|codex-cli 0.167.0'];
+      const shimEntry = JSON.parse(fs.readFileSync(process.env.CONSULT_SANDBOX_CHECK_FILE, 'utf8'))[sandboxCacheKey(stampedShim, 'codex-cli 0.167.0')];
       eq('cached: the .cmd entry carries a matching stamp too', [shimEntry.mtimeMs, shimEntry.size], [fs.statSync(stampedShim).mtimeMs, fs.statSync(stampedShim).size]);
       const updatedShimSpy = versionSpy('codex-cli 0.168.0');
       eq('cached: a .cmd whose stamp matches still asks Codex its version, and an updated Codex finds nothing',
@@ -2826,7 +2848,7 @@ if (SPAWN_OPTS.shell) {
       const failedCodex = path.join(fenceScratch, 'failed-codex.exe');
       fs.writeFileSync(failedCodex, 'x');
       const failedStat = fs.statSync(failedCodex);
-      const failedKey = failedCodex + '|codex-cli 0.167.0';
+      const failedKey = sandboxCacheKey(failedCodex, 'codex-cli 0.167.0');
       const failedClock = Date.parse('2026-11-08T12:00:00Z');
       const writeFailedEntry = (minutesOld, withStamp) => fs.writeFileSync(process.env.CONSULT_SANDBOX_CHECK_FILE, JSON.stringify({
         [failedKey]: { ok: false, failed: 'homeRefused', checkedAt: new Date(failedClock - minutesOld * 60000).toISOString(), ...(withStamp ? { mtimeMs: failedStat.mtimeMs, size: failedStat.size } : {}) }

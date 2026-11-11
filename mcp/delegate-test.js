@@ -8,6 +8,18 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawn, execFile, execFileSync } from 'node:child_process';
 import { getEventListeners } from 'node:events';
 
+// A suite that ends before its last line says how, so a CI log that stops after a PASS line is readable:
+// a process.exit call prints its stack; no line at all means the process was killed from outside.
+let suiteFinished = false;
+const exitProcess = process.exit.bind(process);
+process.exit = (code) => {
+  if (!suiteFinished) console.log(new Error(`process.exit(${code}) before the suite finished`).stack);
+  return exitProcess(code);
+};
+process.on('exit', (code) => {
+  if (!suiteFinished) console.log(`EXIT before the suite finished, with code ${code}`);
+});
+
 import {
   gitState, decideLocation, setupAllowed, setupGit, snapshot, makeCopy, endSnapshot,
   removeCopy, pruneOrphans, changedFiles, mergeCopy, HELD_PATH_RULES
@@ -1694,7 +1706,8 @@ try {
 
     // agy, fenced: a per-task settings file trusts only the work folder
     {
-      const spaceFolder = 'C:\\Проект с пробелом';
+      // A Windows path on POSIX resolves under the cwd, inside the plugin, which counts as holding consult's files.
+      const spaceFolder = process.platform === 'win32' ? 'C:\\Проект с пробелом' : '/tmp/Проект с пробелом';
       const fencedAgy = workerCommand({ ...agyTask, fence: 'fenced', project: spaceFolder }, { settings: defaultSettings });
       const settingsAt = fencedAgy.args.indexOf('--settings');
       eq('agy fenced: --settings points at the task folder file', fencedAgy.args.slice(settingsAt, settingsAt + 2), ['--settings', path.join(taskFolder(agyTask.id), 'agy-settings.json')]);
@@ -1709,27 +1722,29 @@ try {
       eq('preamble: fenced agy is told writes are refused', workerPreamble('C:\\p', true, 'agy', 'fenced', 'agy').includes('Work only inside this folder: C:\\p. Writes outside this folder are refused.'), true);
       eq('preamble: guard wording', workerPreamble('C:\\p', true, 'local', 'fenced', 'guard').includes('File edits outside this folder are refused.'), true);
       eq('preamble: no layer, no refusal sentence', workerPreamble('C:\\p', true, 'agy', 'fenced').includes('refused'), false);
-      const writeStep = (target) => ({ event: 'step_update', step_update: { state: 'DONE', step_type: 'tool', tool_name: 'write_file', tool_info: { name: 'write_file', parameters: { Path: target } } } });
+      // agy reports native paths: on POSIX the Windows fixtures become /work, /Users/user/..., and relative ones keep their meaning.
+      const native = (windowsPath) => process.platform === 'win32' ? windowsPath : windowsPath.replace(/^C:/, '').replace(/\\/g, '/');
+      const writeStep = (target) => ({ event: 'step_update', step_update: { state: 'DONE', step_type: 'tool', tool_name: 'write_file', tool_info: { name: 'write_file', parameters: { Path: native(target) } } } });
       const recordedAgyEvents = [
         writeStep('C:\\work\\inside.txt'),
         writeStep('C:\\Users\\user\\consult-agy-probe.txt'),
         writeStep('C:\\Users\\user\\.claude\\consult-agy-probe.txt'),
         writeStep('C:\\Users\\user\\consult-agy-probe.txt'),
-        { event: 'step_update', step_update: { state: 'DONE', step_type: 'tool', tool_name: 'view_file', tool_info: { name: 'view_file', parameters: { AbsolutePath: 'C:\\elsewhere\\read.txt' } } } },
+        { event: 'step_update', step_update: { state: 'DONE', step_type: 'tool', tool_name: 'view_file', tool_info: { name: 'view_file', parameters: { AbsolutePath: native('C:\\elsewhere\\read.txt') } } } },
         { event: 'result', result: { status: 'SUCCESS', response: '', denied_actions: [{ action: 'write_file', display_name: 'WriteFile' }] } }
       ];
-      eq('refusedOutside: outside paths only, once each', refusedOutside(recordedAgyEvents, 'C:\\work'), ['C:\\Users\\user\\consult-agy-probe.txt', 'C:\\Users\\user\\.claude\\consult-agy-probe.txt']);
+      eq('refusedOutside: outside paths only, once each', refusedOutside(recordedAgyEvents, native('C:\\work')), [native('C:\\Users\\user\\consult-agy-probe.txt'), native('C:\\Users\\user\\.claude\\consult-agy-probe.txt')]);
       const streamLines = recordedAgyEvents.map((event) => JSON.stringify(event));
-      eq('parseWorkerStream: agy refusedPaths with the work folder', parseWorkerStream('agy', streamLines, { workFolder: 'C:\\work' }).refusedPaths.length, 2);
+      eq('parseWorkerStream: agy refusedPaths with the work folder', parseWorkerStream('agy', streamLines, { workFolder: native('C:\\work') }).refusedPaths.length, 2);
       eq('parseWorkerStream: agy without a work folder reports none', parseWorkerStream('agy', streamLines).refusedPaths, []);
-      eq('parseWorkerStream: the empty-answer refusal still errors', parseWorkerStream('agy', streamLines, { workFolder: 'C:\\work' }).error, 'agy was refused: WriteFile');
+      eq('parseWorkerStream: the empty-answer refusal still errors', parseWorkerStream('agy', streamLines, { workFolder: native('C:\\work') }).error, 'agy was refused: WriteFile');
       // F1d: strict comparison, relative paths resolved against the work folder, and only with a denial signal.
       const withoutDenial = recordedAgyEvents.slice(0, -1).concat([{ event: 'result', result: { status: 'SUCCESS', response: 'Done.' } }]);
-      eq('refusedOutside: no write denial in the run means nothing was refused', refusedOutside(withoutDenial, 'C:\\work'), []);
-      eq('refusedOutside: a command denial alone is not a write denial', refusedOutside(recordedAgyEvents.slice(0, -1).concat([{ event: 'result', result: { status: 'SUCCESS', response: '', denied_actions: [{ action: 'command', display_name: 'RunCommand' }] } }]), 'C:\\work'), []);
-      eq('refusedOutside: the stderr auto-denied line is a denial signal', refusedOutside(withoutDenial, 'C:\\work', 'no output produced — a tool required the "write_file" permission that headless mode cannot prompt for, so it was auto-denied'), ['C:\\Users\\user\\consult-agy-probe.txt', 'C:\\Users\\user\\.claude\\consult-agy-probe.txt']);
+      eq('refusedOutside: no write denial in the run means nothing was refused', refusedOutside(withoutDenial, native('C:\\work')), []);
+      eq('refusedOutside: a command denial alone is not a write denial', refusedOutside(recordedAgyEvents.slice(0, -1).concat([{ event: 'result', result: { status: 'SUCCESS', response: '', denied_actions: [{ action: 'command', display_name: 'RunCommand' }] } }]), native('C:\\work')), []);
+      eq('refusedOutside: the stderr auto-denied line is a denial signal', refusedOutside(withoutDenial, native('C:\\work'), 'no output produced — a tool required the "write_file" permission that headless mode cannot prompt for, so it was auto-denied'), [native('C:\\Users\\user\\consult-agy-probe.txt'), native('C:\\Users\\user\\.claude\\consult-agy-probe.txt')]);
       const relativeEvents = [writeStep('notes\\inside.txt'), writeStep('..\\outside.txt'), recordedAgyEvents.at(-1)];
-      eq('refusedOutside: a relative path is resolved against the work folder, and named in full', refusedOutside(relativeEvents, 'C:\\work'), [path.resolve('C:\\work', '..\\outside.txt')]);
+      eq('refusedOutside: a relative path is resolved against the work folder, and named in full', refusedOutside(relativeEvents, native('C:\\work')), [path.resolve(native('C:\\work'), native('..\\outside.txt'))]);
       const homeEvents = [writeStep(path.join(os.homedir(), 'notes.txt')), writeStep(path.join(path.dirname(os.homedir()), 'elsewhere.txt')), recordedAgyEvents.at(-1)];
       eq('refusedOutside: a work folder at home is compared strictly (no broad-folder exemption)', refusedOutside(homeEvents, os.homedir()), [path.join(path.dirname(os.homedir()), 'elsewhere.txt')]);
       // R9: a work folder that cannot be resolved (a junction loop) still gives a normal result, never a throw.
@@ -1746,12 +1761,12 @@ try {
           } catch (error) {
             loopResult = `threw: ${error.message}`;
           }
-          eq('refusedOutside: an unresolvable work folder is a normal result, not a throw', loopResult, ['C:\\elsewhere\\x.txt']);
+          eq('refusedOutside: an unresolvable work folder is a normal result, not a throw', loopResult, [native('C:\\elsewhere\\x.txt')]);
         } finally {
           fs.rmSync(loopRoot, { recursive: true, force: true });
         }
       }
-      eq('parseWorkerStream: agy passes its stderr to the refusal check', parseWorkerStream('agy', withoutDenial.map((event) => JSON.stringify(event)), { workFolder: 'C:\\work', stderr: 'it was auto-denied' }).refusedPaths.length, 2);
+      eq('parseWorkerStream: agy passes its stderr to the refusal check', parseWorkerStream('agy', withoutDenial.map((event) => JSON.stringify(event)), { workFolder: native('C:\\work'), stderr: 'it was auto-denied' }).refusedPaths.length, 2);
       // F1c backstop: a fenced agy write task never trusts a folder that holds consult's own files.
       throws('agy fenced write: a work folder holding consult\'s files is refused', () => workerCommand({ ...agyTask, fence: 'fenced', mode: 'write', project: scratch }, { settings: defaultSettings }));
       let refusalMessage = '';
@@ -6314,7 +6329,11 @@ try {
         };
         const project = makePlain('door fence project');
         const stubs = makeStubs(path.join(scratch, 'door stubs'), true);
-        const keyOf = (folder, version) => path.join(folder, 'codex.cmd') + '|' + version;
+        // The cache keys Codex by its real long path, case-folded on Windows, however PATH spells it.
+        const keyOf = (folder, version) => {
+          const real = fs.realpathSync.native(path.join(folder, 'codex.cmd'));
+          return (process.platform === 'win32' ? real.toLowerCase() : real) + '|' + version;
+        };
         eq('door show: a cached ok check for this codex and version is sandbox (a codex.cmd is read too)', await checkOf(stubs, project, { [keyOf(stubs, stubVersion)]: { ok: true, failed: null } }), 'sandbox');
         eq('door show: a cached failed check is guard', await checkOf(stubs, project, { [keyOf(stubs, stubVersion)]: { ok: false, failed: 'homeRefused', checkedAt: new Date().toISOString() } }), 'guard');
         // R5: Codex is run for its version only when the cache has an entry for its path that still counts.
@@ -6817,4 +6836,5 @@ try {
 }
 
 console.log('\n' + (failed === 0 ? 'ALL PASSED' : `${failed} FAIL(S)`));
+suiteFinished = true;
 process.exit(failed === 0 ? 0 : 1);

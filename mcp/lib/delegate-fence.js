@@ -181,8 +181,16 @@ function readCacheFile() {
   }
 }
 
+// Codex's path in the key is its real long path (case-folded on Windows): the MCP server, the supervisor
+// and the tab's hook can find the same file through different spellings (an 8.3 short PATH entry, a junction).
+function keyPath(codexPath) {
+  let real = codexPath;
+  try { real = fs.realpathSync.native(codexPath); } catch (_) { /* a missing file keys as written */ }
+  return process.platform === 'win32' ? real.toLowerCase() : real;
+}
+
 function cacheKey(codexPath, version) {
-  return codexPath + '|' + version;
+  return keyPath(codexPath) + '|' + version;
 }
 
 // A pass holds for that Codex version for good; a failure is trusted for an hour, then the next caller probes again.
@@ -226,7 +234,7 @@ function readSandboxCheckByFile(codexPath, entries, now) {
   if (!stampNamesCodex(codexPath)) return null;
   const stamp = fileStamp(codexPath);
   if (stamp === null) return null;
-  const prefix = codexPath + '|';
+  const prefix = cacheKey(codexPath, '');
   for (const key of Object.keys(entries)) {
     const entry = entries[key];
     if (!key.startsWith(prefix) || !entry || entry.mtimeMs !== stamp.mtimeMs || entry.size !== stamp.size) continue;
@@ -237,7 +245,7 @@ function readSandboxCheckByFile(codexPath, entries, now) {
 
 // Whether the cache holds an entry for this Codex path that still counts: a pass, or a failure under an hour old.
 function hasEntryThatCounts(codexPath, entries, now) {
-  const prefix = codexPath + '|';
+  const prefix = cacheKey(codexPath, '');
   for (const key of Object.keys(entries)) {
     if (key.startsWith(prefix) && resultOfEntry(entries[key], now) !== null) return true;
   }
