@@ -37,6 +37,24 @@ function removeFolderQuietly(folder) {
   } catch (_) { /* best effort */ }
 }
 
+// Copies a folder's files and subfolders into `target` (made where missing); links and other entries are
+// skipped. Not fs.cpSync: on Windows, Node 22's cpSync ends the process when a path is not ASCII (22.23.4).
+// Throws when `source` itself is a link or junction: a sandboxed pi can swap its temp sessions folder for
+// one, and the copy-back must not bring another folder's files into the task.
+export function copyFolder(source, target) {
+  if (!fs.lstatSync(source).isDirectory()) throw new Error(`${source} is not a folder (a link or junction is not followed)`);
+  fs.mkdirSync(target, { recursive: true });
+  for (const entry of fs.readdirSync(source, { withFileTypes: true })) {
+    const from = path.join(source, entry.name);
+    const to = path.join(target, entry.name);
+    if (entry.isDirectory()) {
+      copyFolder(from, to);
+    } else if (entry.isFile()) {
+      fs.copyFileSync(from, to);
+    }
+  }
+}
+
 export function piTempFolders(taskId) {
   if (!isTaskId(taskId)) throw new Error('not a task id: ' + JSON.stringify(taskId));
   // CONSULT_PI_TEMP_ROOT replaces %TEMP%\consult-pi (the test suites point it at a scratch folder).
@@ -78,7 +96,7 @@ export function stagePiSessions(taskDir, taskId) {
   const authority = path.join(taskDir, 'pi-sessions');
   const authorityOld = path.join(taskDir, 'pi-sessions.old');
   const source = fs.existsSync(authority) ? authority : authorityOld;
-  if (fs.existsSync(source)) fs.cpSync(source, folders.sessions, { recursive: true });
+  if (fs.existsSync(source)) copyFolder(source, folders.sessions);
   return folders;
 }
 
@@ -94,7 +112,7 @@ export function returnPiSessions(taskDir, taskId) {
   try {
     if (!fs.existsSync(folders.sessions)) return null;
     fs.rmSync(incoming, { recursive: true, force: true });
-    fs.cpSync(folders.sessions, incoming, { recursive: true });
+    copyFolder(folders.sessions, incoming);
     // Swap by renames, so there is never a moment with no pi-sessions: the
     // old folder steps aside, the new one moves in, then the old one goes.
     if (fs.existsSync(authority)) {

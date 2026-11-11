@@ -8,18 +8,6 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawn, execFile, execFileSync } from 'node:child_process';
 import { getEventListeners } from 'node:events';
 
-// A suite that ends before its last line says how, so a CI log that stops after a PASS line is readable:
-// a process.exit call prints its stack; no line at all means the process was killed from outside.
-let suiteFinished = false;
-const exitProcess = process.exit.bind(process);
-process.exit = (code) => {
-  if (!suiteFinished) console.log(new Error(`process.exit(${code}) before the suite finished`).stack);
-  return exitProcess(code);
-};
-process.on('exit', (code) => {
-  if (!suiteFinished) console.log(`EXIT before the suite finished, with code ${code}`);
-});
-
 import {
   gitState, decideLocation, setupAllowed, setupGit, snapshot, makeCopy, endSnapshot,
   removeCopy, pruneOrphans, changedFiles, mergeCopy, HELD_PATH_RULES
@@ -6836,5 +6824,4 @@ try {
 }
 
 console.log('\n' + (failed === 0 ? 'ALL PASSED' : `${failed} FAIL(S)`));
-suiteFinished = true;
 process.exit(failed === 0 ? 0 : 1);

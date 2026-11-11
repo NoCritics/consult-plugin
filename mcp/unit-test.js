@@ -2710,6 +2710,30 @@ if (SPAWN_OPTS.shell) {
     eq('stage: with pi-sessions missing, pi-sessions.old is the authority', fs.readdirSync(stagePiSessions(crashedTask, fenceTaskId).sessions), ['kept.jsonl']);
     returnPiSessions(crashedTask, fenceTaskId);
     eq('return: after a crash it restores pi-sessions and clears .old', [fs.readdirSync(path.join(crashedTask, 'pi-sessions')), fs.existsSync(path.join(crashedTask, 'pi-sessions.old'))], [['kept.jsonl'], false]);
+    // Non-ASCII folders and nested session folders go both ways (Node 22's cpSync ended the process on Windows here).
+    const cyrillicTask = path.join(fenceScratch, 'задача Имя task');
+    fs.mkdirSync(path.join(cyrillicTask, 'pi-sessions', 'папка'), { recursive: true });
+    fs.writeFileSync(path.join(cyrillicTask, 'pi-sessions', 'папка', 'сессия.jsonl'), 'nested');
+    const cyrillicStaged = stagePiSessions(cyrillicTask, fenceTaskId);
+    eq('stage: a non-ASCII nested session is copied in', fs.readFileSync(path.join(cyrillicStaged.sessions, 'папка', 'сессия.jsonl'), 'utf8'), 'nested');
+    fs.writeFileSync(path.join(cyrillicStaged.sessions, 'папка', 'новая.jsonl'), 'new');
+    returnPiSessions(cyrillicTask, fenceTaskId);
+    eq('return: a non-ASCII nested session is copied back', fs.readdirSync(path.join(cyrillicTask, 'pi-sessions', 'папка')).sort(), ['новая.jsonl', 'сессия.jsonl']);
+    // A temp sessions folder swapped for a junction (pi can write its temp root) is not followed, and a
+    // junction inside it is skipped: the authority keeps what it had.
+    const elsewhere = path.join(fenceScratch, 'elsewhere');
+    fs.mkdirSync(elsewhere, { recursive: true });
+    fs.writeFileSync(path.join(elsewhere, 'secret.txt'), 'not a session');
+    const linkedStaged = stagePiSessions(cyrillicTask, fenceTaskId);
+    fs.symlinkSync(elsewhere, path.join(linkedStaged.sessions, 'inner link'), 'junction');
+    returnPiSessions(cyrillicTask, fenceTaskId);
+    eq('return: a junction inside the sessions is skipped', fs.readdirSync(path.join(cyrillicTask, 'pi-sessions')).sort(), ['папка']);
+    fs.rmSync(linkedStaged.sessions, { recursive: true, force: true });
+    fs.symlinkSync(elsewhere, linkedStaged.sessions, 'junction');
+    const linkedReturn = returnPiSessions(cyrillicTask, fenceTaskId);
+    eq('return: a sessions folder that is a junction is refused, with a message', typeof linkedReturn === 'string' && linkedReturn.includes('not a folder'), true);
+    eq('return: and the authority keeps what it had', fs.readdirSync(path.join(cyrillicTask, 'pi-sessions')).sort(), ['папка']);
+    fs.unlinkSync(linkedStaged.sessions);
     // F6: only a real task id becomes a path.
     for (const badId of ['..', '..\\x', 'ABCDEF', 'abc', 'a/b', '', undefined]) {
       throws('piTempFolders: ' + JSON.stringify(badId) + ' is refused', () => piTempFolders(badId));

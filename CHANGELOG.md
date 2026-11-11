@@ -25,6 +25,7 @@ All notable changes to this plugin are documented here. Format loosely follows [
 - A sandboxed pi no longer shares the real temp folder: its `TEMP` and `TMP` are its own. Its `codex sandbox` run pins the environment policy (`shell_environment_policy.inherit=all`, `ignore_default_excludes=true`), so a `~/.codex/config.toml` that strips variables can't cut pi off from its runner.
 - **A fenced Codex write task in a folder that holds consult's own files is now refused** (it ran there in 0.16.0), at start and at a follow-up, as for agy: run it in a project folder, or set Codex to full access for that project. Codex read tasks there are unaffected.
 - agy's refused writes are reported only when agy says it denied a write, and relative paths are resolved against the work folder.
+- pi's sessions are copied without `fs.cpSync`: on Windows, Node 22's `cpSync` ended the supervisor when a folder name was not ASCII (a Cyrillic project name, say).
 - Tests never start the real Codex for a fence or write your sandbox-check cache: the supervisor, the Delegated tab and test servers all honour the test switch, and test servers get a scratch cache file.
 
 ### Known limits
