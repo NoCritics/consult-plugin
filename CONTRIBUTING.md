@@ -51,7 +51,7 @@ The plugin runs on Windows + POSIX. Several patterns look unusual but are delibe
 1. **Keep changes focused**, and don't change a public MCP tool schema without a minor-version bump.
 2. **Run `npm test`** (in `mcp/`) and, if you touched `hooks/`, `claude plugin test .` and `claude plugin validate .`. If you touched a provider, chat or council path, also run the matching paid test.
 3. **Add a CHANGELOG entry** for the release, and bump the version in `.claude-plugin/plugin.json`, `mcp/package.json` AND `mcp/manifest.json` (the Desktop extension) -- a unit test fails if they differ -- then `npm install --package-lock-only`. If the tool list changed, update `tools` in `mcp/manifest.json` too (the smoke test checks it).
-4. **Try it in Claude Code** with `claude --plugin-dir <your clone>`. An installed copy of consult does not change when you edit a clone: Claude Code runs the copy it made at install time. For Claude Desktop, reinstall the extension (README, *Claude Desktop*).
+4. **Try it in Claude Code** with `claude --plugin-dir <your clone>`. An installed copy of consult does not change when you edit a clone: Claude Code runs the copy it made at install time. For Claude Desktop, reinstall the extension (GUIDE.md, *Claude Desktop*).
 
 ## Updating the bundled SDK
 

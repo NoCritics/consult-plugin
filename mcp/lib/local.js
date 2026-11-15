@@ -455,7 +455,7 @@ export async function askLocal({
   const body = { model, messages, stream: true, stream_options: { include_usage: true } };
   if (typeof temperature === 'number') body.temperature = temperature;
   // Ollama honours only `reasoning_effort` on this endpoint (not `think` or
-  // `chat_template_kwargs`), and only as none / not-none; see the README.
+  // `chat_template_kwargs`), and only as none / not-none; see GUIDE.md.
   if (reasoning_effort) body.reasoning_effort = reasoning_effort;
 
   const started = Date.now();
