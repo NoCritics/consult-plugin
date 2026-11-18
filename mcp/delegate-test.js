@@ -20,7 +20,7 @@ import {
 import { loadSettings, frontmatterWarnings, DEFAULTS } from './lib/settings.js';
 import { parseWorkerWord, workerForKind, WORKER_ALIASES } from './lib/delegate-route.js';
 import {
-  workerCommand, parseWorkerStream, noteStepEvent, contextWarning, codexRolloutLimits, workerPreamble, CONTINUE_PROMPT, READ_ONLY_REMINDER, refusedOutside
+  workerCommand, parseWorkerStream, noteStepEvent, contextWarning, codexRolloutLimits, workerPreamble, CONTINUE_PROMPT, READ_ONLY_REMINDER, refusedOutside, workerWriteTargets
 } from './lib/delegate-workers.js';
 import { launchSupervisor, runSupervisor } from './lib/delegate-supervisor.js';
 import * as supervisorModule from './lib/delegate-supervisor.js';
@@ -1755,6 +1755,28 @@ try {
         }
       }
       eq('parseWorkerStream: agy passes its stderr to the refusal check', parseWorkerStream('agy', withoutDenial.map((event) => JSON.stringify(event)), { workFolder: native('C:\\work'), stderr: 'it was auto-denied' }).refusedPaths.length, 2);
+      // What agy's own steps wrote or edited: write_file and edit_file only, each file once, with or without a denial.
+      const editStep = (target) => ({ event: 'step_update', step_update: { state: 'DONE', step_type: 'tool', tool_name: 'edit_file', tool_info: { name: 'edit_file', parameters: { Path: native(target) } } } });
+      const ownWrites = [writeStep('C:\\work\\new.txt'), editStep('C:\\work\\old.txt'), editStep('C:\\work\\old.txt'), writeStep('notes\\rel.txt'), recordedAgyEvents[4], { event: 'result', result: { status: 'SUCCESS', response: 'Done.' } }];
+      eq('workerWriteTargets agy: written and edited files, once each, a relative one resolved against the folder; reads are not writes',
+        workerWriteTargets('agy', ownWrites.map((event) => JSON.stringify(event)), native('C:\\work')),
+        [native('C:\\work\\new.txt'), native('C:\\work\\old.txt'), path.resolve(native('C:\\work'), native('notes\\rel.txt'))]);
+      eq('workerWriteTargets agy: a run with no write steps has none', workerWriteTargets('agy', fixtureLines('agy-error-after-answer.jsonl'), native('C:\\work')), []);
+      // pi reports its own writes as tool_execution_start events (write, edit): a path relative to the folder or absolute.
+      const piTool = (toolName, target) => JSON.stringify({ type: 'tool_execution_start', toolCallId: 'c1', toolName, args: { path: target } });
+      eq('workerWriteTargets local: the recorded pi write names pi-hello.txt, resolved against the folder',
+        workerWriteTargets('local', fixtureLines('pi-write.jsonl'), native('C:\\work')), [path.resolve(native('C:\\work'), 'pi-hello.txt')]);
+      eq('workerWriteTargets local: write and edit, once each, absolute or relative; a read is not a write',
+        workerWriteTargets('local', [piTool('write', 'a.txt'), piTool('edit', native('C:\\work\\a.txt')), piTool('edit', 'sub/b.txt'), piTool('read', 'c.txt')], native('C:\\work')),
+        [path.resolve(native('C:\\work'), 'a.txt'), path.resolve(native('C:\\work'), 'sub/b.txt')]);
+      eq('workerWriteTargets codex: it writes through shell commands, so nothing is attributable',
+        workerWriteTargets('codex', fixtureLines('codex-write.jsonl'), native('C:\\work')), []);
+      if (process.platform === 'win32') {
+        // Recorded from agy 1.5.11 (2026-11-18): a write task that created notes.txt and edited existing.txt and multi.txt (twice).
+        const recordedFolder = 'C:\\Users\\user\\AppData\\Local\\Temp\\claude\\b0b0fd8aa923dea9\\6b3dec0c-b789-4697-97e6-7091d846f119\\scratchpad\\agy-probe2\\work';
+        eq('workerWriteTargets agy: the recorded agy 1.5.11 run names its three files',
+          workerWriteTargets('agy', fixtureLines('agy-edit.jsonl'), recordedFolder).map((target) => path.basename(target)).sort(), ['existing.txt', 'multi.txt', 'notes.txt']);
+      }
       // F1c backstop: a fenced agy write task never trusts a folder that holds consult's own files.
       throws('agy fenced write: a work folder holding consult\'s files is refused', () => workerCommand({ ...agyTask, fence: 'fenced', mode: 'write', project: scratch }, { settings: defaultSettings }));
       let refusalMessage = '';
@@ -2763,11 +2785,16 @@ try {
         const repo = makeRepo('Имя agy read edit', { 'readme.txt': 'hello\n', 'src/gone.txt': 'bye\n', 'src/keep.txt': 'stay\n' });
         fs.writeFileSync(path.join(repo, 'readme.txt'), 'edited by the user before the task\n'); // already modified: the check compares before with after
         const task = newTask({ worker: 'agy', mode: 'read', project: repo });
-        launchWith(task, { FAKE_SCENARIO: 'agy-edit', FAKE_WRITE_FILE: 'readme.txt', FAKE_DELETE_FILE: 'src/gone.txt' });
+        // agy edits readme.txt through its own step; another session edits src/keep.txt and deletes src/gone.txt meanwhile.
+        launchWith(task, { FAKE_SCENARIO: 'agy-edit', FAKE_WRITE_FILE: 'readme.txt', FAKE_OTHER_FILE: 'src/keep.txt', FAKE_DELETE_FILE: 'src/gone.txt' });
         const done = await waitForTask(task.id, hasEnded);
         eq('agy read edits: the run still ends done', done.state, 'done');
-        eq('agy read edits: the files it changed are recorded (an already modified file, a deleted one)', [...(done.read_only_edits ?? [])].sort(), ['readme.txt', 'src/gone.txt']);
-        truthy('agy read edits: the warning names them and says the task was read-only', /read-only/i.test(done.warning ?? '') && (done.warning ?? '').includes('readme.txt') && (done.warning ?? '').includes('src/gone.txt'));
+        eq('agy read edits: only the file agy itself edited is recorded (already modified before the task)', done.read_only_edits, ['readme.txt']);
+        const warning = done.warning ?? '';
+        eq('agy read edits: the warning names agy\'s file, says the task was read-only, and not the other session\'s files',
+          [warning.includes('readme.txt'), /read-only/i.test(warning), warning.includes('src/keep.txt'), warning.includes('src/gone.txt')], [true, true, false, false]);
+        eq('agy read edits: the warning no longer hedges that the files may be your own', /your own edits/.test(warning), false);
+        eq('agy read edits: the other session\'s changes are listed apart, as a note and not a warning', done.other_changes, ['src/gone.txt', 'src/keep.txt']);
         // The task's file is written before the index is rebuilt: give the rebuild a moment.
         const indexedEdits = async () => {
           const giveUpAt = Date.now() + 5000;
@@ -2779,7 +2806,7 @@ try {
           }
           return row?.read_only_edits?.slice().sort();
         };
-        eq('agy read edits: the index carries the files for the wake notice', await indexedEdits(), ['readme.txt', 'src/gone.txt']);
+        eq('agy read edits: the index carries the files for the wake notice', await indexedEdits(), ['readme.txt']);
         eq('agy read edits: the git index is untouched', gitSync(repo, 'diff', '--cached', '--name-only'), '');
       } });
 
@@ -2835,7 +2862,7 @@ try {
         const task = newTask({ worker: 'agy', mode: 'read', project: repo });
         launchWith(task, { FAKE_SCENARIO: 'agy-edit' });
         const done = await waitForTask(task.id, hasEnded);
-        eq('agy read clean: done with no warning and no edits', [done.state, done.warning ?? null, done.read_only_edits ?? null], ['done', null, null]);
+        eq('agy read clean: done with no warning and no edits', [done.state, done.warning ?? null, done.read_only_edits ?? null, done.other_changes ?? null], ['done', null, null, null]);
       } });
 
       scenarios.push({ name: 'an agy read task that edits files (no git)', run: async () => {
@@ -2846,15 +2873,32 @@ try {
         const task = newTask({ worker: 'agy', mode: 'read', project: folder });
         launchWith(task, { FAKE_SCENARIO: 'agy-edit', FAKE_WRITE_FILE: 'created.txt', FAKE_DELETE_FILE: 'sub/old.txt' });
         const done = await waitForTask(task.id, hasEnded);
-        eq('agy read edits, no git: a created and a deleted file are found by the listing', [...(done.read_only_edits ?? [])].sort(), ['created.txt', 'sub/old.txt']);
+        eq('agy read edits, no git: the file agy created is found by the listing, the other session\'s deletion is not blamed', done.read_only_edits, ['created.txt']);
       } });
 
-      scenarios.push({ name: 'a codex read task is not checked', run: async () => {
+      scenarios.push({ name: 'an agy read task while another session edits the folder', run: async () => {
+        const repo = makeRepo('Имя agy read other', { 'readme.txt': 'hello\n', 'src/gone.txt': 'bye\n' });
+        const task = newTask({ worker: 'agy', mode: 'read', project: repo });
+        launchWith(task, { FAKE_SCENARIO: 'agy-edit', FAKE_OTHER_FILE: 'readme.txt', FAKE_DELETE_FILE: 'src/gone.txt' });
+        const done = await waitForTask(task.id, hasEnded);
+        eq('agy read, other session edits: done with no warning and no edits, the changes listed as others', [done.state, done.warning ?? null, done.read_only_edits ?? null, done.other_changes], ['done', null, null, ['readme.txt', 'src/gone.txt']]);
+      } });
+
+      scenarios.push({ name: 'an agy read task in a subfolder of a git project', run: async () => {
+        const repo = makeRepo('Имя agy read sub', { 'readme.txt': 'hello\n', 'pkg/a.txt': 'a\n', 'pkg/b.txt': 'b\n' });
+        const task = newTask({ worker: 'agy', mode: 'read', project: path.join(repo, 'pkg') });
+        launchWith(task, { FAKE_SCENARIO: 'agy-edit', FAKE_WRITE_FILE: 'a.txt', FAKE_OTHER_FILE: 'b.txt' });
+        const done = await waitForTask(task.id, hasEnded);
+        eq('agy read in a subfolder: agy\'s edit is found and named from the task\'s folder', done.read_only_edits, ['a.txt']);
+      } });
+
+      scenarios.push({ name: 'a codex read task has only other changes', run: async () => {
         const repo = makeRepo('Имя codex read', { 'readme.txt': 'hello\n' });
         const task = newTask({ worker: 'codex', mode: 'read', project: repo });
         launchWith(task, { FAKE_SCENARIO: 'ok' }); // the fake writes worker-output.txt; a real codex read-only sandbox would not
         const done = await waitForTask(task.id, hasEnded);
-        eq('codex read: no edit check (its sandbox is the fence)', [done.state, done.read_only_edits ?? null], ['done', null]);
+        eq('codex read: done, no warning (codex writes through shell commands, so nothing is its own edit), the change is a neutral note',
+          [done.state, done.warning ?? null, done.read_only_edits ?? null, done.other_changes], ['done', null, null, ['worker-output.txt']]);
       } });
 
       scenarios.push({ name: 'a recorded supervisor pid that is not a live supervisor', run: async () => {
@@ -3314,6 +3358,26 @@ try {
           eq('supervisor pi: sessions written by the worker reach <taskDir>/pi-sessions', fs.readFileSync(path.join(sessionsFolder, 's.jsonl'), 'utf8'), 'a session line\n');
           eq('supervisor pi: the authority was copied in before the run', fs.readFileSync(path.join(sessionsFolder, 'seen.txt'), 'utf8').split(',').includes('old.jsonl'), true);
           eq('supervisor pi: the worker ran in the work folder', sameFolder(report.cwd, task.project), true);
+        });
+
+        await runCase('pi: a read task that wrote, while another session edited the folder', async () => {
+          const repo = makeRepo('Имя pi read edits', { 'readme.txt': 'hello\n', 'src/gone.txt': 'bye\n', 'src/keep.txt': 'stay\n' });
+          const task = newTask({ worker: 'local', model: 'fake-model', mode: 'read', project: repo });
+          useFakeWorker('pi', { FAKE_WRITE_FILE: 'readme.txt', FAKE_OTHER_FILE: 'src/keep.txt', FAKE_DELETE_FILE: 'src/gone.txt' });
+          await runSupervisor(task.id, piOptions());
+          const done = readTask(task.id);
+          eq('supervisor pi read: pi\'s own write is the warning, the other session\'s changes are the note',
+            [done.state, done.read_only_edits, done.other_changes, /^local changed 1 file in this read-only task: readme\.txt\./.test(done.warning ?? '')],
+            ['done', ['readme.txt'], ['src/gone.txt', 'src/keep.txt'], true]);
+        });
+
+        await runCase('pi: a read task that wrote nothing, while another session edited the folder', async () => {
+          const quiet =newTask({ worker: 'local', model: 'fake-model', mode: 'read', project: makeRepo('Имя pi read quiet', { 'readme.txt': 'hello\n' }) });
+          useFakeWorker('pi', { FAKE_OTHER_FILE: 'readme.txt' });
+          await runSupervisor(quiet.id, piOptions());
+          const quietDone = readTask(quiet.id);
+          eq('supervisor pi read: another session\'s edit alone is no warning, only a note',
+            [quietDone.state, quietDone.warning ?? null, quietDone.read_only_edits ?? null, quietDone.other_changes], ['done', null, null, ['readme.txt']]);
         });
 
         await runCase('pi: a killed run still copies sessions back', async () => {
@@ -4905,6 +4969,17 @@ try {
           updateTask(liftedAgyRead.value.id, { state: 'done' });
           const agyReadResult = await call('delegate_result', { id: liftedAgyRead.value.id }, contextFor(project));
           truthy('delegate_result: a lifted agy read task has the sentence (its shell can write)', /could change files outside its folder/.test(agyReadResult.value.note));
+          eq('delegate_result: no other changes means a null field and no such note', [agyReadResult.value.other_changes, /Also changed in the folder/.test(agyReadResult.value.note ?? '')], [null, false]);
+          const manyChanges = Array.from({ length: 12 }, (_, index) => `f${index + 1}.txt`);
+          updateTask(liftedAgyRead.value.id, { other_changes: manyChanges });
+          const othersResult = await call('delegate_result', { id: liftedAgyRead.value.id }, contextFor(project));
+          eq('delegate_result: other changes are a field and a neutral note naming ten, which claims no innocence',
+            [othersResult.value.other_changes, othersResult.value.note.includes("Also changed in the folder during this read-only task, by no edit step of agy's (another session or the user, perhaps): " + manyChanges.slice(0, 10).join(', ') + ', and 2 more.'), /not the worker's doing/.test(othersResult.value.note)],
+            [manyChanges, true, false]);
+          updateTask(liftedCodexRead.value.id, { other_changes: ['a.txt'] });
+          const codexOthers = await call('delegate_result', { id: liftedCodexRead.value.id }, contextFor(project));
+          truthy('delegate_result: a codex task\'s note says its changes cannot be tied to anyone, with no "and more" for one file',
+            codexOthers.value.note.includes("Also changed in the folder during this read-only task: a.txt. Codex reports no file edits, so these can't be tied to it or to anyone else; its read-only sandbox refuses writes."));
         });
 
         await guardedAsync('delegate: how each task is fenced', async () => {

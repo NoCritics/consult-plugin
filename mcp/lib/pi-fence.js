@@ -87,7 +87,7 @@ export function realPathOfTarget(target, linkDepth = 0) {
 }
 
 // Lowercase, backslash separators, no trailing separator.
-function comparable(folderOrFile) {
+export function comparable(folderOrFile) {
   return folderOrFile.replace(/\//g, '\\').replace(/\\+$/, '').toLowerCase();
 }
 

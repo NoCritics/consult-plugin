@@ -4,6 +4,13 @@ All notable changes to this plugin are documented here. Format loosely follows [
 
 ## [Unreleased]
 
+## [0.17.1] - 2026-11-19
+
+### Changed
+
+- **A read task warns only about files its worker itself wrote or edited, and notes the rest.** The folder is compared before and after the run. A changed file named by the worker's own write or edit step (agy's `write_file` and `edit_file`, pi's `write` and `edit`) is a warning; every other changed file, deleted ones too, is a neutral note (`other_changes`) in `delegate_result` and the Delegated tab that blames no one, since another session or you may be working in the same folder. Codex writes only through shell commands, so all its changes go to the note, which says they can't be tied to anyone. In a subfolder of a git project, the files are named from the task's folder.
+- **The README is short; the full reference is in [GUIDE.md](./GUIDE.md).**
+
 ## [0.17.0] - 2026-11-08
 
 ### Added

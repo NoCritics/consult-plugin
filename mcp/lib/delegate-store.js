@@ -54,7 +54,7 @@ const LOCK_ASYNC_RETRY_MS = 20;
 const INDEX_FIELDS = [
   'id', 'worker', 'model', 'title', 'project', 'state', 'location', 'mode', 'summary', 'fenced', 'fence', 'fence_layer',
   'started_at', 'ended_at', 'stop_reason', 'limit', 'queue_model', 'owner_instance', 'reported_at',
-  'queue_waiting_long', 'keep_running', 'hold', 'owner_session', 'created_at', 'queued_at', 'read_only_edits', 'time_limit_ms'
+  'queue_waiting_long', 'keep_running', 'hold', 'owner_session', 'created_at', 'queued_at', 'read_only_edits', 'other_changes', 'time_limit_ms'
 ];
 
 // What each worker's tasks may do beyond the folder they work in. Codex is

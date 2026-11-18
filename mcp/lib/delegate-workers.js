@@ -132,11 +132,16 @@ function codexArgs({ task, isWrite, resume, fence }) {
 
 const AGY_SETTINGS_FILE = 'agy-settings.json';
 
+// How a worker is named in text for the person: Codex capitalised, agy and local as typed.
+export function workerLabel(worker) {
+  return worker === 'codex' ? 'Codex' : worker;
+}
+
 // Why a fenced agy or Codex write task cannot run in a folder that holds consult's
 // own files (Rulings 15 and 20): the worker may write anywhere in that folder, and
 // with it consult's settings and its tasks' state. Used at start, at a follow-up and here.
 function consultFolderRefusal(worker, folder) {
-  const label = worker === 'codex' ? 'Codex' : worker;
+  const label = workerLabel(worker);
   return `${label} can't be fenced in a folder that holds consult's own files (${folder}). Run it in a project folder, or lift ${label}'s fence for this project in the Delegated tab.`;
 }
 
@@ -407,15 +412,59 @@ function writeWasDenied(events, stderr) {
   return false;
 }
 
-// The paths of the write_file/edit_file steps that point outside the work
-// folder, once each, in order, in full (a relative path is resolved against the
-// work folder). With the fence on, agy refuses these writes but still emits the
-// step: nothing in the step marks it refused, so a path is reported only when the
-// run also says a write was denied (writeWasDenied). Compared strictly, by real
-// path and ignoring case, with no broad-folder exemption.
+// The files agy's own write_file and edit_file steps name, once each, in order, in
+// full (a relative path is resolved against the work folder). agy 1.5.11 reports
+// a new file as write_file and an edit as edit_file, each with an absolute Path,
+// ACTIVE then DONE (fixtures/delegate/agy-edit.jsonl). A step does not say whether
+// agy's permissions let the write through.
+function writeStepTargets(events, workFolder) {
+  const targets = [];
+  for (const event of events) {
+    const step = event?.event === 'step_update' ? event.step_update : null;
+    if (step === null || typeof step !== 'object') continue;
+    const toolName = step.tool_info?.name ?? step.tool_name;
+    if (!AGY_WRITE_ACTIONS.includes(toolName)) continue;
+    const parameters = step.tool_info?.parameters;
+    if (parameters === null || typeof parameters !== 'object') continue;
+    const key = ['Path', 'TargetFile', 'AbsolutePath'].find((name) => typeof parameters[name] === 'string' && parameters[name] !== '');
+    if (key === undefined) continue;
+    const resolvedTarget = path.resolve(workFolder, parameters[key]);
+    if (!targets.includes(resolvedTarget)) targets.push(resolvedTarget);
+  }
+  return targets;
+}
+
+// The files pi's own write and edit tools name, once each, in order, in full (a relative
+// path is resolved against the work folder). pi emits tool_execution_start with
+// args.path (fixtures/delegate/pi-write.jsonl).
+function piWriteTargets(events, workFolder) {
+  const targets = [];
+  for (const event of events) {
+    if (event?.type !== 'tool_execution_start' || !PI_WRITE_TOOLS.includes(event.toolName)) continue;
+    const target = event.args?.path;
+    if (typeof target !== 'string' || target === '') continue;
+    const resolvedTarget = path.resolve(workFolder, target);
+    if (!targets.includes(resolvedTarget)) targets.push(resolvedTarget);
+  }
+  return targets;
+}
+
+const PI_WRITE_TOOLS = ['write', 'edit'];
+
+// The files a worker's own steps wrote or edited in a run, from its stdout lines. Codex
+// writes only through shell commands and reports no file changes, so none are attributable.
+export function workerWriteTargets(worker, lines, workFolder) {
+  if (worker === 'agy') return writeStepTargets(parseJsonLines(lines), workFolder);
+  if (worker === 'local') return piWriteTargets(parseJsonLines(lines), workFolder);
+  return [];
+}
+
+// The write targets outside the work folder (writeStepTargets). With the fence on,
+// agy refuses these writes but still emits the step, so a path is reported only
+// when the run also says a write was denied (writeWasDenied). Compared strictly,
+// by real path and ignoring case, with no broad-folder exemption.
 export function refusedOutside(events, workFolder, stderr = '') {
-  const paths = [];
-  if (!writeWasDenied(events, stderr)) return paths;
+  if (!writeWasDenied(events, stderr)) return [];
   let realWorkFolder;
   try {
     realWorkFolder = realPathOfTarget(path.resolve(workFolder));
@@ -423,30 +472,15 @@ export function refusedOutside(events, workFolder, stderr = '') {
     // A work folder that cannot be resolved (a link loop) is compared as written.
     realWorkFolder = path.resolve(workFolder);
   }
-  for (const event of events) {
-    const step = event?.event === 'step_update' ? event.step_update : null;
-    if (step === null || typeof step !== 'object') continue;
-    const toolName = step.tool_info?.name ?? step.tool_name;
-    if (toolName !== 'write_file' && toolName !== 'edit_file') continue;
-    const parameters = step.tool_info?.parameters;
-    if (parameters === null || typeof parameters !== 'object') continue;
-    let target = null;
-    for (const key of ['Path', 'TargetFile', 'AbsolutePath']) {
-      if (typeof parameters[key] === 'string' && parameters[key] !== '') {
-        target = parameters[key];
-        break;
-      }
-    }
-    if (target === null) continue;
-    const resolvedTarget = path.resolve(workFolder, target);
+  const outside = [];
+  for (const target of writeStepTargets(events, workFolder)) {
     let inside = false;
     try {
-      inside = isInside(realPathOfTarget(resolvedTarget), realWorkFolder);
+      inside = isInside(realPathOfTarget(target), realWorkFolder);
     } catch (_) { /* a path that cannot be resolved (a link loop) counts as outside */ }
-    if (inside || paths.includes(resolvedTarget)) continue;
-    paths.push(resolvedTarget);
+    if (!inside) outside.push(target);
   }
-  return paths;
+  return outside;
 }
 
 function parseAgyStream(events, { stderr = '', workFolder = null } = {}) {

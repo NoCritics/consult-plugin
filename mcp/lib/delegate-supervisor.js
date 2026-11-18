@@ -22,8 +22,8 @@ import { shellSafeArgs, killTree, killPidTree } from './spawn-cli.js';
 import { scrubPii, oneLine } from './util.js';
 import { loadSettings, runnerSettings } from './settings.js';
 import { readKey, runnerInventory } from './local-runners.js';
-import { workerCommand, parseWorkerStream, noteStepEvent, codexRolloutLimits, deniedNames } from './delegate-workers.js';
-import { gitState, endSnapshot, changedFiles, watchFolder, diffWatch, isOutside, worktreesRoot } from './delegate-git.js';
+import { workerCommand, parseWorkerStream, noteStepEvent, codexRolloutLimits, deniedNames, workerWriteTargets, workerLabel } from './delegate-workers.js';
+import { gitState, endSnapshot, changedFiles, watchFolder, diffWatch, sortChanges, isOutside, worktreesRoot } from './delegate-git.js';
 import { recordLimit, recordLimitHit, hitKindOf } from './delegate-limits.js';
 import {
   stagePiSessions, returnPiSessions, removePiTemp, makePiTempFolders, hasLeftoverPiSessions, piLauncherFor, sandboxCheck, readCachedSandboxCheck, findCodexForFence
@@ -452,10 +452,11 @@ async function recordEnd(context, outcome) {
       changes.read_only_edits = files;
       const shown = files.slice(0, READ_ONLY_EDITS_NAMED).join(', ');
       const more = context.readOnlyEdits.length - READ_ONLY_EDITS_NAMED;
-      const warning = `agy changed ${context.readOnlyEdits.length === 1 ? '1 file' : `${context.readOnlyEdits.length} files`} in this read-only task: ${shown}${more > 0 ? `, and ${more} more` : ''}. ` +
-        'Check them before relying on the result; the folder was in use meanwhile, so some may be your own edits.';
+      const warning = `${workerLabel(context.task.worker)} changed ${context.readOnlyEdits.length === 1 ? '1 file' : `${context.readOnlyEdits.length} files`} in this read-only task: ${shown}${more > 0 ? `, and ${more} more` : ''}. ` +
+        'Check them before relying on the result.';
       addWarning(warning);
     }
+    if (context.otherChanges.length > 0) changes.other_changes = context.otherChanges.slice(0, READ_ONLY_EDITS_KEPT);
     if (context.survivorWarning !== null) {
       addWarning(context.survivorWarning);
     }
@@ -737,7 +738,7 @@ async function runWorker(context, command, childEnvironmentValues) {
     supervisor_beat_at: context.startedAt, worker_pid: child.pid, worker_real_pid: null, log_path: logPath, fenced: command.fenced, fence_layer: command.fenceLayer,
     fence_layer_reason: command.fenceReason ?? null, fence_layer_changed: layerChange(task.fence_layer, command.fenceLayer),
     followup: null, summary: null, final_path: null, end_commit: null, limit: null, limit_hit: null, denied: null, refused_paths: null,
-    warning: command.warning ?? null, read_only_edits: null,
+    warning: command.warning ?? null, read_only_edits: null, other_changes: null,
     ...(task.model === null && command.model ? { model: command.model } : {})
   });
   stopPreRunBeat(context); // that write carried the beat; the ticker below keeps it
@@ -921,7 +922,7 @@ export async function runSupervisor(taskId, options = {}) {
     taskId, task: null, folder: taskFolder(taskId), child: null, ended: false, stop: null, signalStop: null,
     startedAt: null, lastOutputAt: null, openSteps: new Set(), stderrTail: '', recordingProblem: null, secrets: [],
     workerPid: null, workerRealPid: null, spawnedAtWall: null, killAbandoned: false, requestStop: null,
-    sawOutput: false, sandboxed: false, piEmitted: false, copyBackWarning: null, realWorkerSearched: false, preRunBeat: null, readOnlyEdits: [], survivorWarning: null,
+    sawOutput: false, sandboxed: false, piEmitted: false, copyBackWarning: null, realWorkerSearched: false, preRunBeat: null, readOnlyEdits: [], otherChanges: [], survivorWarning: null,
     timeLimitMs: DEFAULT_TIME_LIMIT_MS,
     now: options.now ?? Date.now,
     io: { updateTask, appendFile: fs.appendFileSync, removeFile: (file) => fs.rmSync(file, { force: true }), killTree, rolloutLimits: codexRolloutLimits, recordLimit, recordLimitHit, ...options.io },
@@ -1125,14 +1126,20 @@ async function superviseTask(context, options) {
 
     // A worker that cannot be started (the tool is missing, an argument cannot be
     // passed safely) throws here, and ends in the catch of runSupervisor.
-    // An agy read task is also checked for files it changed: its fence holds writes made through its
-    // tools, and this catches any that got through another way.
-    const checksReadOnly = task.worker === 'agy' && task.mode === 'read';
+    // A read task is also checked for files that changed: one counts as the worker's own only when
+    // it changed during the run and the worker's own write or edit step named it. Any other change
+    // is kept apart (another session may be editing the same folder meanwhile).
+    const checksReadOnly = task.mode === 'read';
     const folderBefore = checksReadOnly ? await watchFolder(command.cwd) : null;
     context.sandboxed = command.wrapper !== undefined;
     run = await runWorker(context, command, childEnvironment(command, key));
     context.piEmitted = context.sandboxed && hasJsonObjectLine(run.lines);
-    if (checksReadOnly) context.readOnlyEdits = diffWatch(folderBefore, await watchFolder(command.cwd)) ?? [];
+    if (checksReadOnly) {
+      const changed = diffWatch(folderBefore, await watchFolder(command.cwd)) ?? [];
+      const sorted = sortChanges(changed, workerWriteTargets(task.worker, run.lines, command.cwd), command.cwd);
+      context.readOnlyEdits = sorted.own;
+      context.otherChanges = sorted.others;
+    }
 
     parsed = parseWorkerStream(task.worker, run.lines, { stderr: context.stderrTail, workFolder: command.fenced ? command.cwd : null });
     if (task.worker === 'codex' && parsed.session !== null) {

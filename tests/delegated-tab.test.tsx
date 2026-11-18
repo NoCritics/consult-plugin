@@ -57,6 +57,8 @@ function task(overrides: Partial<DelegateTaskRow> & { id: string }): DelegateTas
     report_path: null,
     merged_files: null,
     first_conflict: null,
+    read_only_edits: null,
+    other_changes: null,
     ...overrides,
   }
   return { ...row, clear_kind: row.clear_kind ?? clearKindOf(row) }
@@ -752,6 +754,23 @@ describe('delegated tab', () => {
       expect(lineWith(all, /^\s+can't run commands$/)).toBeDefined()
       expect(lineWith(all, /not fenced/)).toBeUndefined()
       expect((await ui.find({ type: 'Text', text: /^can't run commands$/ }))?.props.color).toBe('warning')
+      await ui.unmount()
+    })
+
+    test('a read task that changed files shows a warning line, and other changes a dim line that blames no one', async ($, on) => {
+      const edited = task({ id: 'hhh888', worker: 'agy', mode: 'read', state: 'done', location: 'here', reported_at: 5, fenced: false, read_only_edits: ['src/a.ts', 'b.ts'] })
+      const meanwhile = task({ id: 'iii999', worker: 'codex', mode: 'read', state: 'done', location: 'here', reported_at: 5, other_changes: ['c.txt', 'd.txt'] })
+      const { ui } = await mountWith($, on, () => shown([edited, meanwhile]))
+      await ui.press({ key: 'delegated:row:hhh888' })
+      expect(lineWith(await lines(ui, 100), /^\s+changed in this read-only task: src\/a\.ts, b\.ts$/)).toBeDefined()
+      expect((await ui.find({ type: 'Text', text: /^changed in this read-only task: / }))?.props.color).toBe('warning')
+      expect(await ui.find({ type: 'Text', text: /^also changed during the task/ })).toBeUndefined()
+      await ui.press({ key: 'delegated:row:iii999' })
+      const all = await lines(ui, 100)
+      expect(lineWith(all, /^\s+also changed during the task: c\.txt, d\.txt$/)).toBeDefined()
+      expect(lineWith(all, /changed in this read-only task/)).toBeUndefined()
+      const neutral = await ui.find({ type: 'Text', text: /^also changed during the task/ })
+      expect([neutral?.props.color, neutral?.props.dimColor]).toEqual([undefined, true])
       await ui.unmount()
     })
 

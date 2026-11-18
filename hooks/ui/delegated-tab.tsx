@@ -301,6 +301,12 @@ export function drawDelegatedTab($: EngineInterface, table: Table, surface: stri
     if (row.worker === 'agy') notes.push("can't run commands")
     if (row.worker === 'local' && row.state === 'running' && row.keep_running) notes.push('keeps the GPU busy and its model loaded')
     if (notes.length > 0) lines.push(<Text color="warning" wrap="truncate-end">{notes.join(' · ')}</Text>)
+    if (row.read_only_edits !== null && row.read_only_edits.length > 0) {
+      lines.push(<Text color="warning" wrap="truncate-end">{`changed in this read-only task: ${row.read_only_edits.join(', ')}`}</Text>)
+    }
+    if (row.other_changes !== null && row.other_changes.length > 0) {
+      lines.push(<Text dimColor wrap="truncate-end">{`also changed during the task: ${row.other_changes.join(', ')}`}</Text>)
+    }
     return (
       <Box flexDirection="column" paddingLeft={DETAIL_INDENT}>
         {lines}

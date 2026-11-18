@@ -131,6 +131,9 @@ export type DelegateTaskRow = {
   // files a merge applied; the first file a merge left in conflict
   merged_files: number | null
   first_conflict: string | null
+  // files a read-only task changed that its own write or edit steps named; files that changed meanwhile and no such step named
+  read_only_edits: string[] | null
+  other_changes: string[] | null
   clear_kind: DelegateClearKind
 }
 

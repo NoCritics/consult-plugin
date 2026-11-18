@@ -23,7 +23,7 @@ import { validateAgyEffort } from './agy.js';
 import { localConfigured, DELEGATE_WORKERS } from './settings.js';
 import { NICKNAME_SPELLINGS } from './local-models.js';
 import { WORKER_ALIASES, parseWorkerWord, workerForKind } from './delegate-route.js';
-import { requireModelId, refuseInConsultFolder } from './delegate-workers.js';
+import { requireModelId, refuseInConsultFolder, workerLabel } from './delegate-workers.js';
 import { lastLimits, limitPolicy } from './delegate-limits.js';
 import { isOutside, gitState, decideLocation, setupAllowed, setupGit, makeCopy, uncommittedCount, removeCopy, changedFiles, diffStat, mergeCopy } from './delegate-git.js';
 import {
@@ -573,6 +573,8 @@ function resultNote(task) {
   return undefined;
 }
 
+const OTHER_CHANGES_NAMED = 10;
+
 async function resultTool(args, context) {
   let task = requireTask(args);
   // A result can be read from any project, but only a session of the task's own project
@@ -582,7 +584,8 @@ async function resultTool(args, context) {
     id: task.id, title: task.title, worker: task.worker, model: task.model, state: task.state, stop_reason: task.stop_reason ?? null,
     summary: task.summary ?? null, location: task.location, mode: task.mode, final_message: readFinalMessage(task),
     changed: null, diff_stat: null, branch: task.branch ?? null, log_path: task.log_path ?? null,
-    limit: task.limit ?? null, limit_hit: task.limit_hit ?? null, denied: task.denied ?? null, warning: task.warning ?? null
+    limit: task.limit ?? null, limit_hit: task.limit_hit ?? null, denied: task.denied ?? null, warning: task.warning ?? null,
+    other_changes: task.other_changes ?? null
   };
   const notes = [];
   const statusNote = resultNote(task);
@@ -596,6 +599,16 @@ async function resultTool(args, context) {
   }
   if (task.worker === 'agy' && Array.isArray(task.refused_paths) && task.refused_paths.length > 0) {
     notes.push(`agy was kept in its folder and refused these writes: ${task.refused_paths.join(', ')}. Only the user can lift agy's fence, in the Delegated tab.`);
+  }
+  if (Array.isArray(task.other_changes) && task.other_changes.length > 0) {
+    const more = task.other_changes.length - OTHER_CHANGES_NAMED;
+    const files = `${task.other_changes.slice(0, OTHER_CHANGES_NAMED).join(', ')}${more > 0 ? `, and ${more} more` : ''}`;
+    // Codex edits only through shell commands, so no change can be tied to it, or ruled out.
+    if (task.worker === 'codex') {
+      notes.push(`Also changed in the folder during this read-only task: ${files}. Codex reports no file edits, so these can't be tied to it or to anyone else; its read-only sandbox refuses writes.`);
+    } else {
+      notes.push(`Also changed in the folder during this read-only task, by no edit step of ${workerLabel(task.worker)}'s (another session or the user, perhaps): ${files}.`);
+    }
   }
   if (typeof task.fence_layer_changed === 'string' && task.fence_layer_changed !== '') {
     notes.push(`The fence changed between runs: ${task.fence_layer_changed}.`);

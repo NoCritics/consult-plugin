@@ -158,10 +158,21 @@ if (scenario === 'ok') {
     emit({ type: 'turn.completed', usage: { input_tokens: 1, output_tokens: 1 } });
   }
 } else if (scenario === 'agy-edit') {
-  // An agy stream that ends well, after writing FAKE_WRITE_FILE (relative to the folder) and, when
-  // FAKE_DELETE_FILE is set, deleting that file: a read task's worker that edited anyway.
+  // An agy stream that ends well. FAKE_WRITE_FILE (relative to the folder) is written through agy's
+  // own step, shaped as agy 1.5.11 reports one (agy-edit.jsonl): edit_file for a file that exists,
+  // else write_file, an absolute Path, ACTIVE then DONE. A read task's worker that edited anyway.
+  // FAKE_OTHER_FILE is written and FAKE_DELETE_FILE deleted with no step: another session at work
+  // in the same folder meanwhile.
   emit({ event: 'init', conversation_id: threadId });
-  if (process.env.FAKE_WRITE_FILE) fs.writeFileSync(process.env.FAKE_WRITE_FILE, 'changed by the fake worker\n');
+  if (process.env.FAKE_WRITE_FILE) {
+    const target = path.resolve(process.env.FAKE_WRITE_FILE);
+    const toolName = fs.existsSync(target) ? 'edit_file' : 'write_file';
+    const step = (state) => ({ event: 'step_update', step_update: { conversation_id: threadId, step_index: 1, state, step_type: 'tool', tool_name: toolName, tool_info: { name: toolName, parameters: { Path: target } } } });
+    emit(step('ACTIVE'));
+    fs.writeFileSync(target, 'changed by the fake worker\n');
+    emit(step('DONE'));
+  }
+  if (process.env.FAKE_OTHER_FILE) fs.writeFileSync(process.env.FAKE_OTHER_FILE, 'changed by another session\n');
   if (process.env.FAKE_DELETE_FILE) fs.rmSync(process.env.FAKE_DELETE_FILE);
   emit({ event: 'result', result: { conversation_id: threadId, status: 'SUCCESS', response: 'Reviewed the code.' } });
 } else if (scenario === 'agy-denied') {
@@ -190,6 +201,15 @@ if (scenario === 'ok') {
   const sessionId = args[args.indexOf(args.includes('--session-id') ? '--session-id' : '--session') + 1];
   emit({ type: 'session', version: 3, id: sessionId });
   emit({ type: 'agent_start' });
+  // FAKE_WRITE_FILE (relative to the folder) is written through pi's own write tool, shaped as
+  // pi-write.jsonl reports one; FAKE_OTHER_FILE is written and FAKE_DELETE_FILE deleted with no
+  // tool call: another session at work in the same folder meanwhile.
+  if (process.env.FAKE_WRITE_FILE) {
+    emit({ type: 'tool_execution_start', toolCallId: 'fake-call-1', toolName: 'write', args: { path: process.env.FAKE_WRITE_FILE, content: 'changed by the fake worker\n' } });
+    fs.writeFileSync(process.env.FAKE_WRITE_FILE, 'changed by the fake worker\n');
+  }
+  if (process.env.FAKE_OTHER_FILE) fs.writeFileSync(process.env.FAKE_OTHER_FILE, 'changed by another session\n');
+  if (process.env.FAKE_DELETE_FILE) fs.rmSync(process.env.FAKE_DELETE_FILE);
   emit({ type: 'agent_end', willRetry: false, messages: [{ role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: 'Wrote the file with pi.' }] }] });
   emit({ type: 'agent_settled' });
 } else {

@@ -13,6 +13,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFile, execFileSync } from 'node:child_process';
 import { dataHome, readTask } from './delegate-store.js';
+import { realPathOfTarget, comparable } from './pi-fence.js';
 
 const MAX_GIT_OUTPUT_BYTES = 256 * 1024 * 1024;
 const SAFE_TASK_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
@@ -302,13 +303,17 @@ function porcelainStatusEntries(output) {
 
 // ---- did a read-only task change anything? ----
 //
-// A read task given to agy is checked too: its fence holds writes made through
-// its tools, and this catches any that got through another way. The folder is
-// looked at before the run and after it, and the files that differ are told to
-// the person. In a git project that is the read-only status (no lock, no index
-// write) plus each listed file's size and mtime, so a file that was already
-// modified and was edited again shows up too. Without git, or when git cannot
-// answer in time, it is a capped listing of the folder (size and mtime).
+// A read task is checked too, whichever worker runs it. The folder is looked at
+// before the run and after it; the files that differ are sorted (sortChanges): the
+// ones the worker's own write or edit step named are told to the person as a
+// warning, every other one (another session may be working in the same folder
+// meanwhile) as a neutral note. In a git project the look is the read-only status
+// (no lock, no index write) plus each listed file's size and mtime, so a file that
+// was already modified and was edited again shows up too. Without git, or when git
+// cannot answer in time, it is a capped listing of the folder (size and mtime).
+// Each watch keeps `base`, the folder its entries are relative to: the repository's
+// root for git (its paths start there even when the task's folder is below it),
+// the task's folder for a listing.
 const WATCH_STATUS_LIMIT_MS = 20000;
 const WATCH_LISTING_LIMIT = 5000;
 const WATCH_SKIPPED_FOLDERS = new Set(['.git', 'node_modules']);
@@ -332,7 +337,7 @@ async function gitWatch(folder) {
       entries.set(entry.path, `${entry.code}|${fileSignature(path.join(state.root, entry.path))}`);
       if (entry.oldPath) entries.set(entry.oldPath, `${entry.code}|from`);
     }
-    return { source: 'git', entries, capped: false };
+    return { source: 'git', base: state.root, entries, capped: false };
   } catch (_) {
     return null;
   }
@@ -364,7 +369,7 @@ function listingWatch(folder) {
     }
   };
   visit(folder, '');
-  return { source: 'listing', entries, capped };
+  return { source: 'listing', base: folder, entries, capped };
 }
 
 // What the folder looks like now, for diffWatch. Never throws.
@@ -376,22 +381,47 @@ export async function watchFolder(folder) {
   }
 }
 
-// The paths (sorted, forward slashes) that differ between two watches, or null
-// when they cannot be compared. A capped listing cannot say what was deleted
-// past its cap, so it reports only what both runs saw and what is new.
+// The full paths of the files that differ between two watches, or null when they
+// cannot be compared. A capped listing cannot say what was deleted past its cap,
+// so it reports only what both runs saw and what is new.
 export function diffWatch(before, after) {
   if (before === null || after === null || before.source !== after.source) return null;
   const capped = before.capped || after.capped;
   const changed = [];
   for (const [relative, signature] of after.entries) {
-    if (before.entries.get(relative) !== signature) changed.push(relative);
+    if (before.entries.get(relative) !== signature) changed.push(path.join(before.base, relative));
   }
   if (!capped) {
     for (const relative of before.entries.keys()) {
-      if (!after.entries.has(relative)) changed.push(relative);
+      if (!after.entries.has(relative)) changed.push(path.join(before.base, relative));
     }
   }
-  return changed.sort();
+  return changed;
+}
+
+// The changed files (diffWatch) split into those the worker's own write or edit steps
+// named (writeTargets, full paths) and all the others, each relative to `folder` with
+// forward slashes, sorted. Both sides are compared by real path, ignoring case.
+export function sortChanges(changed, writeTargets, folder) {
+  const realFolder = realPathOrAsWritten(folder);
+  const writtenKeys = new Set(writeTargets.map((target) => comparable(realPathOrAsWritten(target))));
+  const own = [];
+  const others = [];
+  for (const file of changed) {
+    const realFile = realPathOrAsWritten(file);
+    const relative = path.relative(realFolder, realFile).split(path.sep).join('/');
+    (writtenKeys.has(comparable(realFile)) ? own : others).push(relative);
+  }
+  return { own: own.sort(), others: others.sort() };
+}
+
+// A link loop cannot be resolved: such a path is compared as written.
+function realPathOrAsWritten(target) {
+  try {
+    return realPathOfTarget(path.resolve(target));
+  } catch (_) {
+    return path.resolve(target);
+  }
 }
 
 export async function makeCopy(project, taskId) {
