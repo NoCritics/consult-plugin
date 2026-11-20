@@ -108,8 +108,8 @@ export function recordLimit(worker, limit, at) {
   writeJsonAtomic(limitsFilePath(), data);
 }
 
-// Records that a worker hit its limit: `hit` is { kind, resets_at } with
-// resets_at in ms or null.
+// Records that a worker hit its limit (opencode: 'opencode:<model>', one record per model):
+// `hit` is { kind, resets_at } with resets_at in ms or null.
 export function recordLimitHit(worker, hit, at) {
   const data = readLimitsFile();
   data.hits[worker] = {
@@ -135,6 +135,9 @@ function recordedReading(entry) {
   }
   return windows.length === 0 ? null : { windows, at: entry.at };
 }
+
+// opencode's limits are kept per model: the key is 'opencode:' and the model's id.
+export const OPENCODE_MODEL_KEY_PREFIX = 'opencode:';
 
 function recordedHit(entry) {
   if (!isPlainObject(entry) || typeof entry.hit_at !== 'number') return null;
@@ -241,6 +244,7 @@ function newestRolloutReading(now) {
 //   codex  { windows, at, stale, hit } or null; `hit` is { hit_at, resets_at } or null
 //   agy    { hit_at, resets_at } or null
 //   local  { hit_at, resets_at } or null
+//   'opencode:<model>'  one entry per model opencode hit a limit on: { hit_at, resets_at, kind }
 // codex's windows are the newest of the recorded reading and, when that is
 // missing or over 30 min old, the newest codex rollout. `stale` says the
 // newest reading is over 30 min old.
@@ -261,7 +265,11 @@ export function lastLimits(now) {
       hit: codexHit
     };
   }
-  return { codex, agy: recordedHit(data.hits.agy), local: recordedHit(data.hits.local) };
+  const known = { codex, agy: recordedHit(data.hits.agy), local: recordedHit(data.hits.local) };
+  for (const key of Object.keys(data.hits)) {
+    if (key.startsWith(OPENCODE_MODEL_KEY_PREFIX)) known[key] = recordedHit(data.hits[key]);
+  }
+  return known;
 }
 
 // ---- the policy ----
@@ -302,7 +310,7 @@ function resetText(resetsAt, now) {
 // Whether a worker's recorded hit still holds at `now`: its reset is ahead, or
 // is unknown and the hit is under an hour old (under 5 min for a throttled hit). For codex a later reading of
 // the windows supersedes the hit: it shows what the plan has now.
-function activeHit(worker, limits, now) {
+export function activeHit(worker, limits, now) {
   const hit = worker === 'codex' ? limits.codex?.hit : limits[worker];
   if (!isPlainObject(hit) || typeof hit.hit_at !== 'number') return null;
   if (worker === 'codex' && typeof limits.codex.at === 'number' && limits.codex.at > hit.hit_at) return null;

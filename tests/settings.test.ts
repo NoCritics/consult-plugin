@@ -68,6 +68,24 @@ describe('settings', () => {
     ])
   })
 
+  test('opencode.models: known in the global file, global-only in a project file, read from the global file only', async () => {
+    expect(frontmatterWarnings('---\nopencode.models: a/b, c/d\n---\n')).toEqual([])
+    expect(frontmatterWarnings('---\nopencode.models: a/b\n---\n', true)).toEqual([
+      'line 2: ignored `opencode.models`: opencode settings are global-only (~/.claude/consult.local.md)',
+    ])
+    const world = {
+      cwd: 'C:/proj',
+      env: { USERPROFILE: 'C:/home' },
+      files: {
+        'C:/proj/.claude/consult.local.md': '---\nopencode.models: x/y\ntimeout_ms: 300000\n---\n',
+        'C:/home/.claude/consult.local.md': '---\nopencode.models: a/b\n---\n',
+      } as Record<string, string>,
+    }
+    const settings = await loadConsultSettings(pluginDollar(world))
+    expect(settings.raw['opencode.models']).toBe('a/b')
+    expect(settings.raw.timeout_ms).toBe(300000)
+  })
+
   test('loadConsultSettings: delegate settings come from the global file only', async () => {
     const world = {
       cwd: 'C:/proj',

@@ -1,0 +1,6 @@
+[32mopencode/big-pickle[0m
+opencode/paid-pro
+opencode/no-price
+openrouter/google/gemma-4-31b-it:free
+openrouter/google/gemma-4-31b-it
+some warning line

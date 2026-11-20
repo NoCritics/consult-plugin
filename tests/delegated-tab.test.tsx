@@ -73,7 +73,8 @@ const DONE_READ = task({ id: 'eee555', worker: 'agy', title: 'review CSS', state
 const SETTINGS: DelegateShow['settings'] = {
   workers_edit: 'auto',
   table: { code: 'codex', research_review: 'agy', private: 'local' },
-  fence: { codex: 'fenced', agy: 'fenced', local: 'fenced' },
+  fence: { codex: 'fenced', agy: 'fenced', local: 'fenced', opencode: 'fenced' },
+  opencode: { models: ['opencode/deepseek-v4.1-flash-free', 'opencode/big-pickle'] },
   local_fence_check: 'unchecked',
   local_at_once: 'auto',
   // what auto comes to now
@@ -774,6 +775,21 @@ describe('delegated tab', () => {
       await ui.unmount()
     })
 
+    test('an opencode row shows its model, and each switch after a rate limit', async ($, on) => {
+      const switched = task({ id: 'jjj000', worker: 'opencode', state: 'done', reported_at: 5, model_used: 'opencode/big-pickle', model_switches: ['opencode/deepseek-v4.1-flash-free → opencode/big-pickle: rate limit'] })
+      const plain = task({ id: 'kkk111', worker: 'opencode', state: 'done', reported_at: 5, model_used: 'opencode/big-pickle', model_switches: [] })
+      const { ui } = await mountWith($, on, () => shown([switched, plain]))
+      await ui.press({ key: 'delegated:row:jjj000' })
+      const first = await lines(ui, 120)
+      expect(lineWith(first, /^\s+model: opencode\/big-pickle$/)).toBeDefined()
+      expect(lineWith(first, /^\s+switched: opencode\/deepseek-v4\.1-flash-free → opencode\/big-pickle: rate limit$/)).toBeDefined()
+      await ui.press({ key: 'delegated:row:kkk111' })
+      const second = await lines(ui, 120)
+      expect(lineWith(second, /^\s+model: opencode\/big-pickle$/)).toBeDefined()
+      expect(lineWith(second, /switched:/)).toBeUndefined()
+      await ui.unmount()
+    })
+
     test('a running local row says it keeps the GPU busy only when tasks keep running after close', async ($, on) => {
       const keepsRunning = task({ id: 'fff666', worker: 'local', title: 'big job', state: 'running', keep_running: true, fenced: false })
       const stopsOnClose = task({ id: 'ggg777', worker: 'local', title: 'other job', state: 'running', keep_running: false, fenced: false })
@@ -1392,7 +1408,7 @@ describe('delegated tab', () => {
         const select = await ui.find({ key: `delegated:set:table:${row}` })
         const values: string[] = []
         for (const option of (select?.props.options ?? []) as { value: string }[]) values.push(option.value)
-        expect(values, row).toEqual(['codex', 'agy', 'local', 'ask'])
+        expect(values, row).toEqual(row === 'private' ? ['codex', 'agy', 'local', 'ask'] : ['codex', 'agy', 'local', 'opencode', 'ask'])
       }
       expect((await ui.find({ key: 'delegated:set:table:code' }))?.props.value).toBe('ask')
       await ui.select({ key: 'delegated:set:table:private', value: 'ask' })
@@ -1655,6 +1671,49 @@ describe('delegated tab', () => {
         expect(await ui.find({ type: 'Text', text: /Full access: Codex can read/ })).toBeUndefined()
         await ui.select({ key: 'delegated:set:fence:codex', value: 'full' })
         expect(await ui.find({ type: 'Text', text: /Full access: Codex can read/ })).toBeDefined()
+        await ui.unmount()
+      })
+
+      const OPENCODE_LIFT = 'not fenced: it runs without the sandbox and can change any file you can'
+
+      test('tab: opencode has a fence row, and lifting it warns before saving', async ($, on) => {
+        const { w, ui } = await mountWith($, on, args => (args[0] === 'show' ? SKETCH : { settings: SETTINGS, global_written: false }))
+        await ui.press({ key: 'delegated:fold' })
+        expect((await ui.find({ key: 'delegated:set:fence:opencode' }))?.props.value).toBe('fenced')
+        expect(lineWith(await lines(ui, 120), /fenced \(files\); network open/)).toBeDefined()
+        expect(await ui.find({ type: 'Text', text: /not fenced: it runs without the sandbox/ })).toBeUndefined()
+        await ui.select({ key: 'delegated:set:fence:opencode', value: 'none' })
+        const warning = await ui.find({ type: 'Text', text: /not fenced: it runs without the sandbox/ })
+        expect(warning?.props.color).toBe('warning')
+        expect(squash((await lines(ui, 120)).join(' '))).toContain(squash(OPENCODE_LIFT))
+        expect(savesOf(w)).toEqual([])
+        await ui.press({ key: 'delegated:save' })
+        await w.clock.settle()
+        expect(savesOf(w)).toEqual(['save {"fence":{"opencode":"none"}}'])
+        await ui.unmount()
+      })
+
+      test('the folded line shows opencode anywhere', async ($, on) => {
+        const { ui, show } = await showing($, on, 120)
+        await show(lifted({ opencode: 'none' }))
+        expect(lineWith(await lines(ui, 120), /opencode anywhere/)).toBeDefined()
+        await ui.unmount()
+      })
+
+      test('opencode is a routing choice for every kind but private', async ($, on) => {
+        const { ui } = await mountWith($, on, () => SKETCH)
+        await ui.press({ key: 'delegated:fold' })
+        const values = async (row: string) => ((await ui.find({ key: `delegated:set:table:${row}` }))?.props.options as { value: string }[]).map(option => option.value)
+        expect(await values('code')).toContain('opencode')
+        expect(await values('research_review')).toContain('opencode')
+        expect(await values('private')).not.toContain('opencode')
+        await ui.unmount()
+      })
+
+      test('the opencode model list is shown read-only', async ($, on) => {
+        const { ui } = await mountWith($, on, () => SKETCH)
+        await ui.press({ key: 'delegated:fold' })
+        expect(lineWith(await lines(ui, 120), /opencode models: opencode\/deepseek-v4.1-flash-free, opencode\/big-pickle/)).toBeDefined()
         await ui.unmount()
       })
 

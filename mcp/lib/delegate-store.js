@@ -14,7 +14,7 @@ import path from 'node:path';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { DELEGATE_WORKERS } from './settings.js';
-import { removePiTemp, checkFilePath } from './delegate-fence.js';
+import { removeWorkerTemp, checkFilePath } from './delegate-fence.js';
 import { realPathOfTarget, isInside } from './pi-fence.js';
 import { isTaskId, sleepSync, lockLostError, writeFileAtomic, writeJsonAtomic, readJsonOrNull } from './json-file.js';
 
@@ -52,7 +52,7 @@ const LOCK_READ_PATIENCE_MS = 1000;
 const LOCK_ASYNC_RETRY_MS = 20;
 
 const INDEX_FIELDS = [
-  'id', 'worker', 'model', 'title', 'project', 'state', 'location', 'mode', 'summary', 'fenced', 'fence', 'fence_layer',
+  'id', 'worker', 'model', 'model_used', 'model_switches', 'title', 'project', 'state', 'location', 'mode', 'summary', 'fenced', 'fence', 'fence_layer',
   'started_at', 'ended_at', 'stop_reason', 'limit', 'queue_model', 'owner_instance', 'reported_at',
   'queue_waiting_long', 'keep_running', 'hold', 'owner_session', 'created_at', 'queued_at', 'read_only_edits', 'other_changes', 'time_limit_ms'
 ];
@@ -60,8 +60,8 @@ const INDEX_FIELDS = [
 // What each worker's tasks may do beyond the folder they work in. Codex is
 // `fenced` (an enforced fence) or `full`; agy and local are `fenced` or `none`.
 // A stored `soft` (0.16.0) reads as `fenced`.
-export const FENCE_VALUES = Object.freeze({ codex: ['fenced', 'full'], agy: ['fenced', 'none'], local: ['fenced', 'none'] });
-export const DEFAULT_FENCE = Object.freeze({ codex: 'fenced', agy: 'fenced', local: 'fenced' });
+export const FENCE_VALUES = Object.freeze({ codex: ['fenced', 'full'], agy: ['fenced', 'none'], local: ['fenced', 'none'], opencode: ['fenced', 'none'] });
+export const DEFAULT_FENCE = Object.freeze({ codex: 'fenced', agy: 'fenced', local: 'fenced', opencode: 'fenced' });
 
 // A fence value as the worker reads it: a valid value as is, `soft` as `fenced`,
 // anything else as the worker's default (`fenced` for an unknown worker).
@@ -126,6 +126,9 @@ export function createTask(spec) {
     id,
     worker: spec.worker,
     model: spec.model ?? null,
+    // opencode only: the model its last run used, and the switches a rate limit made in that run.
+    model_used: null,
+    model_switches: [],
     effort: spec.effort ?? null,
     title: spec.title ?? '',
     kind: spec.kind ?? null,
@@ -434,7 +437,7 @@ export function removeTaskWhen(id, allowed) {
     const current = readTask(id);
     if (current === null || !allowed(current)) return false;
     fs.rmSync(taskFolder(id), { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
-    removePiTemp(id);
+    removeWorkerTemp(current.worker, id);
     return true;
   });
   if (removed) rewriteIndex();

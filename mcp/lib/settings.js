@@ -73,10 +73,15 @@ export function isRunnerKey(key) {
 // Delegate (background task) settings: `delegate.<key>`, global-only like the
 // runner settings. They are not in KNOWN_KEYS: the mod keeps a copy of that
 // list and does not read them.
-export const DELEGATE_WORKERS = Object.freeze(['codex', 'agy', 'local']);
+export const DELEGATE_WORKERS = Object.freeze(['codex', 'agy', 'local', 'opencode']);
 const DELEGATE_TABLE_KEYS = ['code', 'research', 'review', 'private'];
 // A table row names a worker, or `ask`: the delegate tool then asks which worker, as for a task of kind `other`.
 const DELEGATE_TABLE_CHOICES = Object.freeze([...DELEGATE_WORKERS, 'ask']);
+// `private` work never goes to a cloud worker: opencode is refused there.
+const DELEGATE_PRIVATE_CHOICES = Object.freeze(DELEGATE_TABLE_CHOICES.filter(choice => choice !== 'opencode'));
+// opencode's free models, in the order to try them; global-only like `delegate.*`.
+const OPENCODE_MODELS_KEY = 'opencode.models';
+const DEFAULT_OPENCODE_MODELS = Object.freeze(['opencode/deepseek-v4.1-flash-free', 'opencode/big-pickle']);
 export const DELEGATE_KEYS = Object.freeze([
   ...DELEGATE_TABLE_KEYS.map(kind => `delegate.${kind}`),
   'delegate.local_at_once', 'delegate.on_close', 'delegate.time_limit_min'
@@ -94,7 +99,15 @@ export function isDelegateKey(key) {
 
 // Settings that describe this machine, not a project: read from the global file only.
 function isGlobalOnlyKey(key) {
-  return isRunnerKey(key) || isDelegateKey(key);
+  return isRunnerKey(key) || isDelegateKey(key) || key === OPENCODE_MODELS_KEY;
+}
+
+function opencodeSettings(globalSettings) {
+  const models = [];
+  for (const entry of String(globalSettings[OPENCODE_MODELS_KEY] ?? '').split(',')) {
+    if (entry.trim() !== '') models.push(entry.trim());
+  }
+  return { models: models.length > 0 ? models : [...DEFAULT_OPENCODE_MODELS] };
 }
 
 // Why a `delegate.*` value is refused, or null when it is fine (or unset).
@@ -102,7 +115,8 @@ export function delegateProblem(key, value) {
   if (value === null) return null;
   const field = key.slice('delegate.'.length);
   if (DELEGATE_TABLE_KEYS.includes(field)) {
-    return DELEGATE_TABLE_CHOICES.includes(value) ? null : `must be one of ${DELEGATE_TABLE_CHOICES.join(', ')}`;
+    const choices = field === 'private' ? DELEGATE_PRIVATE_CHOICES : DELEGATE_TABLE_CHOICES;
+    return choices.includes(value) ? null : `must be one of ${choices.join(', ')}`;
   }
   if (field === 'on_close') {
     return DELEGATE_ON_CLOSE.includes(value) ? null : `must be one of ${DELEGATE_ON_CLOSE.join(', ')}`;
@@ -162,7 +176,7 @@ export function frontmatterWarnings(text, { projectScope = false } = {}) {
     }
     seenAt.set(key, lineNumber);
     if (projectScope && isGlobalOnlyKey(key)) {
-      const kind = isRunnerKey(key) ? 'runner' : 'delegate';
+      const kind = isRunnerKey(key) ? 'runner' : isDelegateKey(key) ? 'delegate' : 'opencode';
       warnings.push(`line ${lineNumber}: ignored \`${key}\`: ${kind} settings are global-only (~/.claude/consult.local.md)`);
       continue;
     }
@@ -175,6 +189,7 @@ export function frontmatterWarnings(text, { projectScope = false } = {}) {
       if (problem !== null) warnings.push(`line ${lineNumber}: ignored \`${key}\`: ${problem}`);
       continue;
     }
+    if (key === OPENCODE_MODELS_KEY) continue;
     if (key === 'local_runner') {
       runnerChosen = true;
       const value = found[2].replace(/\s+#.*$/, '').replace(/^(['"])(.*)\1$/, '$2');
@@ -280,6 +295,9 @@ export function sanitize(parsed) {
   if ('local_runner' in out && !RUNNER_TYPES.includes(out.local_runner)) delete out.local_runner;
   for (const key of Object.keys(out)) {
     if (isDelegateKey(key) && (out[key] === null || delegateProblem(key, out[key]) !== null)) delete out[key];
+  }
+  if (OPENCODE_MODELS_KEY in out && (typeof out[OPENCODE_MODELS_KEY] !== 'string' || out[OPENCODE_MODELS_KEY].trim() === '')) {
+    delete out[OPENCODE_MODELS_KEY];
   }
   for (const key of Object.keys(out)) {
     if (!key.includes('.') || !isRunnerKey(key)) continue;
@@ -469,14 +487,14 @@ export function loadSettings() {
       }
       const settings = {
         ...DEFAULTS, ...parsed, ...globalOnlyKeys,
-        delegate: delegateSettings(global), _source: p, _global: global, _warnings: warnings
+        delegate: delegateSettings(global), opencode: opencodeSettings(global), _source: p, _global: global, _warnings: warnings
       };
       cache = { path: p, mtimeMs: stat.mtimeMs, globalMtimeMs: globalMtime, settings };
       return settings;
     } catch (_) { /* fall through */ }
   }
   if (cache && cache.path === null) return cache.settings;
-  const settings = { ...DEFAULTS, delegate: delegateSettings({}), _source: null, _global: {}, _warnings: [] };
+  const settings = { ...DEFAULTS, delegate: delegateSettings({}), opencode: opencodeSettings({}), _source: null, _global: {}, _warnings: [] };
   cache = { path: null, mtimeMs: 0, globalMtimeMs: 0, settings };
   return settings;
 }

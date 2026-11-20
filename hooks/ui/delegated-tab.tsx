@@ -91,6 +91,7 @@ const WORKER_OPTIONS = [
   { value: 'codex', label: 'codex' },
   { value: 'agy', label: 'agy' },
   { value: 'local', label: 'local' },
+  { value: 'opencode', label: 'opencode' },
   // The worker is asked for when a task of that kind comes up.
   { value: 'ask', label: 'ask' },
 ]
@@ -106,6 +107,7 @@ const FENCE_ROWS = [
   },
   { worker: 'agy', label: 'agy', field: 'fence_agy', options: WORKER_FENCE_OPTIONS },
   { worker: 'local', label: 'Local', field: 'fence_local', options: WORKER_FENCE_OPTIONS },
+  { worker: 'opencode', label: 'opencode', field: 'fence_opencode', options: WORKER_FENCE_OPTIONS },
 ] as const
 const WORKERS_EDIT_OPTIONS = [
   { value: 'auto', label: 'Auto' },
@@ -301,6 +303,10 @@ export function drawDelegatedTab($: EngineInterface, table: Table, surface: stri
     if (row.worker === 'agy') notes.push("can't run commands")
     if (row.worker === 'local' && row.state === 'running' && row.keep_running) notes.push('keeps the GPU busy and its model loaded')
     if (notes.length > 0) lines.push(<Text color="warning" wrap="truncate-end">{notes.join(' · ')}</Text>)
+    if (row.model_used !== undefined && row.model_used !== null) lines.push(<Text dimColor wrap="truncate-end">{`model: ${row.model_used}`}</Text>)
+    if (row.model_switches !== undefined && row.model_switches.length > 0) {
+      lines.push(<Text color="warning" wrap="truncate-end">{`switched: ${row.model_switches.join(' · ')}`}</Text>)
+    }
     if (row.read_only_edits !== null && row.read_only_edits.length > 0) {
       lines.push(<Text color="warning" wrap="truncate-end">{`changed in this read-only task: ${row.read_only_edits.join(', ')}`}</Text>)
     }
@@ -441,6 +447,7 @@ export function drawDelegatedTab($: EngineInterface, table: Table, surface: stri
     if (fences.codex === 'full') liftedParts.push('codex full access')
     if (fences.agy === 'none') liftedParts.push('agy anywhere')
     if (fences.local === 'none') liftedParts.push('local anywhere')
+    if (fences.opencode === 'none') liftedParts.push('opencode anywhere')
     if (!view.isFoldOpen) {
       settingsBlock = (
         <Box flexDirection="row">
@@ -456,7 +463,8 @@ export function drawDelegatedTab($: EngineInterface, table: Table, surface: stri
     } else {
       const tableSelects = []
       for (const row of TABLE_ROWS) {
-        const options = [...WORKER_OPTIONS]
+        // private work stays on this machine: the server refuses opencode there
+        const options = WORKER_OPTIONS.filter(option => row !== 'private' || option.value !== 'opencode')
         if (settings.table[row] === 'mixed') options.push({ value: 'mixed', label: 'mixed' })
         tableSelects.push(
           <Select
@@ -505,6 +513,7 @@ export function drawDelegatedTab($: EngineInterface, table: Table, surface: stri
             <Text bold>Fences (this project)</Text>
             {fenceSelects}
             {liftLines}
+            <Text dimColor wrap="wrap">{`opencode models: ${(settings.opencode?.models ?? []).join(', ')}`}</Text>
             <Input
               key="delegated:set:local_at_once"
               label={'Local at once'.padEnd(SETTING_COLUMN)}

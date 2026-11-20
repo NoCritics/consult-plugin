@@ -79,10 +79,11 @@
 # summary_model: haiku                  # unset: summary = the answer's first paragraph
 
 # ----- Delegate (background tasks); global file only, also set from the Delegated tab -----
-# delegate.code: codex                  # worker for writing, building, editing: codex | agy | local | ask
+# delegate.code: codex                  # worker for writing, building, editing: codex | agy | opencode | local | ask
 # delegate.research: agy
 # delegate.review: agy
-# delegate.private: local               # private or offline work
+# delegate.private: local               # private or offline work (never opencode)
+# opencode.models: opencode/deepseek-v4.1-flash-free, opencode/big-pickle   # free models only, tried in order; switches on a rate limit
 # delegate.local_at_once: auto          # auto, or a ceiling 1-8 for local tasks at once
 # delegate.on_close: stop               # stop | keep: what happens to running tasks when Claude Code closes
 # delegate.time_limit_min: 180          # per task, 10-1440

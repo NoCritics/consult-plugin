@@ -17,7 +17,7 @@ import {
   beat, isAlive, isSessionAlive, taskFence, normalFence, narrowerFence, projectSettings, saveProjectSettings, projectKey, taskFolder,
   withTaskLock, breakStaleLock, updateTaskWhen, withLockFolder
 } from './lib/delegate-store.js';
-import { loadSettings, frontmatterWarnings, DEFAULTS } from './lib/settings.js';
+import { loadSettings, frontmatterWarnings, delegateProblem, DELEGATE_WORKERS, DEFAULTS } from './lib/settings.js';
 import { parseWorkerWord, workerForKind, WORKER_ALIASES } from './lib/delegate-route.js';
 import {
   workerCommand, parseWorkerStream, noteStepEvent, contextWarning, codexRolloutLimits, workerPreamble, CONTINUE_PROMPT, READ_ONLY_REMINDER, refusedOutside, workerWriteTargets
@@ -34,7 +34,7 @@ import { makeAsker } from './lib/council.js';
 import { sleepUnlessAborted } from './lib/util.js';
 import { fakeServer, startServer, handshake, unpack } from './test-helpers.js';
 import { shellSafeArgs } from './lib/spawn-cli.js';
-import { piTempFolders } from './lib/delegate-fence.js';
+import { workerTempFolders, SANDBOX_ENV_POLICY_ARGS } from './lib/delegate-fence.js';
 import { spawnableCmd, SPAWN_OPTS } from './lib/resolve-cmd.js';
 
 let failed = 0;
@@ -61,6 +61,7 @@ const originalEnv = {
   CONSULT_PROJECTS_FILE: process.env.CONSULT_PROJECTS_FILE,
   CODEX_HOME: process.env.CODEX_HOME,
   CONSULT_PI_TEMP_ROOT: process.env.CONSULT_PI_TEMP_ROOT,
+  CONSULT_OPENCODE_TEMP_ROOT: process.env.CONSULT_OPENCODE_TEMP_ROOT,
   CONSULT_DELEGATE_TEST_NO_CODEX: process.env.CONSULT_DELEGATE_TEST_NO_CODEX,
   CONSULT_SANDBOX_CHECK_FILE: process.env.CONSULT_SANDBOX_CHECK_FILE
 };
@@ -68,6 +69,7 @@ process.env.CONSULT_DELEGATE_HOME = path.join(scratch, 'data');
 process.env.CONSULT_PROJECTS_FILE = path.join(scratch, 'consult-projects.json');
 // pi's temp folders go under the scratch folder, and a launched supervisor never reaches a real Codex.
 process.env.CONSULT_PI_TEMP_ROOT = path.join(scratch, 'consult-pi');
+process.env.CONSULT_OPENCODE_TEMP_ROOT = path.join(scratch, 'consult-opencode');
 process.env.CONSULT_DELEGATE_TEST_NO_CODEX = '1';
 // The Codex sandbox check cache is a scratch file for the whole run, never the user's ~/.claude one (unless the caller set one).
 if (!process.env.CONSULT_SANDBOX_CHECK_FILE) process.env.CONSULT_SANDBOX_CHECK_FILE = path.join(scratch, 'consult-sandbox-check.json');
@@ -189,7 +191,7 @@ try {
     eq('index: newest first', index.tasks.map(row => row.title), ['third', 'second', 'first']);
     truthy('index: updated_at is a time in ms', Math.abs(index.updated_at - Date.now()) < 5000);
     eq('index: row fields', Object.keys(index.tasks[0]).sort(), [
-      'id', 'worker', 'model', 'title', 'project', 'state', 'location', 'mode', 'summary', 'fenced', 'fence', 'fence_layer',
+      'id', 'worker', 'model', 'model_used', 'model_switches', 'title', 'project', 'state', 'location', 'mode', 'summary', 'fenced', 'fence', 'fence_layer',
       'started_at', 'ended_at', 'stop_reason', 'limit', 'queue_model', 'owner_instance', 'reported_at',
       'queue_waiting_long', 'keep_running', 'hold', 'owner_session', 'created_at', 'queued_at', 'time_limit_ms'
     ].sort());
@@ -613,7 +615,7 @@ try {
   // ---- per-project settings ----
   {
     const project = path.join(scratch, 'My Projects', 'Имя');
-    const fenceDefaults = { codex: 'fenced', agy: 'fenced', local: 'fenced' };
+    const fenceDefaults = { codex: 'fenced', agy: 'fenced', local: 'fenced', opencode: 'fenced' };
     eq('projectSettings: defaults for an unknown project', projectSettings(project), { workers_edit: 'auto', git: 'ask', fence: fenceDefaults });
     eq('projectSettings: no file is created by reading', fs.existsSync(process.env.CONSULT_PROJECTS_FILE), false);
     const saved = saveProjectSettings(project, { workers_edit: 'copy' });
@@ -641,10 +643,10 @@ try {
     const projectsFile = process.env.CONSULT_PROJECTS_FILE;
     fs.rmSync(projectsFile, { force: true });
     const spec = sampleSpec();
-    eq('projectSettings: fence defaults', projectSettings(freshProject).fence, { codex: 'fenced', agy: 'fenced', local: 'fenced' });
+    eq('projectSettings: fence defaults', projectSettings(freshProject).fence, { codex: 'fenced', agy: 'fenced', local: 'fenced', opencode: 'fenced' });
     saveProjectSettings(freshProject, { fence: { codex: 'full' } });
     saveProjectSettings(freshProject, { fence: { agy: 'none' } });
-    eq('saveProjectSettings: fence merges per worker', projectSettings(freshProject).fence, { codex: 'full', agy: 'none', local: 'fenced' });
+    eq('saveProjectSettings: fence merges per worker', projectSettings(freshProject).fence, { codex: 'full', agy: 'none', local: 'fenced', opencode: 'fenced' });
     saveProjectSettings(freshProject, { fence: { codex: null } });
     eq('saveProjectSettings: null puts one worker back', projectSettings(freshProject).fence.codex, 'fenced');
     throws('saveProjectSettings: codex cannot be soft', () => saveProjectSettings(freshProject, { fence: { codex: 'soft' } }));
@@ -652,12 +654,15 @@ try {
     // ---- fence values 0.17 ----
     const writeProjectsFile = (contents) => fs.writeFileSync(projectsFile, JSON.stringify(contents));
     fs.rmSync(projectsFile, { force: true });
-    eq('fence 0.17: defaults are fenced for all', projectSettings(freshProject).fence, { codex: 'fenced', agy: 'fenced', local: 'fenced' });
+    eq('fence 0.17: defaults are fenced for all', projectSettings(freshProject).fence, { codex: 'fenced', agy: 'fenced', local: 'fenced', opencode: 'fenced' });
+    eq('fence opencode: none and fenced are its values', [normalFence('opencode', 'none'), normalFence('opencode', 'fenced')], ['none', 'fenced']);
+    eq('fence opencode: full is not one of them and reads as fenced', normalFence('opencode', 'full'), 'fenced');
+    eq('fence opencode: a task defaults to fenced', createTask({ ...spec, worker: 'opencode' }).fence, 'fenced');
     eq('fence 0.17: soft reads as fenced', [normalFence('agy', 'soft'), normalFence('local', 'soft'), normalFence('codex', 'soft')], ['fenced', 'fenced', 'fenced']);
     eq('fence 0.17: an old task with soft', taskFence({ worker: 'local', fence: 'soft' }), 'fenced');
     // a project file written by 0.16.0 with agy soft and codex full
     writeProjectsFile({ [projectKey(freshProject)]: { fence: { codex: 'full', agy: 'soft', local: 'none' } } });
-    eq('fence 0.17: an old file reads soft as fenced', projectSettings(freshProject).fence, { codex: 'full', agy: 'fenced', local: 'none' });
+    eq('fence 0.17: an old file reads soft as fenced', projectSettings(freshProject).fence, { codex: 'full', agy: 'fenced', local: 'none', opencode: 'fenced' });
     saveProjectSettings(freshProject, { git: 'ask' });
     eq('fence 0.17: saving another key keeps the old file readable', projectSettings(freshProject).fence.local, 'none');
     throws('fence 0.17: soft can no longer be saved', () => saveProjectSettings(freshProject, { fence: { agy: 'soft' } }));
@@ -677,10 +682,10 @@ try {
     eq('saveProjectSettings: a fence save changes only the named worker', JSON.parse(fs.readFileSync(projectsFile, 'utf8'))[projectKey(stampProject)], { fence: { codex: 'full', agy: 'none' }, git: 'declined' });
     // a hand-edited file with a bad value reads as the default
     fs.writeFileSync(projectsFile, JSON.stringify({ [projectKey(freshProject)]: { fence: { codex: 'wide-open', agy: 'none' } } }));
-    eq('projectSettings: a bad value reads as the default', projectSettings(freshProject).fence, { codex: 'fenced', agy: 'none', local: 'fenced' });
+    eq('projectSettings: a bad value reads as the default', projectSettings(freshProject).fence, { codex: 'fenced', agy: 'none', local: 'fenced', opencode: 'fenced' });
     // unreadable file: defaults
     fs.writeFileSync(projectsFile, '{ not json');
-    eq('projectSettings: unreadable file reads fenced', projectSettings(freshProject).fence, { codex: 'fenced', agy: 'fenced', local: 'fenced' });
+    eq('projectSettings: unreadable file reads fenced', projectSettings(freshProject).fence, { codex: 'fenced', agy: 'fenced', local: 'fenced', opencode: 'fenced' });
     eq('createTask: fence defaults by worker', [createTask({ ...spec, worker: 'codex' }).fence, createTask({ ...spec, worker: 'agy' }).fence], ['fenced', 'fenced']);
     eq('createTask: fence is kept', createTask({ ...spec, worker: 'codex', fence: 'full' }).fence, 'full');
     throws('createTask: a fence of another worker is refused', () => createTask({ ...spec, worker: 'agy', fence: 'full' }));
@@ -764,6 +769,22 @@ try {
     const unknownKey = loadWith({ globalText: '---\ndelegate.colour: red\n---\n' });
     truthy('settings.delegate: an unknown delegate key is an unknown setting', unknownKey.settings._warnings.some(warning => warning.includes('unknown setting `delegate.colour`')));
 
+    // ---- opencode: a worker name, a fence and a global model list ----
+    eq('delegateProblem: opencode may run code', delegateProblem('delegate.code', 'opencode'), null);
+    eq('delegateProblem: opencode may run research', delegateProblem('delegate.research', 'opencode'), null);
+    eq('delegateProblem: opencode may review', delegateProblem('delegate.review', 'opencode'), null);
+    truthy('delegateProblem: private refuses opencode and names local', typeof delegateProblem('delegate.private', 'opencode') === 'string' && delegateProblem('delegate.private', 'opencode').includes('local'));
+    eq('delegateProblem: private still takes codex, agy, local and ask', ['codex', 'agy', 'local', 'ask'].map(choice => delegateProblem('delegate.private', choice)), [null, null, null, null]);
+    eq('DELEGATE_WORKERS: opencode is a worker', [...DELEGATE_WORKERS], ['codex', 'agy', 'local', 'opencode']);
+    const defaultOpencodeModels = ['opencode/deepseek-v4.1-flash-free', 'opencode/big-pickle'];
+    eq('settings.opencode.models: unset reads as the default list', loadWith({}).settings.opencode.models, defaultOpencodeModels);
+    eq('settings.opencode.models: the global list is trimmed and empty entries dropped', loadWith({ globalText: '---\nopencode.models: a/x, , b/y\n---\n' }).settings.opencode.models, ['a/x', 'b/y']);
+    eq('settings.opencode.models: an all-empty list reads as the default', loadWith({ globalText: '---\nopencode.models: " , "\n---\n' }).settings.opencode.models, defaultOpencodeModels);
+    const projectModels = loadWith({ globalText: '---\nopencode.models: g/one\n---\n', projectText: '---\nopencode.models: p/two\n---\n' });
+    eq('settings.opencode.models: a project file cannot set it', projectModels.settings.opencode.models, ['g/one']);
+    truthy('settings.opencode.models: the project line is warned about as global-only', projectModels.settings._warnings.some(warning => warning.includes('`opencode.models`') && warning.includes('global-only')));
+    eq('settings.opencode.models: a project file alone leaves the default', loadWith({ projectText: '---\nopencode.models: p/two\n---\n' }).settings.opencode.models, defaultOpencodeModels);
+    eq('settings.opencode.models: a good global line has no warnings', loadWith({ globalText: '---\nopencode.models: a/x, b/y\n---\n' }).settings._warnings, []);
     eq('frontmatterWarnings: a quoted value is read', frontmatterWarnings('---\ndelegate.on_close: "keep"\n---\n'), []);
     eq('frontmatterWarnings: a trailing comment is ignored', frontmatterWarnings('---\ndelegate.time_limit_min: 60 # an hour\n---\n'), []);
     eq('frontmatterWarnings: an empty value is just unset', frontmatterWarnings('---\ndelegate.on_close:\n---\n'), []);
@@ -793,6 +814,7 @@ try {
     });
     truthy('WORKER_ALIASES: is frozen', Object.isFrozen(WORKER_ALIASES));
 
+    eq('parseWorkerWord: opencode', parseWorkerWord('opencode'), { worker: 'opencode', nickname: null });
     eq('parseWorkerWord: codex', parseWorkerWord('codex'), { worker: 'codex', nickname: null });
     eq('parseWorkerWord: an alias, any case', parseWorkerWord('OpenAI'), { worker: 'codex', nickname: null });
     eq('parseWorkerWord: local:big', parseWorkerWord('local:big'), { worker: 'local', nickname: 'big' });
@@ -1654,6 +1676,118 @@ try {
     const agyWriteForPreamble = workerCommand(createTask(sampleSpec({ worker: 'agy', mode: 'write' })), { settings: defaultSettings });
     eq('a write task keeps the write preamble', agyWriteForPreamble.stdinText.startsWith(workerPreamble(agyWriteForPreamble.cwd, true, 'agy', 'fenced', 'agy')), true);
 
+    // opencode
+    {
+      const fakeBinary = { path: path.join(scratch, 'fake-bin', 'opencode.exe') };
+      const fakeTemp = workerTempFolders('opencode', 'abcd12');
+      const opencodeOptions = { settings: defaultSettings, model: 'opencode/deepseek-v4.1-flash-free', workerTemp: fakeTemp, opencodeBinary: fakeBinary, codexPath: 'C:\\codex\\codex.exe' };
+      const opencodeTask = (overrides = {}) => createTask(sampleSpec({ worker: 'opencode', ...overrides }));
+      const configOf = (command) => JSON.parse(command.env.OPENCODE_CONFIG_CONTENT);
+
+      const readCommand = workerCommand(opencodeTask({ mode: 'read' }), opencodeOptions);
+      const writeCommand = workerCommand(opencodeTask({ mode: 'write' }), opencodeOptions);
+      eq('opencode: the program is the binary found, and the run args are fixed', [readCommand.cmd, readCommand.args], [fakeBinary.path, ['run', '--standalone', '--format', 'json', '--archived', '-m', 'opencode/deepseek-v4.1-flash-free']]);
+      eq('opencode read: no --auto, and the config denies edit and bash', [readCommand.args.includes('--auto'), configOf(readCommand).permission], [false, { edit: 'deny', bash: 'deny' }]);
+      eq('opencode write: --auto and no permission block', [writeCommand.args.includes('--auto'), 'permission' in configOf(writeCommand)], [true, false]);
+      eq('opencode: no MCP servers or plugins, and only the model\'s provider', [configOf(readCommand).mcp, configOf(readCommand).plugin, configOf(readCommand).enabled_providers], [{}, [], ['opencode']]);
+      eq('opencode: the provider list follows an openrouter model', configOf(workerCommand(opencodeTask(), { ...opencodeOptions, model: 'openrouter/nvidia/nemotron-3.5-super-vl:free' })).enabled_providers, ['openrouter']);
+
+      const env = writeCommand.env;
+      eq('opencode env: PWD is the work folder; TEMP, TMP and the XDG folders sit under the temp root',
+        [env.PWD, env.TEMP, env.TMP, env.XDG_DATA_HOME, env.XDG_CACHE_HOME, env.XDG_STATE_HOME, env.XDG_CONFIG_HOME],
+        [writeCommand.cwd, fakeTemp.root, fakeTemp.root, fakeTemp.data, fakeTemp.cache, fakeTemp.state, fakeTemp.config]);
+      eq('opencode env: the switches', [env.OPENCODE_DISABLE_PROJECT_CONFIG, env.OPENCODE_DISABLE_AUTOUPDATE, env.OPENCODE_DISABLE_CLAUDE_CODE, env.GIT_OPTIONAL_LOCKS], ['1', '1', '1', '0']);
+      eq('opencode: the child does not inherit the supervisor\'s environment', writeCommand.inheritEnvironment, false);
+
+      const savedSecrets = { SECRET_FOR_TEST: process.env.SECRET_FOR_TEST, CODEX_HOME: process.env.CODEX_HOME, OPENROUTER_API_KEY: process.env.OPENROUTER_API_KEY, OPENCODE_API_KEY: process.env.OPENCODE_API_KEY, PWD: process.env.PWD };
+      try {
+        process.env.SECRET_FOR_TEST = 'hunter2';
+        process.env.OPENROUTER_API_KEY = 'router-key';
+        process.env.OPENCODE_API_KEY = 'zen-key';
+        process.env.PWD = path.join(scratch, 'some other folder');
+        const freeZen = workerCommand(opencodeTask(), opencodeOptions);
+        const viaRouter = workerCommand(opencodeTask(), { ...opencodeOptions, model: 'openrouter/nvidia/nemotron-3.5-super-vl:free' });
+        eq('opencode env: a stray secret is not passed', freeZen.env.SECRET_FOR_TEST, undefined);
+        eq('opencode env: OPENROUTER_API_KEY only for an openrouter model', [freeZen.env.OPENROUTER_API_KEY, viaRouter.env.OPENROUTER_API_KEY], [undefined, 'router-key']);
+        eq('opencode env: OPENCODE_API_KEY is never passed', [freeZen.env.OPENCODE_API_KEY, viaRouter.env.OPENCODE_API_KEY], [undefined, undefined]);
+        eq('opencode env: PWD is pinned to the work folder whatever the supervisor\'s PWD is', freeZen.env.PWD, freeZen.cwd);
+        eq('opencode env: a system variable passes (PATH, in any case)', Object.keys(freeZen.env).some((name) => name.toLowerCase() === 'path'), true);
+        process.env.CODEX_HOME = path.join(scratch, 'codex home');
+        eq('opencode env: CODEX_HOME passes when set, so a fenced Codex sandbox uses the Codex home its self-test used', workerCommand(opencodeTask(), opencodeOptions).env.CODEX_HOME, process.env.CODEX_HOME);
+        delete process.env.CODEX_HOME;
+        eq('opencode env: and is not invented when unset', 'CODEX_HOME' in workerCommand(opencodeTask(), opencodeOptions).env, false);
+      } finally {
+        for (const [name, value] of Object.entries(savedSecrets)) {
+          if (value === undefined) delete process.env[name];
+          else process.env[name] = value;
+        }
+      }
+
+      const nastyBrief = 'Fix " & | < > ^ % ! in the parser.';
+      const nastyCommand = workerCommand(opencodeTask(), { ...opencodeOptions, brief: nastyBrief });
+      eq('opencode: the brief goes to stdin, never to args', [nastyCommand.stdinText.endsWith(nastyBrief), nastyCommand.args.some((arg) => arg.includes('Fix')), nastyCommand.briefFile], [true, false, null]);
+
+      eq('opencode fenced: the sandbox wrapper has the network on',
+        [writeCommand.wrapper.program, writeCommand.wrapper.args, writeCommand.fenceLayer, writeCommand.fenced],
+        ['C:\\codex\\codex.exe', ['sandbox', '-c', 'sandbox_mode=workspace-write', ...SANDBOX_ENV_POLICY_ARGS, '-c', 'sandbox_workspace_write.network_access=true', '--'], 'sandbox', true]);
+      const liftedCommand = workerCommand(opencodeTask(), { ...opencodeOptions, fence: 'none', codexPath: undefined });
+      eq('opencode lifted: no wrapper, no fence layer', [liftedCommand.wrapper, liftedCommand.fenceLayer, liftedCommand.fenced], [undefined, null, false]);
+      throws('opencode fenced: a missing codexPath is refused', () => workerCommand(opencodeTask(), { ...opencodeOptions, codexPath: undefined }));
+
+      const cyrillicFolder = path.join(scratch, 'проект х');
+      const cyrillicCommand = workerCommand({ ...opencodeTask(), worktree: cyrillicFolder }, opencodeOptions);
+      eq('opencode: a folder with a space and Cyrillic is both cwd and PWD', [cyrillicCommand.cwd, cyrillicCommand.env.PWD], [cyrillicFolder, cyrillicFolder]);
+
+      const resumed = workerCommand({ ...opencodeTask(), worker_session: 'ses_e07505d63ffetuvW4zRSXvOKR8' }, { ...opencodeOptions, resume: true, followUp: 'Next step.' });
+      eq('opencode resume: --session and the follow-up on stdin', [resumed.args.slice(-2), resumed.stdinText], [['--session', 'ses_e07505d63ffetuvW4zRSXvOKR8'], 'Next step.']);
+      throws('opencode resume: a session id that reads as a flag is refused', () => workerCommand({ ...opencodeTask(), worker_session: '--auto' }, { ...opencodeOptions, resume: true }));
+      throws('opencode resume: no session to resume', () => workerCommand(opencodeTask(), { ...opencodeOptions, resume: true }));
+      throws('opencode: a missing model is refused', () => workerCommand(opencodeTask(), { ...opencodeOptions, model: undefined }));
+      throws('opencode: a model that reads as a flag is refused', () => workerCommand(opencodeTask(), { ...opencodeOptions, model: '--auto' }));
+      throws('opencode: a missing temp object is refused', () => workerCommand(opencodeTask(), { ...opencodeOptions, workerTemp: undefined }));
+
+      let notInstalled = null;
+      try {
+        workerCommand(opencodeTask(), { ...opencodeOptions, opencodeBinary: { unavailable: 'opencode is not installed (no opencode on PATH)' } });
+      } catch (error) {
+        notInstalled = error.message;
+      }
+      eq('opencode: an unavailable binary throws its reason', notInstalled?.startsWith('opencode is not installed'), true);
+
+      for (const missing of ['data', 'cache', 'state', 'config', 'root']) {
+        throws(`opencode: a temp object without ${missing} is refused`, () => workerCommand(opencodeTask(), { ...opencodeOptions, workerTemp: { ...fakeTemp, [missing]: '' } }));
+      }
+      throws('opencode: a temp object missing a field is refused', () => workerCommand(opencodeTask(), { ...opencodeOptions, workerTemp: { root: fakeTemp.root } }));
+
+      // The spawn plan: what the supervisor actually runs.
+      const savedTestBin = process.env.CONSULT_DELEGATE_TEST_BIN;
+      delete process.env.CONSULT_DELEGATE_TEST_BIN;
+      try {
+        const planTask = { worker: 'opencode', project: path.join(scratch, 'project'), worktree: null };
+        const fencedPlan = supervisorModule.spawnPlan(planTask, writeCommand);
+        eq('opencode fenced plan: codex runs the sandbox, then opencode, then its args',
+          fencedPlan, { program: 'C:\\codex\\codex.exe', args: [...writeCommand.wrapper.args, fakeBinary.path, ...writeCommand.args] });
+        eq('opencode fenced plan: the program follows the "--" the sandbox ends on', [fencedPlan.args[fencedPlan.args.indexOf('--')], fencedPlan.args[fencedPlan.args.indexOf('--') + 1]], ['--', fakeBinary.path]);
+        eq('opencode lifted plan: the command own program, args unchanged', supervisorModule.spawnPlan(planTask, liftedCommand), { program: fakeBinary.path, args: liftedCommand.args });
+        const planInside = { ...planTask, project: path.join(scratch, 'fake-bin') };
+        throws('opencode plan: a program inside the project is refused', () => supervisorModule.spawnPlan(planInside, liftedCommand));
+        const piWrapped = { cmd: 'pi', args: ['--mode', 'json'], wrapper: { program: 'C:\\codex\\codex.exe', launcherPath: 'C:\\launch\\pi.js', args: ['sandbox', '--', 'node', 'C:\\launch\\pi.js'] } };
+        eq('pi fenced plan is unchanged: wrapper args then pi args', supervisorModule.spawnPlan({ worker: 'local', project: planTask.project, worktree: null }, piWrapped),
+          { program: 'C:\\codex\\codex.exe', args: ['sandbox', '--', 'node', 'C:\\launch\\pi.js', '--mode', 'json'] });
+        process.env.CONSULT_DELEGATE_TEST_BIN = 'C:\\test\\bin.exe';
+        eq('a test binary replaces the program; the opencode program stays in the args', supervisorModule.spawnPlan(planTask, writeCommand).args.includes(fakeBinary.path), true);
+      } finally {
+        if (savedTestBin === undefined) delete process.env.CONSULT_DELEGATE_TEST_BIN;
+        else process.env.CONSULT_DELEGATE_TEST_BIN = savedTestBin;
+      }
+
+      // The supervisor builds the child's environment: only an opencode command goes without ours.
+      eq('childEnvironment: a command that does not inherit gets exactly its own env', supervisorModule.childEnvironment(writeCommand, null), writeCommand.env);
+      process.env.CONSULT_TEST_INHERITED = 'yes';
+      eq('childEnvironment: the other workers still inherit', supervisorModule.childEnvironment({ env: { A: '1' } }, null).CONSULT_TEST_INHERITED, 'yes');
+      delete process.env.CONSULT_TEST_INHERITED;
+    }
+
     // codex
     const codexTask = createTask(sampleSpec({ worker: 'codex', mode: 'write' }));
     const codexFolder = path.join(scratch, 'work tree');
@@ -2111,6 +2245,46 @@ try {
       eq('parse pi: the settled error fixtures are complete', [parseWorkerStream('local', connectLines).complete, parseWorkerStream('local', fixtureLines('pi-error-auth.jsonl')).complete], [true, true]);
       const piAborted = parseWorkerStream('local', [...fixtureLines('pi-write.jsonl').slice(0, -1), JSON.stringify({ type: 'agent_settled', aborted: true })]);
       eq('parse pi: an aborted settle is an error', [piAborted.error, piAborted.complete], ['pi aborted', true]);
+
+      // opencode stream (recorded on 2.3.2; @WORK@ and @SIBLING@ stand for scratch folders)
+      const opencodeWorkFolder = path.resolve(os.tmpdir(), 'opencode-fixture-work');
+      const opencodeSibling = path.resolve(os.tmpdir(), 'opencode-fixture-sibling');
+      const opencodeLines = (name) => fixtureLines(name).map((line) => line.split('@WORK@').join(JSON.stringify(opencodeWorkFolder).slice(1, -1)).split('@SIBLING@').join(JSON.stringify(opencodeSibling).slice(1, -1)));
+      const opencodeRead = parseWorkerStream('opencode', fixtureLines('opencode-read.jsonl'), { model: 'opencode/deepseek-v4.1-flash-free' });
+      eq('parse opencode: read gives the session, the last step\'s text, complete, no error',
+        opencodeRead, { finalMessage: 'The readme.txt file says "hello world."', session: 'ses_e06e01d70ffeQ9cZJhtEPIF58Z', limit: null, limitHit: null, error: null, denied: [], complete: true, refusedPaths: [], warning: null });
+      eq('parse opencode: a stream cut before the last step_finish is not complete', parseWorkerStream('opencode', fixtureLines('opencode-read.jsonl').slice(0, -1)).complete, false);
+      eq('parse opencode: a step_finish that is not "stop" (tool-calls) is not complete', parseWorkerStream('opencode', fixtureLines('opencode-read.jsonl').slice(0, 3)).complete, false);
+      eq('parse opencode: no text after the last step_start is no final message', parseWorkerStream('opencode', fixtureLines('opencode-read.jsonl').slice(0, 4)).finalMessage, null);
+      const opencodeError = (error) => parseWorkerStream('opencode', [JSON.stringify({ type: 'step_start', sessionID: 'ses_a1' }), JSON.stringify({ type: 'error', sessionID: 'ses_a1', error })], { model: 'm/x', now: 5 });
+      const opencodeLimited = parseWorkerStream('opencode', fixtureLines('opencode-ratelimit.jsonl'), { model: 'stub/stub-model', now: 1000000 });
+      eq('parse opencode: the 429 stub (retryAfterMs 1000, its last back-off) is a throttled hit held for the 5 minute throttled hold, not complete, no error',
+        [opencodeLimited.limitHit, opencodeLimited.complete, opencodeLimited.error], [{ kind: 'throttled', resets_at: 1000000 + 5 * 60 * 1000, model: 'stub/stub-model' }, false, null]);
+      eq('parse opencode: a retryAfterMs longer than the hold is kept',
+        opencodeError({ type: 'provider.rate-limit', status: 429, message: 'slow', retryAfterMs: 600000 }).limitHit.resets_at, 5 + 600000);
+      eq('parse opencode: the retry events alone are no hit', parseWorkerStream('opencode', fixtureLines('opencode-ratelimit.jsonl').slice(0, -1)).limitHit, null);
+      const opencodeTransport = opencodeError({ type: 'provider.transport', message: 'ECONNREFUSED' });
+      eq('parse opencode: a provider.transport error is the error, not a limit', [opencodeTransport.error, opencodeTransport.limitHit, opencodeTransport.complete], ['ECONNREFUSED', null, false]);
+      eq('parse opencode: status 429 alone is a throttled hit with no reset time', opencodeError({ type: 'provider.other', status: 429, message: 'slow down' }).limitHit, { kind: 'throttled', resets_at: null, model: 'm/x' });
+      eq('parse opencode: the last error event wins', parseWorkerStream('opencode', [JSON.stringify({ type: 'error', error: { type: 'provider.rate-limit', status: 429, message: 'a' } }), JSON.stringify({ type: 'error', error: { type: 'provider.transport', message: 'b' } })]).limitHit, null);
+      eq('parse opencode: junk and unknown events are skipped', parseWorkerStream('opencode', ['not json', '{"type":"mystery"}', '[1]']).session, null);
+      const opencodeWrite = parseWorkerStream('opencode', fixtureLines('opencode-write.jsonl'));
+      eq('parse opencode: write fixture is complete with the text at the end', [opencodeWrite.complete, opencodeWrite.finalMessage.startsWith('Done.')], [true, true]);
+      eq('write targets opencode: write and edit inputs, read is none, each once, in order',
+        workerWriteTargets('opencode', opencodeLines('opencode-write.jsonl'), opencodeWorkFolder),
+        [path.join(opencodeWorkFolder, 'notes.txt'), path.join(opencodeSibling, 'outside.txt'), path.join(opencodeWorkFolder, 'existing.txt')]);
+      eq('write targets opencode: a read-only run names none', workerWriteTargets('opencode', opencodeLines('opencode-read.jsonl'), opencodeWorkFolder), []);
+      const opencodeTool = (tool, input) => JSON.stringify({ type: 'tool_use', sessionID: 'ses_a1', part: { tool, state: { status: 'completed', input } } });
+      eq('write targets opencode: shell is none; a patch\'s filePath and a relative path resolve against the folder',
+        workerWriteTargets('opencode', [opencodeTool('shell', { command: 'echo home > C:\\Users\\x\\f.txt' }), opencodeTool('patch', { filePath: 'sub/p.txt' }), opencodeTool('write', { path: 'rel.txt' }), opencodeTool('write', {})], opencodeWorkFolder),
+        [path.resolve(opencodeWorkFolder, 'sub/p.txt'), path.resolve(opencodeWorkFolder, 'rel.txt')]);
+      const openOpencode = new Set();
+      for (const line of fixtureLines('opencode-read.jsonl')) noteStepEvent('opencode', line, openOpencode);
+      eq('steps opencode: step_start and tool_use open no step, so the watchdog (which waits only while a step is open) still fires on a silent run', openOpencode.size, 0);
+      const midStep = new Set();
+      for (const line of fixtureLines('opencode-ratelimit.jsonl')) noteStepEvent('opencode', line, midStep);
+      eq('steps opencode: a stream stuck after step_start (the 429 retries) leaves nothing open', midStep.size, 0);
+      eq('steps contrast: a codex command started stays open, which is what suspends the watchdog', (noteStepEvent('codex', JSON.stringify({ type: 'item.started', item: { id: 'i1', type: 'command_execution' } }), midStep), midStep.size), 1);
 
       // agy edges
       const agyResult = (result) => [JSON.stringify({ event: 'init', conversation_id: 'c1' }), JSON.stringify({ event: 'result', result: { conversation_id: 'c1', status: 'SUCCESS', response: '', ...result } })];
@@ -3515,9 +3689,9 @@ try {
 
         // R1: a temp copy left by an earlier run (a failed copy-back, a crashed supervisor) is the newest one.
         const plantLeftover = (task) => {
-          fs.mkdirSync(piTempFolders(task.id).sessions, { recursive: true });
-          fs.writeFileSync(path.join(piTempFolders(task.id).sessions, 'old.jsonl'), 'an earlier session\n');
-          fs.writeFileSync(path.join(piTempFolders(task.id).sessions, 'newer.jsonl'), 'left by the last run');
+          fs.mkdirSync(workerTempFolders('local', task.id).sessions, { recursive: true });
+          fs.writeFileSync(path.join(workerTempFolders('local', task.id).sessions, 'old.jsonl'), 'an earlier session\n');
+          fs.writeFileSync(path.join(workerTempFolders('local', task.id).sessions, 'newer.jsonl'), 'left by the last run');
         };
 
         await runCase('pi: a fenced run first copies a leftover temp copy back, then stages it', async () => {
@@ -3536,9 +3710,9 @@ try {
           plantAuthority(task);
           plantLeftover(task);
           useFakeWorker('pi');
-          await runSupervisor(task.id, piOptions({ returnPiSessions: () => 'disk full' }));
+          await runSupervisor(task.id, piOptions({ returnSessions: () => 'disk full' }));
           const done = readTask(task.id);
-          const tempSessions = piTempFolders(task.id).sessions;
+          const tempSessions = workerTempFolders('local', task.id).sessions;
           eq('supervisor pi: the newer temp session survives, and the worker saw it',
             [fs.existsSync(path.join(tempSessions, 'newer.jsonl')), fs.readFileSync(path.join(tempSessions, 'seen.txt'), 'utf8').split(',').sort()], [true, ['newer.jsonl', 'old.jsonl']]);
           eq('supervisor pi: done, with the copy-back warning', [done.state, done.warning], ['done', "pi's session files could not be copied back: disk full"]);
@@ -3582,27 +3756,27 @@ try {
         await runCase('pi: a lifted run whose leftover copy-back fails stops before pi starts', async () => {
           const task = newTask({ worker: 'local', model: 'fake-model', mode: 'read', fence: 'none' });
           plantAuthority(task);
-          fs.mkdirSync(piTempFolders(task.id).sessions, { recursive: true });
-          fs.writeFileSync(path.join(piTempFolders(task.id).sessions, 'crash.jsonl'), 'kept by the crash');
+          fs.mkdirSync(workerTempFolders('local', task.id).sessions, { recursive: true });
+          fs.writeFileSync(path.join(workerTempFolders('local', task.id).sessions, 'crash.jsonl'), 'kept by the crash');
           liftLocalFence(task);
           const reportFile = reportFileFor(task);
           fs.rmSync(reportFile, { force: true });
           useFakeWorker('pi', { FAKE_REPORT_FILE: reportFile });
           try {
-            await runSupervisor(task.id, piOptions({ returnPiSessions: () => 'disk full' }));
+            await runSupervisor(task.id, piOptions({ returnSessions: () => 'disk full' }));
           } finally {
             restoreProjects();
           }
           const done = readTask(task.id);
           eq('supervisor pi lifted: a failed leftover copy-back fails the task with the spec\'s words',
             [done.state, done.summary], ['failed', "Failed: pi's session files from the last run could not be copied back (disk full). Nothing was run, so try again."]);
-          eq('supervisor pi lifted: the worker never started, and the temp copy is kept', [fs.existsSync(reportFile), fs.existsSync(path.join(piTempFolders(task.id).sessions, 'crash.jsonl'))], [false, true]);
+          eq('supervisor pi lifted: the worker never started, and the temp copy is kept', [fs.existsSync(reportFile), fs.existsSync(path.join(workerTempFolders('local', task.id).sessions, 'crash.jsonl'))], [false, true]);
         });
 
         await runCase('pi: a lifted run with an empty temp sessions folder runs on the authority', async () => {
           const task = newTask({ worker: 'local', model: 'fake-model', mode: 'read', fence: 'none' });
           plantAuthority(task);
-          fs.mkdirSync(piTempFolders(task.id).sessions, { recursive: true });
+          fs.mkdirSync(workerTempFolders('local', task.id).sessions, { recursive: true });
           liftLocalFence(task);
           useFakeWorker('pi');
           try {
@@ -3616,7 +3790,7 @@ try {
         await runCase('pi: a copy-back failure reaches the task warning and stderr.log', async () => {
           const task = newTask({ worker: 'local', model: 'fake-model', mode: 'read' });
           useFakeWorker('pi');
-          await runSupervisor(task.id, piOptions({ returnPiSessions: () => 'disk full' }));
+          await runSupervisor(task.id, piOptions({ returnSessions: () => 'disk full' }));
           const done = readTask(task.id);
           eq('supervisor pi: done, with the warning', [done.state, done.warning], ['done', "pi's session files could not be copied back: disk full"]);
           eq('supervisor pi: and stderr.log has the line', fs.readFileSync(path.join(taskFolder(task.id), 'stderr.log'), 'utf8').includes('disk full'), true);
@@ -3625,8 +3799,8 @@ try {
         await runCase('pi: a lifted run first takes back the sessions a crash left in temp', async () => {
           const task = newTask({ worker: 'local', model: 'fake-model', mode: 'read', fence: 'none' });
           plantAuthority(task);
-          fs.mkdirSync(piTempFolders(task.id).sessions, { recursive: true });
-          fs.writeFileSync(path.join(piTempFolders(task.id).sessions, 'crash.jsonl'), 'kept by the crash');
+          fs.mkdirSync(workerTempFolders('local', task.id).sessions, { recursive: true });
+          fs.writeFileSync(path.join(workerTempFolders('local', task.id).sessions, 'crash.jsonl'), 'kept by the crash');
           liftLocalFence(task);
           const reportFile = reportFileFor(task);
           fs.rmSync(reportFile, { force: true });
@@ -3638,7 +3812,273 @@ try {
           }
           eq('supervisor pi lifted: with the leftover copied back, the worker started', [readTask(task.id).state, fs.existsSync(reportFile)], ['done', true]);
           eq('supervisor pi: the lifted worker saw the crash session in the task folder', fs.readFileSync(path.join(sessionsOf(task), 'seen.txt'), 'utf8').split(',').includes('crash.jsonl'), true);
-          eq('supervisor pi: and the temp folder is gone, so it cannot overwrite a newer copy later', fs.existsSync(piTempFolders(task.id).root), false);
+          eq('supervisor pi: and the temp folder is gone, so it cannot overwrite a newer copy later', fs.existsSync(workerTempFolders('local', task.id).root), false);
+        });
+      }
+
+      {
+        // opencode tasks, run through the fake worker. Injection points (options of runSupervisor): findOpencode, findCodex,
+        // readFreeModels, sandboxCheck, returnSessions; options.io.recordLimitHit and options.io.lastLimits for the limit records.
+        const modelA = 'opencode/model-a';
+        const modelB = 'opencode/model-b';
+        const opencodeSettings = { delegate: { time_limit_ms: BACKSTOP_MS }, opencode: { models: [modelA, modelB] } };
+        const sandboxChecks = [];
+        const freeAsked = [];
+        const opencodeOptions = (overrides = {}) => ({
+          settings: opencodeSettings, pollMs: 100,
+          findOpencode: () => ({ path: 'C:\\fake opencode\\opencode.exe' }),
+          findCodex: () => ({ path: 'C:\\fake codex\\codex.exe', found: true }),
+          readFreeModels: async (asked) => { freeAsked.push(asked); return { ok: true, free: [modelA, modelB, 'opencode/model-c'] }; },
+          sandboxCheck: async (asked) => { sandboxChecks.push(asked); return { ok: true, failed: null, cached: false }; },
+          ...overrides
+        });
+        const limitsFile = () => path.join(dataHome(), 'limits.json');
+        const argsLogOf = (task) => path.join(scratch, `fake-args-${task.id}.jsonl`);
+        const runsOf = (task) => (fs.existsSync(argsLogOf(task)) ? fs.readFileSync(argsLogOf(task), 'utf8').trim().split('\n').map((line) => JSON.parse(line)) : []);
+        const modelOf = (run) => run.args[run.args.indexOf('-m') + 1];
+        const restoreProjects = () => fs.rmSync(process.env.CONSULT_PROJECTS_FILE, { force: true });
+        const liftOpencodeFence = (task) => fs.writeFileSync(process.env.CONSULT_PROJECTS_FILE, JSON.stringify({ [projectKey(task.project)]: { fence: { opencode: 'none' } } }));
+        const hitRecords = [];
+        const recordingHits = { recordLimitHit: (worker, hit, at) => { hitRecords.push(worker); recordLimitHit(worker, hit, at); } };
+
+        await runCase('opencode: an answer ends done, its session data comes back, and the sandbox was checked with the network on', async () => {
+          sandboxChecks.length = 0;
+          freeAsked.length = 0;
+          const task = newTask({ worker: 'opencode', mode: 'read' });
+          useFakeWorker('opencode-answer', { FAKE_ARGS_LOG: argsLogOf(task) });
+          await runSupervisor(task.id, opencodeOptions());
+          const done = readTask(task.id);
+          eq('supervisor opencode: done on the first listed model, with its answer, fenced by the sandbox layer',
+            [done.state, done.summary, done.model, done.model_used, done.model_switches, done.fenced, done.fence_layer, done.worker_session],
+            ['done', `Answer from ${modelA}.`, null, modelA, [], true, 'sandbox', 'ses_fakeopencode1']);
+          eq('supervisor opencode: the final message is final.md', fs.readFileSync(path.join(taskFolder(task.id), 'final.md'), 'utf8'), `Answer from ${modelA}.`);
+          eq('supervisor opencode: the session database was copied back to <taskDir>/opencode-data',
+            fs.readFileSync(path.join(taskFolder(task.id), 'opencode-data', 'opencode', 'opencode.db'), 'utf8'), `ses_fakeopencode1 ${modelA}\n`);
+          eq('supervisor opencode: the network-on check ran for the Codex found', sandboxChecks.map((asked) => [asked.codexPath, asked.network]), [['C:\\fake codex\\codex.exe', true]]);
+          eq('supervisor opencode: the free list was asked for the opencode binary', freeAsked.map((asked) => asked.binary), ['C:\\fake opencode\\opencode.exe']);
+          const [run] = runsOf(task);
+          eq('supervisor opencode: the worker got the sandbox wrapper, the program, its model and no --session',
+            [run.args[0], run.args.includes('C:\\fake opencode\\opencode.exe'), modelOf(run), run.args.includes('--session')], ['sandbox', true, modelA, false]);
+          eq('supervisor opencode: PWD is the work folder and the data folder is the task\'s temp folder',
+            [sameFolder(run.folders.PWD, task.project), sameFolder(run.folders.XDG_DATA_HOME, workerTempFolders('opencode', task.id).data)], [true, true]);
+        });
+
+        await runCase('opencode: a rate limit switches to the next model on the same session', async () => {
+          hitRecords.length = 0;
+          fs.rmSync(limitsFile(), { force: true });
+          const task = newTask({ worker: 'opencode', mode: 'read' });
+          useFakeWorker('opencode-ratelimit-then-answer', { FAKE_ARGS_LOG: argsLogOf(task), FAKE_LIMITED_MODEL: modelA, FAKE_RETRY_AFTER_MS: '600000' });
+          await runSupervisor(task.id, opencodeOptions({ io: recordingHits }));
+          const done = readTask(task.id);
+          eq('supervisor opencode switch: done on the second model, one switch recorded, task.model still not set',
+            [done.state, done.summary, done.model_used, done.model_switches, done.model], ['done', `Answer from ${modelB}.`, modelB, [`${modelA} → ${modelB}: rate limit`], null]);
+          const runs = runsOf(task);
+          eq('supervisor opencode switch: two runs, in list order', runs.map(modelOf), [modelA, modelB]);
+          eq('supervisor opencode switch: the second run continued the first run\'s session with the follow-up text',
+            [runs[1].args[runs[1].args.indexOf('--session') + 1], runs[1].promptStart.includes('Continue the task.')], ['ses_fakeopencode1', true]);
+          eq('supervisor opencode switch: the first run had no --session', runs[0].args.includes('--session'), false);
+          eq('supervisor opencode switch: the hit is recorded for the model, not for the worker', hitRecords, [`opencode:${modelA}`]);
+          const known = lastLimits(Date.now());
+          eq('supervisor opencode switch: the reading side lists the per-model record, and the policy accepts that key',
+            [known[`opencode:${modelA}`] !== null && typeof known[`opencode:${modelA}`] === 'object', limitPolicy(`opencode:${modelA}`, known, Date.now()).level, limitPolicy(`opencode:${modelB}`, known, Date.now())],
+            [true, 'warn', { level: 'ok', note: '' }]);
+          eq('supervisor opencode switch: the session database of the second run holds both runs', fs.readFileSync(path.join(taskFolder(task.id), 'opencode-data', 'opencode', 'opencode.db'), 'utf8'), `ses_fakeopencode1 ${modelA}\nses_fakeopencode1 ${modelB}\n`);
+          fs.rmSync(limitsFile(), { force: true });
+        });
+
+        await runCase('opencode: an explicit model never switches', async () => {
+          hitRecords.length = 0;
+          fs.rmSync(limitsFile(), { force: true });
+          const task = newTask({ worker: 'opencode', mode: 'read', model: modelB });
+          useFakeWorker('opencode-all-limited', { FAKE_ARGS_LOG: argsLogOf(task), FAKE_RETRY_AFTER_MS: '600000' });
+          await runSupervisor(task.id, opencodeOptions({ io: recordingHits }));
+          const paused = readTask(task.id);
+          eq('supervisor opencode explicit: paused on the named model, no switch, one record',
+            [paused.state, paused.model, paused.model_used, paused.model_switches, runsOf(task).map(modelOf), hitRecords], ['paused-limit', modelB, modelB, [], [modelB], [`opencode:${modelB}`]]);
+          fs.rmSync(limitsFile(), { force: true });
+        });
+
+        await runCase('opencode: every model limited pauses the task, and a follow-up starts on the model it ended on', async () => {
+          hitRecords.length = 0;
+          fs.rmSync(limitsFile(), { force: true });
+          const task = newTask({ worker: 'opencode', mode: 'read' });
+          useFakeWorker('opencode-all-limited', { FAKE_ARGS_LOG: argsLogOf(task), FAKE_RETRY_AFTER_MS: '600000' });
+          await runSupervisor(task.id, opencodeOptions({ io: recordingHits }));
+          const paused = readTask(task.id);
+          eq('supervisor opencode all limited: paused-limit after trying each model once, the switch recorded',
+            [paused.state, runsOf(task).map(modelOf), paused.model_used, paused.model_switches, hitRecords, typeof paused.limit?.resets_at], ['paused-limit', [modelA, modelB], modelB, [`${modelA} → ${modelB}: rate limit`], [`opencode:${modelA}`, `opencode:${modelB}`], 'number']);
+          // While both records hold, a follow-up has nothing to run on.
+          updateTask(task.id, { followup: 'Go on.', state: 'queued' });
+          await runSupervisor(task.id, opencodeOptions());
+          eq('supervisor opencode all limited: with the records still holding, the follow-up pauses without a run', [readTask(task.id).state, runsOf(task).length], ['paused-limit', 2]);
+          // Once they are gone, the follow-up starts on model_used, not on the first listed model.
+          fs.rmSync(limitsFile(), { force: true });
+          useFakeWorker('opencode-answer', { FAKE_ARGS_LOG: argsLogOf(task) });
+          updateTask(task.id, { followup: 'Go on.', state: 'queued' });
+          await runSupervisor(task.id, opencodeOptions());
+          const resumed = readTask(task.id);
+          const runs = runsOf(task);
+          eq('supervisor opencode follow-up: done on model_used, continuing the session', [resumed.state, resumed.model_used, modelOf(runs[2]), runs[2].args.includes('--session')], ['done', modelB, modelB, true]);
+          eq('supervisor opencode follow-up: the previous run\'s switch is not carried over', resumed.model_switches, []);
+          fs.rmSync(limitsFile(), { force: true });
+        });
+
+        await runCase('opencode: an error that is no limit fails the task and never switches', async () => {
+          hitRecords.length = 0;
+          const task = newTask({ worker: 'opencode', mode: 'read' });
+          useFakeWorker('opencode-error', { FAKE_ARGS_LOG: argsLogOf(task) });
+          await runSupervisor(task.id, opencodeOptions({ io: recordingHits }));
+          const failedTask = readTask(task.id);
+          eq('supervisor opencode error: failed with the message, one run, no switch, no record',
+            [failedTask.state, failedTask.summary, runsOf(task).length, failedTask.model_switches, hitRecords], ['failed', 'The model fell over.', 1, [], []]);
+        });
+
+        await runCase('opencode: a read task while another process edits the folder', async () => {
+          const repo = makeRepo('Имя opencode read other', { 'readme.txt': 'hello\n', 'src/gone.txt': 'bye\n' });
+          const task = newTask({ worker: 'opencode', mode: 'read', project: repo });
+          useFakeWorker('opencode-read-other-change', { FAKE_OTHER_FILE: 'readme.txt', FAKE_DELETE_FILE: 'src/gone.txt' });
+          await runSupervisor(task.id, opencodeOptions());
+          const done = readTask(task.id);
+          eq('supervisor opencode read: no warning, the other process\'s changes are the note',
+            [done.state, done.warning ?? null, done.read_only_edits ?? null, done.other_changes], ['done', null, null, ['readme.txt', 'src/gone.txt']]);
+        });
+
+        await runCase('opencode: a read task whose own write event names a changed file warns', async () => {
+          const repo = makeRepo('Имя opencode read wrote', { 'readme.txt': 'hello\n' });
+          const task = newTask({ worker: 'opencode', mode: 'read', project: repo });
+          useFakeWorker('opencode-answer', { FAKE_WRITE_FILE: 'readme.txt' });
+          await runSupervisor(task.id, opencodeOptions());
+          const done = readTask(task.id);
+          eq('supervisor opencode read: its own write event is the warning', [done.state, done.read_only_edits, /^opencode changed 1 file in this read-only task: readme\.txt\./.test(done.warning ?? '')], ['done', ['readme.txt'], true]);
+        });
+
+        await runCase('opencode: a write the sandbox refused is no change, in a read or a write task', async () => {
+          const outside = path.join(scratch, 'outside the folder.txt');
+          fs.rmSync(outside, { force: true });
+          for (const mode of ['read', 'write']) {
+            const repo = makeRepo(`Имя opencode refused ${mode}`, { 'readme.txt': 'hello\n' });
+            const task = newTask({ worker: 'opencode', mode, project: repo, location: 'here' });
+            useFakeWorker('opencode-answer', { FAKE_REFUSED_FILE: outside });
+            await runSupervisor(task.id, opencodeOptions());
+            const done = readTask(task.id);
+            eq(`supervisor opencode refused write (${mode}): done, nothing written outside, no read-only warning, no other changes`,
+              [done.state, fs.existsSync(outside), done.warning ?? null, done.read_only_edits ?? null, done.other_changes ?? null], ['done', false, null, null, null]);
+          }
+        });
+
+        await runCase('opencode: a cancel that comes between two models never starts the second', async () => {
+          hitRecords.length = 0;
+          fs.rmSync(limitsFile(), { force: true });
+          const task = newTask({ worker: 'opencode', mode: 'read' });
+          useFakeWorker('opencode-ratelimit-then-answer', { FAKE_ARGS_LOG: argsLogOf(task), FAKE_LIMITED_MODEL: modelA, FAKE_RETRY_AFTER_MS: '600000' });
+          // The hit is recorded after the first worker exited and before the second would start: no worker is there to kill.
+          const cancelling = { recordLimitHit: (worker, hit, at) => { fs.writeFileSync(path.join(taskFolder(task.id), 'cancel'), ''); recordLimitHit(worker, hit, at); } };
+          await runSupervisor(task.id, opencodeOptions({ io: cancelling }));
+          const cancelled = readTask(task.id);
+          eq('supervisor opencode cancel between runs: cancelled after the first run, the second model never started, no switch noted',
+            [cancelled.state, runsOf(task).map(modelOf), cancelled.model_switches], ['cancelled', [modelA], []]);
+          fs.rmSync(limitsFile(), { force: true });
+        });
+
+        await runCase('opencode: a rate limit holds the model for the throttled hold, not for the 1 s retryAfterMs', async () => {
+          fs.rmSync(limitsFile(), { force: true });
+          const task = newTask({ worker: 'opencode', mode: 'read' });
+          useFakeWorker('opencode-ratelimit-then-answer', { FAKE_ARGS_LOG: argsLogOf(task), FAKE_LIMITED_MODEL: modelA, FAKE_RETRY_AFTER_MS: '1000' });
+          await runSupervisor(task.id, opencodeOptions());
+          const known = lastLimits(Date.now());
+          const key = `opencode:${modelA}`;
+          eq('supervisor opencode hold: the model still counts as limited a minute on, and not after the hold',
+            [limitPolicy(key, known, Date.now() + 60 * 1000).level, limitPolicy(key, known, Date.now() + 6 * 60 * 1000).level], ['warn', 'ok']);
+          fs.rmSync(limitsFile(), { force: true });
+        });
+
+        await runCase('opencode: a fenced task with no Codex fails without running the worker', async () => {
+          const task = newTask({ worker: 'opencode', mode: 'read' });
+          useFakeWorker('opencode-answer', { FAKE_ARGS_LOG: argsLogOf(task) });
+          await runSupervisor(task.id, opencodeOptions({ findCodex: () => ({ path: 'codex', found: false }) }));
+          const refused = readTask(task.id);
+          eq('supervisor opencode no Codex: failed, the summary starts with the refusal prefix and says why, the worker never ran',
+            [refused.state, refused.summary, runsOf(task).length], ['failed', "opencode's fence needs Codex's sandbox: Codex is not installed", 0]);
+        });
+
+        await runCase('opencode: a failed or throwing network-on check, a broad folder and a program inside the project each refuse', async () => {
+          const reasonOf = async (taskOverrides, optionOverrides) => {
+            const task = newTask({ worker: 'opencode', mode: 'read', ...taskOverrides });
+            useFakeWorker('opencode-answer', { FAKE_ARGS_LOG: argsLogOf(task) });
+            await runSupervisor(task.id, opencodeOptions(optionOverrides));
+            return [readTask(task.id).summary, runsOf(task).length];
+          };
+          eq('supervisor opencode refusals: a failed check',
+            await reasonOf({}, { sandboxCheck: async () => ({ ok: false, failed: 'home write allowed', cached: false }) }), ["opencode's fence needs Codex's sandbox: the sandbox check failed: home write allowed", 0]);
+          eq('supervisor opencode refusals: a check that throws',
+            await reasonOf({}, { sandboxCheck: async () => { throw new Error('probe broke'); } }), ["opencode's fence needs Codex's sandbox: the sandbox check failed: probe broke", 0]);
+          const [homeSummary, homeRuns] = await reasonOf({ project: os.homedir() }, {});
+          eq('supervisor opencode refusals: the home folder', [homeSummary.startsWith("opencode's fence needs Codex's sandbox: the work folder is your home folder"), homeRuns], [true, 0]);
+          const inProject = path.join(hereProject, 'opencode.exe');
+          const [insideSummary, insideRuns] = await reasonOf({}, { findOpencode: () => ({ path: inProject }) });
+          eq('supervisor opencode refusals: opencode inside the project', [insideSummary.startsWith("opencode's fence needs Codex's sandbox: "), insideRuns], [true, 0]);
+          freeAsked.length = 0;
+          const liftedTask = newTask({ worker: 'opencode', mode: 'read', fence: 'none' });
+          liftOpencodeFence(liftedTask);
+          useFakeWorker('opencode-answer', { FAKE_ARGS_LOG: argsLogOf(liftedTask) });
+          try {
+            await runSupervisor(liftedTask.id, opencodeOptions({ findOpencode: () => ({ path: inProject }) }));
+          } finally {
+            restoreProjects();
+          }
+          eq('supervisor opencode refusals: a lifted task refuses opencode inside the project too, and nothing ran it (not even the model listing)',
+            [readTask(liftedTask.id).summary.startsWith('Failed: Found opencode only inside the project folder'), runsOf(liftedTask).length, freeAsked.length], [true, 0, 0]);
+        });
+
+        await runCase('opencode: a lifted task runs without the sandbox and skips the network-on check', async () => {
+          sandboxChecks.length = 0;
+          const task = newTask({ worker: 'opencode', mode: 'read', fence: 'none' });
+          liftOpencodeFence(task);
+          useFakeWorker('opencode-answer', { FAKE_ARGS_LOG: argsLogOf(task) });
+          try {
+            await runSupervisor(task.id, opencodeOptions({ findCodex: () => ({ path: 'codex', found: false }) }));
+          } finally {
+            restoreProjects();
+          }
+          const done = readTask(task.id);
+          const [run] = runsOf(task);
+          eq('supervisor opencode lifted: done with no Codex, not fenced, no wrapper, no check, its session data still comes back',
+            [done.state, done.fenced, done.fence_layer ?? null, run.args[0], sandboxChecks.length, fs.existsSync(path.join(taskFolder(task.id), 'opencode-data', 'opencode', 'opencode.db'))], ['done', false, null, 'run', 0, true]);
+        });
+
+        await runCase('opencode: a model that is not free, or an unreadable price list, fails the task', async () => {
+          const run = async (overrides, taskOverrides = {}) => {
+            const task = newTask({ worker: 'opencode', mode: 'read', ...taskOverrides });
+            useFakeWorker('opencode-answer', { FAKE_ARGS_LOG: argsLogOf(task) });
+            await runSupervisor(task.id, opencodeOptions(overrides));
+            return [readTask(task.id).state, readTask(task.id).summary, runsOf(task).length];
+          };
+          const [stateA, summaryA, runsA] = await run({}, { model: 'opencode/paid-model' });
+          eq('supervisor opencode free check: a named model that is not free is refused with the reason', [stateA, summaryA.includes('opencode/paid-model is not a free opencode model'), runsA], ['failed', true, 0]);
+          eq('supervisor opencode free check: a price list that cannot be read refuses', await run({ readFreeModels: async () => ({ ok: false, reason: 'no price list' }) }), ['failed', 'Failed: no price list', 0]);
+          const [stateC, summaryC, runsC] = await run({ settings: { ...opencodeSettings, opencode: { models: ['opencode/paid-model'] } } });
+          eq('supervisor opencode free check: no listed model is free', [stateC, summaryC.includes('none of the listed opencode models is free'), runsC], ['failed', true, 0]);
+        });
+
+        await runCase('opencode: a leftover temp copy is copied back first, then staged, and a failed copy-back is a warning', async () => {
+          const task = newTask({ worker: 'opencode', mode: 'read' });
+          const authority = path.join(taskFolder(task.id), 'opencode-data');
+          fs.mkdirSync(authority, { recursive: true });
+          fs.writeFileSync(path.join(authority, 'old.db'), 'an earlier session\n');
+          const temp = workerTempFolders('opencode', task.id);
+          fs.mkdirSync(temp.data, { recursive: true });
+          fs.writeFileSync(path.join(temp.data, 'old.db'), 'an earlier session\n');
+          fs.writeFileSync(path.join(temp.data, 'newer.db'), 'left by the last run');
+          useFakeWorker('opencode-answer');
+          await runSupervisor(task.id, opencodeOptions());
+          eq('supervisor opencode leftover: the leftover copy is in the authority after the run', fs.readdirSync(authority).sort(), ['newer.db', 'old.db', 'opencode']);
+          const second = newTask({ worker: 'opencode', mode: 'read' });
+          const secondTemp = workerTempFolders('opencode', second.id);
+          fs.mkdirSync(secondTemp.data, { recursive: true });
+          fs.writeFileSync(path.join(secondTemp.data, 'newer.db'), 'left by the last run');
+          await runSupervisor(second.id, opencodeOptions({ returnSessions: () => 'disk full' }));
+          const done = readTask(second.id);
+          eq('supervisor opencode leftover: a failed copy-back runs on the leftover and warns', [done.state, done.warning, fs.existsSync(path.join(secondTemp.data, 'newer.db'))], ['done', "opencode's session files could not be copied back: disk full", true]);
         });
       }
 
@@ -4802,6 +5242,7 @@ try {
 
     const fakeSettings = (delegateOverrides = {}) => ({
       ...DEFAULTS, local_runner: 'llama-swap', _source: null, _global: {}, _warnings: [],
+      opencode: { models: ['opencode/deepseek-v4.1-flash-free', 'opencode/big-pickle'] },
       delegate: { table: { code: 'codex', research: 'agy', review: 'agy', private: 'local' }, local_at_once: 'auto', on_close: 'stop', time_limit_ms: 3 * 3600000, ...delegateOverrides }
     });
     const launchedIds = [];
@@ -4871,7 +5312,7 @@ try {
           const names = toolsModule.DELEGATE_TOOLS.map((tool) => tool.name);
           eq('the eight tools are defined', names, ['delegate', 'delegate_status', 'delegate_list', 'delegate_result', 'delegate_merge', 'delegate_send', 'delegate_cancel', 'delegate_wait']);
           const description = toolsModule.DELEGATE_TOOLS[0].description;
-          truthy('delegate: the description opens with the routing text', description.startsWith(toolsModule.DELEGATE_ROUTING_TEXT) && description.startsWith('Background task run by Codex, agy or a local model in the project folder:'));
+          truthy('delegate: the description opens with the routing text', description.startsWith(toolsModule.DELEGATE_ROUTING_TEXT) && description.startsWith('Background task run by Codex, agy, opencode (free cloud models) or a local model in the project folder:'));
           const missingAliases = Object.keys(WORKER_ALIASES).filter((alias) => !description.includes(alias));
           eq('delegate: every worker alias is listed', missingAliases, []);
           truthy('delegate: fences are the user\'s', /set per project by the user in the Delegated tab/.test(description) && /Never change a fence yourself/.test(description));
@@ -4897,7 +5338,7 @@ try {
         await guardedAsync('delegate: workers and kinds', async () => {
           const project = makePlainFolder('plain workers');
           const refusal = await call('delegate', briefArgs({ worker: 'bogus' }), contextFor(project));
-          truthy('delegate: an unknown worker is an error result naming the choices', refusal.isError && /codex, agy, local/.test(refusal.text) && /local:<nickname>/.test(refusal.text) && /gpt/.test(refusal.text));
+          truthy('delegate: an unknown worker is an error result naming the choices', refusal.isError && /codex, agy, opencode, local/.test(refusal.text) && /local:<nickname>/.test(refusal.text) && /gpt/.test(refusal.text));
           const badNickname = await call('delegate', briefArgs({ worker: 'local:C:\\evil' }), contextFor(project));
           truthy('delegate: a bad local nickname is an error result naming the nicknames', badNickname.isError && /vision-best/.test(badNickname.text));
           const noKind = await call('delegate', briefArgs({ worker: 'auto' }), contextFor(project));
@@ -4938,6 +5379,85 @@ try {
           eq('delegate: the stub was asked to launch each started task', launchedIds.includes(gptWord.value.id) && launchedIds.includes(tableReview.value.id), true);
           eq('delegate: fenced is known up front', [gptWord.value.fenced, geminiWord.value.fenced, localFast.value.fenced], [true, true, true]);
           eq('delegate: nothing saved starts fenced, with no note', [gptWord.value.fence, geminiWord.value.fence, localFast.value.fence, gptWord.value.fence_note, readTask(gptWord.value.id).fence], ['fenced', 'fenced', 'fenced', undefined, 'fenced']);
+        });
+
+        await guardedAsync('delegate: opencode', async () => {
+          const project = makePlainFolder('opencode tool');
+          const freeList = ['opencode/deepseek-v4.1-flash-free', 'opencode/big-pickle'];
+          const opencodeContext = (overrides = {}) => contextFor(project, {
+            findOpencode: () => ({ path: 'fake-opencode.exe' }),
+            readFreeModels: async () => ({ ok: true, free: freeList }),
+            ...overrides
+          });
+          const notInstalled = () => ({ unavailable: 'opencode is not installed (no opencode on PATH)' });
+          const taskCountBefore = listTasks({ project }).length;
+
+          const missing = await call('delegate', briefArgs({ worker: 'opencode', mode: 'read' }), opencodeContext({ findOpencode: notInstalled }));
+          eq('delegate opencode: not installed is an error naming why', [missing.isError, missing.text.includes('opencode is not installed')], [true, true]);
+          const priceListDown = await call('delegate', briefArgs({ worker: 'opencode', mode: 'read' }), opencodeContext({ readFreeModels: async () => ({ ok: false, reason: "opencode's price list is not available (HTTP 500), so no model can be checked as free" }) }));
+          eq('delegate opencode: a failed price check is an error naming why', [priceListDown.isError, priceListDown.text.includes('price list')], [true, true]);
+          const paid = await call('delegate', briefArgs({ worker: 'opencode', mode: 'read', model: 'opencode/gpt-6-paid' }), opencodeContext());
+          eq('delegate opencode: a paid model is refused with the free list', [paid.isError, paid.text.includes('is not a free opencode model'), paid.text.includes('opencode/big-pickle')], [true, true, true]);
+          let listings = 0;
+          const insideProject = await call('delegate', briefArgs({ worker: 'opencode', mode: 'read' }), opencodeContext({
+            findOpencode: () => ({ path: path.join(project, 'node_modules', 'opencode.exe') }),
+            readFreeModels: async () => { listings += 1; return { ok: true, free: freeList }; }
+          }));
+          eq('delegate opencode: a program inside the project is refused before the model listing runs it', [insideProject.isError, /only inside the project folder/.test(insideProject.text), listings], [true, true, 0]);
+          eq('delegate opencode: no task was created by the refusals', listTasks({ project }).length, taskCountBefore);
+
+          const outsideProject = await call('delegate', briefArgs({ worker: 'opencode', mode: 'read', model: 'opencode/big-pickle' }), opencodeContext({
+            readFreeModels: async () => { listings += 1; return { ok: true, free: freeList }; }
+          }));
+          eq('delegate opencode: and one outside it is listed (the pair that shows the check can tell)', [outsideProject.value.started, listings], [true, 1]);
+
+          const free = await call('delegate', briefArgs({ worker: 'opencode', mode: 'read', model: 'opencode/big-pickle' }), opencodeContext());
+          eq('delegate opencode: a free model starts, fenced, layer sandbox, exact note', [free.value.started, free.value.fence, free.value.fenced, free.value.fence_layer, free.value.fence_note],
+            [true, 'fenced', true, 'sandbox', 'fenced (files); network open: it can read any file you can and send it out']);
+          eq('delegate opencode: the task records the caller\'s model, and no layer before a run', [readTask(free.value.id).model, readTask(free.value.id).fence_layer], ['opencode/big-pickle', null]);
+          const codexSibling = await call('delegate', briefArgs({ worker: 'codex', mode: 'read' }), opencodeContext());
+          const defaultModel = await call('delegate', briefArgs({ worker: 'opencode', mode: 'read' }), opencodeContext());
+          eq('delegate opencode: no model starts, the supervisor picks', [defaultModel.value.started, readTask(defaultModel.value.id).model], [true, null]);
+
+          const privateAuto = await call('delegate', briefArgs({ worker: 'auto', kind: 'private', mode: 'read' }), opencodeContext({ settings: fakeSettings({ table: { code: 'codex', research: 'agy', review: 'agy', private: 'opencode' } }) }));
+          eq('delegate opencode: kind private never lands on opencode', privateAuto.isError === true || privateAuto.value.worker !== 'opencode', true);
+          const privateNamed = await call('delegate', briefArgs({ worker: 'opencode', kind: 'private', mode: 'read' }), opencodeContext());
+          eq('delegate opencode: naming opencode for private work is refused', [privateNamed.isError, /private/i.test(privateNamed.text)], [true, true]);
+
+          fs.writeFileSync(process.env.CONSULT_PROJECTS_FILE, JSON.stringify({ [projectKey(project)]: { fence: { opencode: 'none' } } }));
+          const liftedWrite = await call('delegate', briefArgs({ worker: 'opencode', mode: 'write', location: 'here' }), opencodeContext());
+          eq('delegate opencode: lifted write has the lifted note only', [liftedWrite.value.fence, liftedWrite.value.fenced, liftedWrite.value.fence_layer, liftedWrite.value.fence_note],
+            ['none', false, null, 'not fenced: it runs without the sandbox and can change any file you can']);
+          const liftedRead = await call('delegate', briefArgs({ worker: 'opencode', mode: 'read' }), opencodeContext());
+          eq('delegate opencode: lifted read adds the tool-rules line', liftedRead.value.fence_note,
+            "not fenced: it runs without the sandbox and can change any file you can; only opencode's own tool rules keep this read task from writing");
+
+          const sendTarget = readTask(free.value.id);
+          updateTask(sendTarget.id, { state: 'done', worker_session: 'ses_abc123', model: 'opencode/gpt-6-paid' });
+          const sendPaid = await call('delegate_send', { id: sendTarget.id, message: 'again' }, opencodeContext());
+          eq('delegate_send opencode: a paid model is refused before the run', [sendPaid.isError, sendPaid.text.includes('is not a free opencode model'), readTask(sendTarget.id).state], [true, true, 'done']);
+          const sendMissing = await call('delegate_send', { id: sendTarget.id, message: 'again' }, opencodeContext({ findOpencode: notInstalled }));
+          eq('delegate_send opencode: not installed is an error', [sendMissing.isError, sendMissing.text.includes('not installed')], [true, true]);
+          updateTask(sendTarget.id, { model: 'opencode/big-pickle' });
+          fs.writeFileSync(process.env.CONSULT_PROJECTS_FILE, JSON.stringify({}));
+          const sendOk = await call('delegate_send', { id: sendTarget.id, message: 'again' }, opencodeContext());
+          eq('delegate_send opencode: a free model resumes, with the fence note', [sendOk.value.started, sendOk.value.fence, sendOk.value.fence_note], [true, 'fenced', 'fenced (files); network open: it can read any file you can and send it out']);
+
+          const switched = readTask(defaultModel.value.id);
+          updateTask(switched.id, { state: 'done', model_used: 'opencode/big-pickle', model_switches: ['opencode/deepseek-v4.1-flash-free → opencode/big-pickle: rate limit', 'opencode/big-pickle → x/y:free: rate limit'] });
+          const switchedResult = await call('delegate_result', { id: switched.id }, opencodeContext());
+          eq('delegate_result opencode: model_used and the switch note', [switchedResult.value.model_used, switchedResult.value.note.includes('Switched models on a rate limit: opencode/deepseek-v4.1-flash-free → opencode/big-pickle: rate limit; opencode/big-pickle → x/y:free: rate limit.')], ['opencode/big-pickle', true]);
+          const statusOfFenced = await call('delegate_status', { id: free.value.id }, opencodeContext());
+          eq('delegate_status opencode: the fence note names the open network, as the start reply did', statusOfFenced.value.tasks[0].fence_note, 'fenced (files); network open: it can read any file you can and send it out');
+          const statusOfCodex = await call('delegate_status', { id: codexSibling.value.id }, opencodeContext());
+          eq('delegate_status: a codex task gets no opencode fence note', statusOfCodex.value.tasks[0].fence_note, undefined);
+          const switchedStatus = await call('delegate_status', { id: switched.id }, opencodeContext());
+          eq('delegate_status opencode: model_used and the switch note', [switchedStatus.value.tasks[0].model_used, /Switched models on a rate limit: /.test(switchedStatus.value.tasks[0].note)], ['opencode/big-pickle', true]);
+          const plainResult = await call('delegate_result', { id: free.value.id }, opencodeContext());
+          eq('delegate_result opencode: no switches, no note', [/Switched models/.test(plainResult.value.note ?? ''), 'model_used' in plainResult.value], [false, true]);
+
+          const delegateText = toolsModule.DELEGATE_TOOLS.find((tool) => tool.name === 'delegate').description;
+          truthy('delegate description names opencode as the free cloud worker', /opencode/.test(delegateText) && /free/.test(delegateText));
         });
 
         await guardedAsync('delegate: a lifted fence', async () => {
@@ -6331,7 +6851,7 @@ try {
         eq('door show: other projects are only counts (finished and not yet reported, running)', shown.json.elsewhere, [{ project: projectB, finished: 2, running: 2 }]);
         const { local_slots: defaultSlots, local_fence_check: defaultFenceCheck, ...defaultSettings } = shown.json.settings;
         eq('door show: the defaults', defaultSettings, {
-          workers_edit: 'auto', table: { code: 'codex', research_review: 'agy', private: 'local' }, fence: { codex: 'fenced', agy: 'fenced', local: 'fenced' }, local_at_once: 'auto', on_close: 'stop', time_limit_min: 180
+          workers_edit: 'auto', table: { code: 'codex', research_review: 'agy', private: 'local' }, fence: { codex: 'fenced', agy: 'fenced', local: 'fenced', opencode: 'fenced' }, opencode: { models: ['opencode/deepseek-v4.1-flash-free', 'opencode/big-pickle'] }, local_at_once: 'auto', on_close: 'stop', time_limit_min: 180
         });
         // The door's home folder is its own, so no check is cached: unchecked, or guard when Codex or pi is not installed here.
         truthy('door show: local_fence_check is guard or unchecked with nothing cached', ['guard', 'unchecked'].includes(defaultFenceCheck));
@@ -6360,11 +6880,13 @@ try {
         const { local_fence_check: configuredFenceCheck, ...configuredSettings } = configured.json.settings;
         truthy('door show: the saved settings carry local_fence_check', ['guard', 'unchecked', 'sandbox'].includes(configuredFenceCheck));
         eq('door show: the saved settings, research and review differing show as mixed', configuredSettings, {
-          workers_edit: 'copy', table: { code: 'codex', research_review: 'mixed', private: 'agy' }, fence: { codex: 'fenced', agy: 'fenced', local: 'fenced' }, local_at_once: 2, on_close: 'keep', time_limit_min: 45, local_slots: null
+          workers_edit: 'copy', table: { code: 'codex', research_review: 'mixed', private: 'agy' }, fence: { codex: 'fenced', agy: 'fenced', local: 'fenced', opencode: 'fenced' }, opencode: { models: ['opencode/deepseek-v4.1-flash-free', 'opencode/big-pickle'] }, local_at_once: 2, on_close: 'keep', time_limit_min: 45, local_slots: null
         });
         eq('door show: git declined', configured.json.git?.declined, true);
         fs.writeFileSync(globalSettingsPath, '---\ndelegate.research: local\ndelegate.review: local\n---\n');
         eq('door show: research and review the same show as that value', (await runDoor(projectA, 'show')).json.settings?.table?.research_review, 'local');
+        fs.writeFileSync(globalSettingsPath, '---\nopencode.models: opencode/big-pickle, openrouter/google/gemma-4-31b-it:free\n---\n');
+        eq('door show: the opencode models the settings name, in order (the tab shows them)', (await runDoor(projectA, 'show')).json.settings?.opencode, { models: ['opencode/big-pickle', 'openrouter/google/gemma-4-31b-it:free'] });
       });
 
       // ---- local_fence_check against a stub codex and pi on PATH ----
@@ -6709,7 +7231,7 @@ try {
         eq('door save: the first save keeps a .bak of the file as it was', fs.readFileSync(`${globalSettingsPath}.bak`, 'utf8'), original);
         const { local_fence_check: keptFenceCheck, ...keptSettings } = keep.json.settings;
         eq('door save: the reply leaves out local_fence_check (only show reads Codex)', keptFenceCheck, undefined);
-        eq('door save: the settings come back as show reads them', keptSettings, { workers_edit: 'copy', table: { code: 'codex', research_review: 'agy', private: 'local' }, fence: { codex: 'fenced', agy: 'fenced', local: 'fenced' }, local_at_once: 'auto', on_close: 'keep', time_limit_min: 180 });
+        eq('door save: the settings come back as show reads them', keptSettings, { workers_edit: 'copy', table: { code: 'codex', research_review: 'agy', private: 'local' }, fence: { codex: 'fenced', agy: 'fenced', local: 'fenced', opencode: 'fenced' }, opencode: { models: ['opencode/deepseek-v4.1-flash-free', 'opencode/big-pickle'] }, local_at_once: 'auto', on_close: 'keep', time_limit_min: 180 });
         const second = await runDoor(projectA, 'save', JSON.stringify({ time_limit_min: 45, local_at_once: 3, keep_backup: true }));
         eq('door save: keep_backup leaves the first .bak alone and still saves', [second.json.error, fs.readFileSync(`${globalSettingsPath}.bak`, 'utf8'), fs.readFileSync(globalSettingsPath, 'utf8').includes('delegate.time_limit_min: 45\r\n'), fs.readFileSync(globalSettingsPath, 'utf8').includes('delegate.local_at_once: 3\r\n')], [undefined, original, true, true]);
         eq('door save: the numbers come back as numbers', [second.json.settings?.time_limit_min, second.json.settings?.local_at_once], [45, 3]);
@@ -6769,7 +7291,7 @@ try {
         const declined = await runDoor(projectA, 'save', JSON.stringify({ git: 'declined' }));
         eq('door save: git declined is saved and shows', [declined.json.error, projectSettings(projectA).git, (await runDoor(projectA, 'show')).json.git?.declined], [undefined, 'declined', true]);
         const asked = await runDoor(projectA, 'save', JSON.stringify({ git: null, workers_edit: null }));
-        eq('door save: null puts git back to ask and workers_edit to auto', [asked.json.error, projectSettings(projectA), asked.json.settings?.workers_edit, (await runDoor(projectA, 'show')).json.git?.declined], [undefined, { workers_edit: 'auto', git: 'ask', fence: { codex: 'fenced', agy: 'fenced', local: 'fenced' } }, 'auto', false]);
+        eq('door save: null puts git back to ask and workers_edit to auto', [asked.json.error, projectSettings(projectA), asked.json.settings?.workers_edit, (await runDoor(projectA, 'show')).json.git?.declined], [undefined, { workers_edit: 'auto', git: 'ask', fence: { codex: 'fenced', agy: 'fenced', local: 'fenced', opencode: 'fenced' } }, 'auto', false]);
         const fenceSaved = await runDoor(projectA, 'save', JSON.stringify({ fence: { codex: 'full' } }));
         eq('door save: a fence is saved for the project', [fenceSaved.json.error, projectSettings(projectA).fence.codex, fenceSaved.json.settings?.fence?.codex], [undefined, 'full', 'full']);
         const projectsBeforeSoftCodex = fs.readFileSync(doorProjectsFile, 'utf8');
@@ -6781,7 +7303,7 @@ try {
           saveProjectSettings(projectB, { git: 'declined', workers_edit: 'copy' });
           return saveProjectSettings(projectB, { git: null, workers_edit: null });
         })();
-        eq('saveProjectSettings: null resets', nullStore, { workers_edit: 'auto', git: 'ask', fence: { codex: 'fenced', agy: 'fenced', local: 'fenced' } });
+        eq('saveProjectSettings: null resets', nullStore, { workers_edit: 'auto', git: 'ask', fence: { codex: 'fenced', agy: 'fenced', local: 'fenced', opencode: 'fenced' } });
 
         fs.rmSync(globalSettingsPath);
         fs.rmSync(`${globalSettingsPath}.bak`, { force: true });
@@ -6856,12 +7378,18 @@ try {
         eq('removeTaskWhen: the check sees the task as it is under the lock', storeNamespace.removeTaskWhen(task.id, (current) => current.state === 'failed' && current.id === task.id), true);
         eq('removeTaskWhen: the folder and the index row are gone', [fs.existsSync(taskFolder(task.id)), indexIds().includes(task.id)], [false, false]);
         const fenceNamespace = await import('./lib/delegate-fence.js');
-        const piTask = addTask(repo, {}, { state: 'failed' });
-        const piFolders = fenceNamespace.piTempFolders(piTask.id);
+        const piTask = addTask(repo, { worker: 'local' }, { state: 'failed' });
+        const piFolders = fenceNamespace.workerTempFolders('local', piTask.id);
         fs.mkdirSync(piFolders.sessions, { recursive: true });
         fs.writeFileSync(path.join(piFolders.sessions, 's.jsonl'), 'x');
         eq('removeTaskWhen: a refusing check keeps the pi temp folder', [storeNamespace.removeTaskWhen(piTask.id, () => false), fs.existsSync(piFolders.root)], [false, true]);
         eq('removeTaskWhen: removing the task also removes its pi temp folder', [storeNamespace.removeTaskWhen(piTask.id, () => true), fs.existsSync(piFolders.root)], [true, false]);
+        const opencodeTask = addTask(repo, { worker: 'opencode' }, { state: 'failed' });
+        const opencodeFolders = fenceNamespace.workerTempFolders('opencode', opencodeTask.id);
+        fs.mkdirSync(opencodeFolders.data, { recursive: true });
+        fs.writeFileSync(path.join(opencodeFolders.data, 'opencode.db'), 'x');
+        eq('removeTaskWhen: a refusing check keeps the opencode temp folder', [storeNamespace.removeTaskWhen(opencodeTask.id, () => false), fs.existsSync(opencodeFolders.root)], [false, true]);
+        eq('removeTaskWhen: removing the task also removes its opencode temp folder', [storeNamespace.removeTaskWhen(opencodeTask.id, () => true), fs.existsSync(opencodeFolders.root)], [true, false]);
         eq('removeTaskWhen: a task that is already gone is false', storeNamespace.removeTaskWhen(task.id, () => true), false);
         const delegateModule = await import('./lib/delegate.js');
         eq('delegate.js exports cancelTask and sameProject for the door', [typeof delegateModule.cancelTask, typeof delegateModule.sameProject], ['function', 'function']);

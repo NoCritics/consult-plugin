@@ -30,7 +30,8 @@ import {
   dataHome, taskFolder, createTask, readTask, updateTask, updateTaskWhen, scanTasks, listTasks, indexRow,
   projectKey, projectSettings, taskFence, narrowerFence, saveProjectSettings, withLockFolder, removeTaskWhen, unmergedBase, isSupervisorLive, ACTIVE_STATES
 } from './delegate-store.js';
-import { launchSupervisor, copyWorkFolder, cachedPiLayer } from './delegate-supervisor.js';
+import { launchSupervisor, copyWorkFolder, cachedPiLayer, refuseProgramInsideProject } from './delegate-supervisor.js';
+import { findOpencodeBinary, readFreeModels, chooseModels } from './opencode-models.js';
 import { isLongText, previewWithPath } from './long-answer.js';
 
 // ---- the words ----
@@ -39,7 +40,7 @@ import { isLongText, previewWithPath } from './long-answer.js';
 // (which stay loaded when tools are deferred), the delegate description and
 // the ask_* descriptions. The worker's name never picks the route.
 export const ASK_OR_DELEGATE_RULE =
-  'Ask or delegate. consult is in play when the user names codex, agy, local or their models, or says through consult / another model / not Claude; the name picks the worker, never the route. First match wins: ' +
+  'Ask or delegate. consult is in play when the user names codex, agy, opencode, local or their models, or says through consult / another model / not Claude; the name picks the worker, never the route. First match wins: ' +
   '1) an instruction to delegate -> delegate, even for a quick question (not a quoted or negated "delegate"); ' +
   '2) project work (fix, write or edit files, run, debug, investigate, inspect folders) or research over many sources -> delegate, even if they say ask; ' +
   '3) an answer, explanation or summary from knowledge or text in the conversation -> ask_*; ' +
@@ -47,7 +48,7 @@ export const ASK_OR_DELEGATE_RULE =
   '5) ask_*. A longer ask timeout never replaces delegate. Without consult in play, use your own subagents.';
 // The delegate description opens with this.
 export const DELEGATE_ROUTING_TEXT =
-  'Background task run by Codex, agy or a local model in the project folder: work on the project (fix, write or edit files, run, debug, investigate), inspecting project folders, or research over many sources. ' +
+  'Background task run by Codex, agy, opencode (free cloud models) or a local model in the project folder: work on the project (fix, write or edit files, run, debug, investigate), inspecting project folders, or research over many sources. ' +
   'Use it whenever the user tells one of those workers to delegate, even a quick question, and for such work even when they say "ask". Otherwise an answer, explanation or summary goes to ask_<worker>; if that still leaves it open, task, hand off, give X the job and have X work on mean delegate. ' +
   "With no consult worker named and no 'through consult' / 'another model' / 'not Claude', use your own subagent tool.";
 // Added to the ask_* descriptions when delegate is on.
@@ -99,7 +100,7 @@ function aliasSentence() {
 }
 
 function workerChoices() {
-  return `Use codex, agy, local or local:<nickname> (${uniqueNicknames().join(', ')}), a model-family alias (${Object.keys(WORKER_ALIASES).join(', ')}), or auto together with kind (${KINDS.join(', ')}).`;
+  return `Use codex, agy, opencode, local or local:<nickname> (${uniqueNicknames().join(', ')}), a model-family alias (${Object.keys(WORKER_ALIASES).join(', ')}), or auto together with kind (${KINDS.join(', ')}).`;
 }
 
 // ---- tool definitions (consult.js lists these) ----
@@ -111,9 +112,9 @@ export const DELEGATE_TOOLS = [
     name: 'delegate',
     description:
       `${DELEGATE_ROUTING_TEXT} ` +
-      `Workers: codex, agy, local, or local:<nickname> (${uniqueNicknames().join(', ')}) to pick a local model. ${aliasSentence()} ` +
+      `Workers: codex, agy, opencode (free cloud models only; never for private work), local, or local:<nickname> (${uniqueNicknames().join(', ')}) to pick a local model. ${aliasSentence()} ` +
       '`worker: "auto"` with a `kind` uses the user\'s default table: use it only when the user clearly pointed at consult without naming a worker, and say which worker it chose. ' +
-      'Fences are set per project by the user in the Delegated tab, and the start reply\'s `fence` says this task\'s: codex is `fenced` (works only inside its copy) or `full` (write tasks have full access to the PC; read tasks stay read-only but may read anywhere); agy and local are `fenced` (agy trusts only the project folder; local runs in Codex\'s sandbox, or with consult\'s file-edit check when Codex is missing) or `none`. agy can\'t run commands; local read-only tasks get read tools only. ' +
+      'Fences are set per project by the user in the Delegated tab, and the start reply\'s `fence` says this task\'s: codex is `fenced` (works only inside its copy) or `full` (write tasks have full access to the PC; read tasks stay read-only but may read anywhere); agy, opencode and local are `fenced` (agy trusts only the project folder; opencode and local run in Codex\'s sandbox, and opencode never runs fenced without it; local falls back to consult\'s file-edit check when Codex is missing) or `none`. A fenced opencode task can still read any file you can and send it out over the network. agy can\'t run commands; local read-only tasks get read tools only. ' +
       'Never change a fence yourself, with a tool, a script or a file edit: if the user wants one changed, tell them it is in the Delegated tab\'s settings. When `fence_note` is set, tell the user in your one-line start message. ' +
       'A local worker keeps its own model calls on this machine, but it is not offline (its shell can reach the network), and Claude, which writes the brief and reads the result, is a cloud model. ' +
       'Write the brief yourself: the goal, the files involved, what done means and the constraints; the worker cannot see this conversation. ' +
@@ -131,7 +132,7 @@ export const DELEGATE_TOOLS = [
         brief: { type: 'string', description: 'The whole task for the worker: goal, files, what done means, constraints. It reaches the worker on stdin or as a file, never in its command line.' },
         mode: { type: 'string', enum: TASK_MODES, description: '"read" for research and review (works in the real folder, writes nothing); "write" when it edits files.' },
         kind: { type: 'string', enum: KINDS, description: 'What kind of work this is. Required with worker "auto" (the table maps it to a worker; "other" asks the user); otherwise only recorded.' },
-        model: { type: 'string', description: 'Optional model for the worker (Codex model id, agy model id, or a local model name or nickname). Omit for the worker\'s own default.' },
+        model: { type: 'string', description: 'Optional model for the worker (Codex model id, agy model id, a free opencode model id such as opencode/big-pickle, or a local model name or nickname). Omit for the worker\'s own default.' },
         effort: { type: 'string', description: 'Optional reasoning effort for codex or agy. Omit for the default.' },
         location: { type: 'string', enum: LOCATIONS, description: 'Optional override of where a write task works: "copy" (a separate git copy) or "here" (the real folder). Use it only when the user said so ("in a copy", "right here"); the project\'s setting decides otherwise.' },
         hold: { type: 'boolean', description: 'true: when it finishes, hold it for the user\'s review instead of treating it as ready to merge.' },
@@ -241,6 +242,11 @@ function failTask(taskId, reason) {
   } catch (_) { /* the error the caller throws is what the user sees */ }
 }
 
+function modelSwitchNote(task) {
+  if (!Array.isArray(task.model_switches) || task.model_switches.length === 0) return undefined;
+  return `Switched models on a rate limit: ${task.model_switches.join('; ')}.`;
+}
+
 function taskView(task) {
   const view = indexRow(task);
   view.kind = task.kind ?? null;
@@ -250,6 +256,9 @@ function taskView(task) {
   view.last_output_at = task.last_output_at ?? null;
   view.log_path = task.log_path ?? null;
   view.warning = task.warning ?? null;
+  const switchNote = modelSwitchNote(task);
+  if (switchNote !== undefined) view.note = switchNote;
+  if (task.worker === 'opencode') view.fence_note = currentOpencodeFenceNote(task);
   return view;
 }
 
@@ -326,6 +335,40 @@ function launch(context, taskId) {
 
 // ---- delegate ----
 
+const OPENCODE_FENCED_NOTE = 'fenced (files); network open: it can read any file you can and send it out';
+const OPENCODE_LIFTED_NOTE = 'not fenced: it runs without the sandbox and can change any file you can';
+const OPENCODE_LIFTED_READ_NOTE = "only opencode's own tool rules keep this read task from writing";
+
+// The note for a task's fence as it runs now: the project's setting can only narrow it.
+function currentOpencodeFenceNote(task) {
+  return opencodeFenceNote(narrowerFence('opencode', taskFence(task), projectSettings(task.project).fence.opencode), task.mode);
+}
+
+function opencodeFenceNote(fence, mode) {
+  if (fence === 'fenced') return OPENCODE_FENCED_NOTE;
+  if (mode === 'read') return `${OPENCODE_LIFTED_NOTE}; ${OPENCODE_LIFTED_READ_NOTE}`;
+  return OPENCODE_LIFTED_NOTE;
+}
+
+// Before a task is made or resumed: opencode is installed and the named model, if any, is free.
+// (context.findOpencode and context.readFreeModels are for tests; the supervisor checks again.)
+// `folders`: the task's own folders, which the program may not sit inside.
+async function checkOpencode(model, context, folders) {
+  const binary = (context.findOpencode ?? findOpencodeBinary)();
+  if (binary.unavailable !== undefined) throw new Error(`opencode cannot run: ${binary.unavailable}.`);
+  // The listing runs the program too, so a program inside the project is refused before it.
+  refuseProgramInsideProject(binary.path, 'opencode', folders);
+  let free;
+  try {
+    free = await (context.readFreeModels ?? readFreeModels)({ binary: binary.path });
+  } catch (error) {
+    free = { ok: false, reason: error.message };
+  }
+  if (!free.ok) throw new Error(`opencode cannot run: ${free.reason}.`);
+  const chosen = chooseModels({ listed: context.settings.opencode?.models ?? [], explicit: model, free: free.free });
+  if (!chosen.ok) throw new Error(`opencode cannot run: ${chosen.reason}.`);
+}
+
 function validateWorkerOptions(worker, model, effort) {
   requireModelId(model);
   if (worker === 'codex') validateReasoningEffort(effort);
@@ -339,6 +382,9 @@ function chooseWorker(args, settings) {
   if (word.toLowerCase() === 'auto') {
     if (args.kind === undefined) throw new Error(`worker "auto" needs \`kind\` (${KINDS.join(', ')}): classify the task. ${workerChoices()}`);
     const named = workerForKind(args.kind, settings.delegate.table);
+    if (args.kind === 'private' && named === 'opencode') {
+      throw new Error('Private work never goes to opencode (a cloud worker). Use a local model, or change delegate.private in the settings.');
+    }
     if (!DELEGATE_WORKERS.includes(named)) {
       return {
         ask: 'This kind of task has no default worker. Which should take it: codex (writing and building code), agy (research or review) or local (private work)? Or keep it with one of your own subagents.'
@@ -353,6 +399,7 @@ function chooseWorker(args, settings) {
     throw new Error(`${error.message} ${workerChoices()}`);
   }
   if (parsed.worker === null) throw new Error(`Unknown worker ${JSON.stringify(word)}. ${workerChoices()}`);
+  if (parsed.worker === 'opencode' && args.kind === 'private') throw new Error('Private work never goes to opencode (a cloud worker). Use a local model.');
   return parsed;
 }
 
@@ -388,6 +435,7 @@ async function startDelegate(args, context) {
   const model = args.model ?? chosen.nickname ?? null;
   const effort = args.effort ?? null;
   validateWorkerOptions(worker, model, effort);
+  if (worker === 'opencode') await checkOpencode(args.model ?? null, context, [context.project]);
   if (worker === 'local' && !localConfigured(context.settings)) {
     throw new Error('No local runner is set up, so a local task cannot start. Run /consult:setlocal first.');
   }
@@ -508,6 +556,11 @@ async function startDelegate(args, context) {
   if (localLayer !== null) result.fence_layer = localLayer.kind ?? 'pending';
   if (fence === 'full') result.fence_note = 'This project\'s fence is lifted: Codex has full access to this PC for this task.';
   if (fence === 'none') result.fence_note = `This project's fence is lifted: ${worker} may change files outside the project folder.`;
+  if (worker === 'opencode') {
+    // The supervisor writes the layer at the first run; a fenced opencode task always gets the sandbox.
+    result.fence_layer = fence === 'fenced' ? 'sandbox' : null;
+    result.fence_note = opencodeFenceNote(fence, args.mode);
+  }
   if (localLayer !== null && localLayer.kind === 'guard') result.fence_note = guardNote(localLayer.reason);
   // Pending: the supervisor decides the layer as the task starts.
   if (localLayer !== null && localLayer.kind === null) {
@@ -581,7 +634,7 @@ async function resultTool(args, context) {
   // acts on it: removes its empty copy, or marks it seen (which hides it from its owner's open list).
   const inOwnProject = sameProject(task.project, context.project);
   const output = {
-    id: task.id, title: task.title, worker: task.worker, model: task.model, state: task.state, stop_reason: task.stop_reason ?? null,
+    id: task.id, title: task.title, worker: task.worker, model: task.model, model_used: task.model_used ?? null, state: task.state, stop_reason: task.stop_reason ?? null,
     summary: task.summary ?? null, location: task.location, mode: task.mode, final_message: readFinalMessage(task),
     changed: null, diff_stat: null, branch: task.branch ?? null, log_path: task.log_path ?? null,
     limit: task.limit ?? null, limit_hit: task.limit_hit ?? null, denied: task.denied ?? null, warning: task.warning ?? null,
@@ -610,6 +663,8 @@ async function resultTool(args, context) {
       notes.push(`Also changed in the folder during this read-only task, by no edit step of ${workerLabel(task.worker)}'s (another session or the user, perhaps): ${files}.`);
     }
   }
+  const switchNote = modelSwitchNote(task);
+  if (switchNote !== undefined) notes.push(switchNote);
   if (typeof task.fence_layer_changed === 'string' && task.fence_layer_changed !== '') {
     notes.push(`The fence changed between runs: ${task.fence_layer_changed}.`);
   }
@@ -835,6 +890,7 @@ async function sendTool(args, context) {
     const fenceNow = narrowerFence(task.worker, taskFence(task), projectSettings(task.project).fence[task.worker]);
     refuseInConsultFolder({ worker: task.worker, isWrite: task.mode === 'write', fenced: fenceNow === 'fenced', folder: task.project });
   }
+  if (task.worker === 'opencode') await checkOpencode(task.model ?? null, context, [task.project, task.worktree].filter(Boolean));
   const queuedAt = Date.now();
   // What the update below changes, as it was, so a launch that fails can put it all back.
   let previous = null;
@@ -875,6 +931,10 @@ async function sendTool(args, context) {
   const folder = task.location === 'copy' ? await workFolderOf(latest) : task.project;
   if (task.worker === 'local') latest = await waitForLocalStart(task.id, context.startWaitMs ?? LOCAL_START_WAIT_MS);
   const result = { started: true, resumed: true, id: task.id, worker: task.worker, location: task.location, folder, state: latest.state };
+  if (task.worker === 'opencode') {
+    result.fence = taskFence(latest);
+    result.fence_note = currentOpencodeFenceNote(latest);
+  }
   if (task.worker === 'local' && latest.state === 'queued') {
     result.queued = true;
     result.ahead = localTasksAhead(latest);

@@ -24,9 +24,10 @@ import { loadSettings, runnerSettings } from './settings.js';
 import { readKey, runnerInventory } from './local-runners.js';
 import { workerCommand, parseWorkerStream, noteStepEvent, codexRolloutLimits, deniedNames, workerWriteTargets, workerLabel } from './delegate-workers.js';
 import { gitState, endSnapshot, changedFiles, watchFolder, diffWatch, sortChanges, isOutside, worktreesRoot } from './delegate-git.js';
-import { recordLimit, recordLimitHit, hitKindOf } from './delegate-limits.js';
+import { recordLimit, recordLimitHit, hitKindOf, lastLimits, activeHit, OPENCODE_MODEL_KEY_PREFIX } from './delegate-limits.js';
+import { findOpencodeBinary, readFreeModels, chooseModels } from './opencode-models.js';
 import {
-  stagePiSessions, returnPiSessions, removePiTemp, makePiTempFolders, hasLeftoverPiSessions, piLauncherFor, sandboxCheck, readCachedSandboxCheck, findCodexForFence
+  stageSessions, returnSessions, removeWorkerTemp, makeWorkerTempFolders, hasLeftoverSessions, piLauncherFor, sandboxCheck, readCachedSandboxCheck, findCodexForFence
 } from './delegate-fence.js';
 import { readTask, updateTask, updateTaskWhen, taskFolder, taskFence, narrowerFence, projectSettings, isAlive, isSessionAlive, isProcessAlive, isSupervisorLive, unmergedBase, holdsConsultFiles } from './delegate-store.js';
 
@@ -64,7 +65,7 @@ const READ_ONLY_EDITS_NAMED = 10;
 const SURVIVORS_NAMED = 5;
 
 // The command-line tool behind each worker, for the "not installed" check.
-const CLI_NAMES = { codex: 'codex', agy: 'agy', local: 'pi' };
+const CLI_NAMES = { codex: 'codex', agy: 'agy', local: 'pi', opencode: 'opencode' };
 
 // ---- launching ----
 
@@ -473,6 +474,8 @@ async function recordEnd(context, outcome) {
 // none can change the task, which is already written.
 function recordLearnedLimits(context, outcome) {
   const worker = context.task.worker;
+  // opencode's hits are kept per model, and runOpencodeModels recorded each one as its run ended.
+  if (worker === 'opencode') return;
   const now = context.now();
   if (worker === 'codex' && outcome.limit) {
     try { context.io.recordLimit(worker, outcome.limit, now); } catch (_) { /* the limits are a convenience */ }
@@ -529,7 +532,7 @@ function outcomeOfRun(context, exit, parsed, rolloutLimits) {
     if (sandboxLine !== null) {
       return {
         ...parsedOutcome(parsed), limit: windows,
-        state: 'failed', summary: `Failed: Codex's sandbox could not start pi: ${oneLine(scrubPii(context.redact(sandboxLine)), STDERR_SUMMARY_CHARS)}`
+        state: 'failed', summary: `Failed: Codex's sandbox could not start ${task.worker === 'opencode' ? 'opencode' : 'pi'}: ${oneLine(scrubPii(context.redact(sandboxLine)), STDERR_SUMMARY_CHARS)}`
       };
     }
   }
@@ -559,7 +562,9 @@ function outcomeOfRun(context, exit, parsed, rolloutLimits) {
 
 // The child's environment: ours, then the worker command's own, and the pi
 // key under the variable name the command names. The key goes nowhere else.
-function childEnvironment(command, key) {
+// A command with inheritEnvironment: false (opencode) gets its own env alone.
+export function childEnvironment(command, key) {
+  if (command.inheritEnvironment === false) return { ...command.env };
   const environment = { ...process.env, ...command.env };
   const keyName = command.env.CONSULT_PI_KEY_ENV;
   if (typeof keyName === 'string' && environment[keyName] === undefined && key !== null) environment[keyName] = key;
@@ -579,45 +584,67 @@ function isInsideAnyFolder(program, folders) {
   return false;
 }
 
-// Spawns the worker as spawn-cli.js does. CONSULT_DELEGATE_TEST_BIN (the
-// supervisor's own environment only) swaps the worker's binary for a script
+// The program and arguments to spawn for a worker command. CONSULT_DELEGATE_TEST_BIN
+// (the supervisor's own environment only) swaps the worker's binary for a script
 // run by node, or for any other program.
-function spawnWorker(task, command, environment) {
+export function spawnPlan(task, command) {
   const testBin = process.env.CONSULT_DELEGATE_TEST_BIN;
-  let program;
-  let args;
-  // A sandboxed pi: Codex's sandbox command comes first, then node on pi's launcher, then pi's own arguments.
-  const workerArgs = command.wrapper ? [...command.wrapper.args, ...command.args] : command.args;
+  // opencode's command names its own program (command.cmd, found once at build time);
+  // a sandboxed one is Codex's sandbox command, then that program, then its arguments.
+  const isOpencode = task.worker === 'opencode';
+  let workerArgs = command.args;
+  if (command.wrapper) workerArgs = isOpencode ? [...command.wrapper.args, command.cmd, ...command.args] : [...command.wrapper.args, ...command.args];
   if (testBin) {
     const isScript = /\.[cm]?js$/i.test(testBin);
-    program = isScript ? process.execPath : testBin;
-    args = isScript ? [testBin, ...workerArgs] : workerArgs;
-  } else if (command.wrapper) {
-    program = command.wrapper.program;
-    refuseProgramInsideProject(program, 'codex', [task.project, task.worktree]);
-    refuseProgramInsideProject(command.wrapper.launcherPath, 'pi', [task.project, task.worktree]);
-    args = workerArgs;
-  } else {
-    program = ensureCmd(CLI_NAMES[task.worker]);
-    // resolveCmd filtered against this process's cwd (the task folder); the
-    // project and its copy are what a planted CLI would sit in.
-    refuseProgramInsideProject(program, CLI_NAMES[task.worker], [task.project, task.worktree]);
-    args = workerArgs;
+    return { program: isScript ? process.execPath : testBin, args: isScript ? [testBin, ...workerArgs] : workerArgs };
   }
+  const folders = [task.project, task.worktree];
+  if (isOpencode) refuseProgramInsideProject(command.cmd, 'opencode', folders);
+  if (command.wrapper) {
+    refuseProgramInsideProject(command.wrapper.program, 'codex', folders);
+    // pi's launcher is the one extra program a sandboxed pi runs.
+    if (!isOpencode) refuseProgramInsideProject(command.wrapper.launcherPath, 'pi', folders);
+    return { program: command.wrapper.program, args: workerArgs };
+  }
+  if (isOpencode) return { program: command.cmd, args: workerArgs };
+  const program = ensureCmd(CLI_NAMES[task.worker]);
+  // resolveCmd filtered against this process's cwd (the task folder); the
+  // project and its copy are what a planted CLI would sit in.
+  refuseProgramInsideProject(program, CLI_NAMES[task.worker], folders);
+  return { program, args: workerArgs };
+}
+
+// With CONSULT_DELEGATE_TEST_BIN set (the supervisor's own environment only), a worker whose environment
+// is built rather than inherited (opencode) still gets the test's FAKE_* variables.
+function testWorkerVariables() {
+  const variables = {};
+  if (!process.env.CONSULT_DELEGATE_TEST_BIN) return variables;
+  for (const [name, value] of Object.entries(process.env)) {
+    if (name.startsWith('FAKE_')) variables[name] = value;
+  }
+  return variables;
+}
+
+// Spawns the worker as spawn-cli.js does.
+function spawnWorker(task, command, environment) {
+  const { program, args } = spawnPlan(task, command);
   return spawn(spawnableCmd(program), shellSafeArgs(args), {
     ...SPAWN_OPTS,
     cwd: command.cwd,
-    env: environment,
+    env: { ...environment, ...testWorkerVariables() },
     stdio: ['pipe', 'pipe', 'pipe'],
     windowsHide: true,
     detached: process.platform !== 'win32'
   });
 }
 
-// A failed copy of pi's sessions goes to stderr.log and, through recordEnd, to the task's warning.
+// The program whose session files a worker's temp folder holds.
+const SESSION_OWNER = { local: 'pi', opencode: 'opencode' };
+
+// A failed copy of pi's or opencode's sessions goes to stderr.log and, through recordEnd, to the task's warning.
 function noteCopyBack(context, copyBackError) {
   if (copyBackError === null) return;
-  context.copyBackWarning = `pi's session files could not be copied back: ${copyBackError}`;
+  context.copyBackWarning = `${SESSION_OWNER[context.task.worker]}'s session files could not be copied back: ${copyBackError}`;
   try { context.io.appendFile(path.join(context.folder, 'stderr.log'), `consult: ${copyBackError}\n`); } catch (_) { /* the log is a courtesy */ }
 }
 
@@ -627,8 +654,22 @@ function layerChange(previousLayer, layer) {
   return `${previousLayer} → ${layer}`;
 }
 
-const INSIDE_PROJECT_REASON = 'a codex or pi program inside the project was refused';
 const CONSULT_FILES_REASON = "the work folder holds consult's own files";
+
+// The checks every fenced worker that runs under Codex's sandbox shares: a reason string, or null when none
+// rules the sandbox out. `programs` names the programs a repository could plant, for the message.
+function sandboxHostReason({ codex, programs, workFolder, guardedFolders, skipFolderChecks }) {
+  if (!codex.found) return 'Codex is not installed';
+  // A repository can ship its own codex or worker; none inside the project is ever run.
+  if (isInsideAnyFolder(codex.path, guardedFolders)) return insideProjectReason(programs);
+  if (!skipFolderChecks && isBroadWorkFolder(workFolder)) return "the work folder is your home folder or a drive root, which Codex's sandbox must not be given";
+  if (!skipFolderChecks && holdsConsultFiles(workFolder)) return CONSULT_FILES_REASON;
+  return null;
+}
+
+function insideProjectReason(programs) {
+  return `a ${programs} program inside the project was refused`;
+}
 
 // The pure, synchronous checks that decide a fenced pi cannot have the sandbox: a reason string, or null
 // when none of them rules it out. `codex` and `pi` are lookups ({ path, found }), `launcherPath` is pi's
@@ -638,12 +679,9 @@ const CONSULT_FILES_REASON = "the work folder holds consult's own files";
 // is never broad and never holds consult's files. The tab uses the same checks (hooks/scripts/delegate.js).
 export function piGuardReason({ codex, pi, launcherPath, workFolder, protectedFolders = [], skipFolderChecks = false }) {
   const guardedFolders = [workFolder, ...protectedFolders];
-  if (!codex.found) return 'Codex is not installed';
-  // A repository can ship its own codex or pi; none inside the project is ever run.
-  if (isInsideAnyFolder(codex.path, guardedFolders)) return INSIDE_PROJECT_REASON;
-  if (!skipFolderChecks && isBroadWorkFolder(workFolder)) return "the work folder is your home folder or a drive root, which Codex's sandbox must not be given";
-  if (!skipFolderChecks && holdsConsultFiles(workFolder)) return CONSULT_FILES_REASON;
-  if (pi.found && isInsideAnyFolder(pi.path, guardedFolders)) return INSIDE_PROJECT_REASON;
+  const hostReason = sandboxHostReason({ codex, programs: 'codex or pi', workFolder, guardedFolders, skipFolderChecks });
+  if (hostReason !== null) return hostReason;
+  if (pi.found && isInsideAnyFolder(pi.path, guardedFolders)) return insideProjectReason('codex or pi');
   if (launcherPath === null) return "pi's launcher was not found next to pi.cmd";
   return null;
 }
@@ -696,6 +734,83 @@ export async function cachedPiLayer(options, workFolder, protectedFolders = [], 
   return layerOfCheck(cached, prechecked);
 }
 
+const OPENCODE_SANDBOX_REFUSAL = "opencode's fence needs Codex's sandbox: ";
+const OPENCODE_SWITCH_FOLLOW_UP = 'Continue the task.';
+
+// What a fenced opencode task needs of Codex's sandbox: { reason } when it cannot have it, else { codexPath }.
+// A fenced opencode task never falls back to its own rules.
+// (options.findCodex and options.sandboxCheck are for tests.)
+async function opencodeSandbox(options, workFolder, protectedFolders) {
+  // findCodexForFence honours CONSULT_DELEGATE_TEST_NO_CODEX, so no test ever reaches a real Codex.
+  const codex = (options.findCodex ?? findCodexForFence)();
+  const guardedFolders = [workFolder, ...protectedFolders];
+  const hostReason = sandboxHostReason({ codex, programs: 'codex or opencode', workFolder, guardedFolders, skipFolderChecks: false });
+  if (hostReason !== null) return { reason: hostReason };
+  let check;
+  try {
+    check = await (options.sandboxCheck ?? sandboxCheck)({ codexPath: codex.path, network: true });
+  } catch (error) {
+    return { reason: `the sandbox check failed: ${oneLine(error.message, 200)}` };
+  }
+  if (!check.ok) return { reason: `the sandbox check failed: ${check.failed}` };
+  return { codexPath: codex.path };
+}
+
+// Everything an opencode task needs decided before anything is staged or run: its fence (and, fenced, the
+// sandbox), the models it may run on, in order. Answers { outcome } when the task ends here (refused, or
+// every model limited), else { fence, binary, codexPath, models }.
+// (options.findOpencode and options.readFreeModels are for tests.)
+async function planOpencode(context, options, settings, workFolder) {
+  const task = context.task;
+  const refuse = (summary) => ({ outcome: { state: 'failed', summary: oneLine(scrubPii(context.redact(summary)), FAILURE_SUMMARY_MAX_CHARS) } });
+  const fence = narrowerFence('opencode', taskFence(task), projectSettings(task.project).fence.opencode);
+  const binary = (options.findOpencode ?? findOpencodeBinary)();
+  if (binary.unavailable !== undefined) return refuse(`Failed: ${binary.unavailable}`);
+
+  // The program is checked before anything runs it, the model listing included, fenced or not.
+  if (isInsideAnyFolder(binary.path, [workFolder, task.worktree, task.project])) {
+    return refuse(fence === 'fenced' ? `${OPENCODE_SANDBOX_REFUSAL}${insideProjectReason('codex or opencode')}` : `Failed: ${missingMessage('opencode', binary.path)}`);
+  }
+
+  let codexPath = null;
+  if (fence === 'fenced') {
+    const sandbox = await opencodeSandbox(options, workFolder ?? task.worktree ?? task.project, [task.worktree, task.project]);
+    if (sandbox.reason !== undefined) return refuse(`${OPENCODE_SANDBOX_REFUSAL}${sandbox.reason}`);
+    codexPath = sandbox.codexPath;
+  }
+
+  let free;
+  try {
+    free = await (options.readFreeModels ?? readFreeModels)({ binary: binary.path });
+  } catch (error) {
+    free = { ok: false, reason: error.message };
+  }
+  if (!free.ok) return refuse(`Failed: ${free.reason}`);
+  const chosen = chooseModels({ listed: settings.opencode?.models ?? [], explicit: task.model ?? null, free: free.free });
+  if (!chosen.ok) return refuse(`Failed: ${chosen.reason}`);
+
+  const now = context.now();
+  const known = context.io.lastLimits(now);
+  let models = [];
+  let earliestReset = null;
+  for (const model of chosen.models) {
+    const hit = activeHit(OPENCODE_MODEL_KEY_PREFIX + model, known, now);
+    if (hit === null) {
+      models.push(model);
+    } else if (typeof hit.resets_at === 'number' && (earliestReset === null || hit.resets_at < earliestReset)) {
+      earliestReset = hit.resets_at;
+    }
+  }
+  if (models.length === 0) {
+    const subject = chosen.models.length === 1 ? chosen.models[0] : 'every free opencode model';
+    const resets = earliestReset === null ? '' : ` (resets ${new Date(earliestReset).toISOString()})`;
+    return { outcome: { state: 'paused-limit', summary: `Paused: ${subject} ${hitKindOf('throttled').pausedPhrase}${resets}.`, limit: { kind: 'throttled', resets_at: earliestReset } } };
+  }
+  // A follow-up starts on the model the task ended on.
+  if (models.includes(task.model_used)) models = [task.model_used, ...models.filter((model) => model !== task.model_used)];
+  return { fence, binary, codexPath, models };
+}
+
 // Whether any output line is a JSON object, which only pi writes: a sandboxed run that printed one got as far as pi.
 function hasJsonObjectLine(lines) {
   for (const line of lines) {
@@ -726,20 +841,26 @@ async function runWorker(context, command, childEnvironmentValues) {
   context.child = child;
   context.workerPid = child.pid;
   context.spawnedAtWall = Date.now();
-  context.startedAt = context.now();
-  context.lastOutputAt = context.startedAt;
+  // The time limit counts from the first run of this supervisor (opencode can run again on another model).
+  const runStartedAt = context.now();
+  context.startedAt ??= runStartedAt;
+  context.lastOutputAt = runStartedAt;
   // The previous run's answer goes too: delegate_result reads final.md only when this run wrote one.
   attempt(() => io.removeFile(path.join(context.folder, 'final.md')));
   // The run's own fields start clean: nothing an earlier run (a follow-up has
   // one) recorded about its outcome carries over. worker_session stays: it is
   // what a follow-up resumes.
+  // opencode: task.model stays what the caller named; the model the run uses is model_used.
+  let modelField = {};
+  if (task.worker === 'opencode') modelField = { model_used: command.model };
+  else if (task.model === null && command.model) modelField = { model: command.model };
   io.updateTask(task.id, {
     state: 'running', started_at: context.startedAt, ended_at: null, stop_reason: null, supervisor_pid: process.pid,
-    supervisor_beat_at: context.startedAt, worker_pid: child.pid, worker_real_pid: null, log_path: logPath, fenced: command.fenced, fence_layer: command.fenceLayer,
+    supervisor_beat_at: runStartedAt, worker_pid: child.pid, worker_real_pid: null, log_path: logPath, fenced: command.fenced, fence_layer: command.fenceLayer,
     fence_layer_reason: command.fenceReason ?? null, fence_layer_changed: layerChange(task.fence_layer, command.fenceLayer),
     followup: null, summary: null, final_path: null, end_commit: null, limit: null, limit_hit: null, denied: null, refused_paths: null,
     warning: command.warning ?? null, read_only_edits: null, other_changes: null,
-    ...(task.model === null && command.model ? { model: command.model } : {})
+    ...modelField
   });
   stopPreRunBeat(context); // that write carried the beat; the ticker below keeps it
 
@@ -925,7 +1046,7 @@ export async function runSupervisor(taskId, options = {}) {
     sawOutput: false, sandboxed: false, piEmitted: false, copyBackWarning: null, realWorkerSearched: false, preRunBeat: null, readOnlyEdits: [], otherChanges: [], survivorWarning: null,
     timeLimitMs: DEFAULT_TIME_LIMIT_MS,
     now: options.now ?? Date.now,
-    io: { updateTask, appendFile: fs.appendFileSync, removeFile: (file) => fs.rmSync(file, { force: true }), killTree, rolloutLimits: codexRolloutLimits, recordLimit, recordLimitHit, ...options.io },
+    io: { updateTask, appendFile: fs.appendFileSync, removeFile: (file) => fs.rmSync(file, { force: true }), killTree, rolloutLimits: codexRolloutLimits, recordLimit, recordLimitHit, lastLimits, ...options.io },
     watchdogMs: timingValue(options.watchdogMs, 'CONSULT_DELEGATE_WATCHDOG_MS', WATCHDOG_MS, MIN_WATCHDOG_MS),
     pollMs: timingValue(options.pollMs, 'CONSULT_DELEGATE_POLL_MS', POLL_MS, MIN_POLL_MS),
     killGiveUpMs: options.killGiveUpMs ?? KILL_GIVE_UP_MS,
@@ -1082,20 +1203,36 @@ async function superviseTask(context, options) {
   // A temp copy an earlier run left behind is newer than <taskDir>/pi-sessions: it is copied back first.
   // If that fails, a fenced run continues on it and a lifted run (which reads <taskDir>) stops.
   let piLayer = null;
-  let sessionsStaged = false;
+  // The worker whose sessions are staged in a temp folder, copied back in the finally below.
+  let stagedWorker = null;
+  let workerTemp = null;
   let fence;
-  if (task.worker === 'local') {
+  // opencode: its fence, models and sandbox are decided before anything is staged.
+  let opencodePlan = null;
+  if (task.worker === 'opencode') {
+    opencodePlan = await planOpencode(context, options, settings, workFolder);
+    if (opencodePlan.outcome !== undefined) {
+      await recordEnd(context, opencodePlan.outcome);
+      return;
+    }
+    fence = opencodePlan.fence;
+    // A temp copy an earlier run left behind is the newest: it is copied back first. If that fails, the run goes on it.
+    const leftoverError = hasLeftoverSessions('opencode', task.id) ? (options.returnSessions ?? returnSessions)('opencode', context.folder, task.id) : null;
+    noteCopyBack(context, leftoverError);
+    workerTemp = leftoverError === null ? stageSessions('opencode', context.folder, task.id) : makeWorkerTempFolders('opencode', task.id);
+    stagedWorker = 'opencode';
+  } else if (task.worker === 'local') {
     fence = narrowerFence('local', taskFence(task), projectSettings(task.project).fence.local);
-    const copyBack = options.returnPiSessions ?? returnPiSessions;
+    const copyBack = options.returnSessions ?? returnSessions;
     if (fence === 'fenced') {
       const chosen = await choosePiLayer(options, workFolder ?? task.worktree ?? task.project, [task.worktree, task.project]);
-      const leftoverError = hasLeftoverPiSessions(task.id) ? copyBack(context.folder, task.id) : null;
+      const leftoverError = hasLeftoverSessions('local', task.id) ? copyBack('local', context.folder, task.id) : null;
       noteCopyBack(context, leftoverError);
-      const temp = leftoverError === null ? stagePiSessions(context.folder, task.id) : makePiTempFolders(task.id);
-      sessionsStaged = true;
+      const temp = leftoverError === null ? stageSessions('local', context.folder, task.id) : makeWorkerTempFolders('local', task.id);
+      stagedWorker = 'local';
       piLayer = { ...chosen, temp };
-    } else if (hasLeftoverPiSessions(task.id)) {
-      const leftoverError = copyBack(context.folder, task.id);
+    } else if (hasLeftoverSessions('local', task.id)) {
+      const leftoverError = copyBack('local', context.folder, task.id);
       if (leftoverError !== null) {
         await recordEnd(context, {
           state: 'failed',
@@ -1104,7 +1241,7 @@ async function superviseTask(context, options) {
         return;
       }
       // Gone once it is back, so it can never be copied over a newer <taskDir>/pi-sessions later.
-      removePiTemp(task.id);
+      removeWorkerTemp('local', task.id);
     }
   }
   let run;
@@ -1112,41 +1249,15 @@ async function superviseTask(context, options) {
   let parsed;
   let rolloutLimits = { limit: null, limitHit: null };
   try {
-    command = workerCommand(workFolder === null ? task : { ...task, worktree: workFolder }, {
-      settings, runner, inventory, resume: isFollowUp, followUp: isFollowUp ? task.followup : null, piLayer, fence
-    });
-    if (command.briefFile !== null) {
-      fs.mkdirSync(path.dirname(command.briefFile.path), { recursive: true });
-      fs.writeFileSync(command.briefFile.path, command.briefFile.text);
-    }
-    for (const file of command.files) {
-      fs.mkdirSync(path.dirname(file.path), { recursive: true });
-      fs.writeFileSync(file.path, file.text);
-    }
-
-    // A worker that cannot be started (the tool is missing, an argument cannot be
-    // passed safely) throws here, and ends in the catch of runSupervisor.
-    // A read task is also checked for files that changed: one counts as the worker's own only when
-    // it changed during the run and the worker's own write or edit step named it. Any other change
-    // is kept apart (another session may be editing the same folder meanwhile).
-    const checksReadOnly = task.mode === 'read';
-    const folderBefore = checksReadOnly ? await watchFolder(command.cwd) : null;
-    context.sandboxed = command.wrapper !== undefined;
-    run = await runWorker(context, command, childEnvironment(command, key));
-    context.piEmitted = context.sandboxed && hasJsonObjectLine(run.lines);
-    if (checksReadOnly) {
-      const changed = diffWatch(folderBefore, await watchFolder(command.cwd)) ?? [];
-      const sorted = sortChanges(changed, workerWriteTargets(task.worker, run.lines, command.cwd), command.cwd);
-      context.readOnlyEdits = sorted.own;
-      context.otherChanges = sorted.others;
-    }
-
-    parsed = parseWorkerStream(task.worker, run.lines, { stderr: context.stderrTail, workFolder: command.fenced ? command.cwd : null });
-    if (task.worker === 'codex' && parsed.session !== null) {
-      rolloutLimits = context.io.rolloutLimits(parsed.session, { codexHome: options.codexHome });
+    if (opencodePlan !== null) {
+      ({ command, run, parsed } = await runOpencodeModels(context, options, opencodePlan, { settings, workFolder, isFollowUp, workerTemp, key }));
+    } else {
+      ({ command, run, parsed, rolloutLimits } = await runOnce(context, options, workFolder === null ? task : { ...task, worktree: workFolder }, {
+        settings, runner, inventory, resume: isFollowUp, followUp: isFollowUp ? task.followup : null, piLayer, fence
+      }, key));
     }
   } finally {
-    if (sessionsStaged) noteCopyBack(context, (options.returnPiSessions ?? returnPiSessions)(context.folder, task.id));
+    if (stagedWorker !== null) noteCopyBack(context, (options.returnSessions ?? returnSessions)(stagedWorker, context.folder, task.id));
   }
   if (context.stop !== null) {
     await recordEnd(context, {
@@ -1160,4 +1271,87 @@ async function superviseTask(context, options) {
     return;
   }
   await recordEnd(context, outcomeOfRun(context, run.exit, parsed, rolloutLimits));
+}
+
+// Builds one worker command, runs it, checks a read task's folder and parses the stream.
+// Answers { command, run, parsed, rolloutLimits }. A step that throws before the worker starts ends in runSupervisor's catch.
+async function runOnce(context, options, commandTask, commandOptions, key) {
+  const task = context.task;
+  const command = workerCommand(commandTask, commandOptions);
+  if (command.briefFile !== null) {
+    fs.mkdirSync(path.dirname(command.briefFile.path), { recursive: true });
+    fs.writeFileSync(command.briefFile.path, command.briefFile.text);
+  }
+  for (const file of command.files) {
+    fs.mkdirSync(path.dirname(file.path), { recursive: true });
+    fs.writeFileSync(file.path, file.text);
+  }
+
+  // A worker that cannot be started (the tool is missing, an argument cannot be
+  // passed safely) throws here, and ends in the catch of runSupervisor.
+  // A read task is also checked for files that changed: one counts as the worker's own only when
+  // it changed during the run and the worker's own write or edit step named it. Any other change
+  // is kept apart (another session may be editing the same folder meanwhile).
+  const checksReadOnly = task.mode === 'read';
+  const folderBefore = checksReadOnly ? await watchFolder(command.cwd) : null;
+  context.sandboxed = command.wrapper !== undefined;
+  const run = await runWorker(context, command, childEnvironment(command, key));
+  context.piEmitted = context.sandboxed && hasJsonObjectLine(run.lines);
+  if (checksReadOnly) {
+    const changed = diffWatch(folderBefore, await watchFolder(command.cwd)) ?? [];
+    const sorted = sortChanges(changed, workerWriteTargets(task.worker, run.lines, command.cwd), command.cwd);
+    // An earlier run of this task (opencode on another model) may have changed files too.
+    context.readOnlyEdits = [...new Set([...context.readOnlyEdits, ...sorted.own])].sort();
+    context.otherChanges = [...new Set([...context.otherChanges, ...sorted.others])].sort();
+  }
+
+  const parsed = parseWorkerStream(task.worker, run.lines, { stderr: context.stderrTail, workFolder: command.fenced ? command.cwd : null, model: command.model ?? null, now: context.now() });
+  let rolloutLimits = { limit: null, limitHit: null };
+  if (task.worker === 'codex' && parsed.session !== null) {
+    rolloutLimits = context.io.rolloutLimits(parsed.session, { codexHome: options.codexHome });
+  }
+  return { command, run, parsed, rolloutLimits };
+}
+
+// Runs an opencode task on its models in order: when a run ends on a rate limit, the hit is recorded for
+// that model and the next model continues the same session; each model runs at most once. A named model
+// is the only one in the list, so it never switches. Answers the last run, as runOnce does.
+async function runOpencodeModels(context, options, plan, { settings, workFolder, isFollowUp, workerTemp, key }) {
+  const task = context.task;
+  const switches = [];
+  context.io.updateTask(task.id, { model_switches: switches });
+  let session = task.worker_session;
+  let resume = isFollowUp;
+  let followUp = isFollowUp ? task.followup : null;
+  let modelIndex = 0;
+  while (true) {
+    const model = plan.models[modelIndex];
+    const commandTask = { ...task, worker_session: session, ...(workFolder === null ? {} : { worktree: workFolder }) };
+    const result = await runOnce(context, options, commandTask, {
+      settings, resume, followUp, fence: plan.fence, model, workerTemp, opencodeBinary: plan.binary, codexPath: plan.codexPath
+    }, key);
+    session = result.parsed.session ?? session;
+    const hit = result.parsed.limitHit;
+    if (hit === null) return result;
+    try {
+      context.io.recordLimitHit(OPENCODE_MODEL_KEY_PREFIX + model, hit, context.now());
+    } catch (_) { /* the limits are a convenience */ }
+    if (context.stop !== null || result.run.spawnError !== null || modelIndex + 1 >= plan.models.length) return result;
+    // Between runs there is no worker for requestStop to kill: a cancel or signal that came now ends the task here.
+    const stopBetweenRuns = pendingStop(context);
+    if (stopBetweenRuns !== null) {
+      context.stop = { ...stopBetweenRuns, at: Date.now() };
+      return result;
+    }
+
+    switches.push(`${model} → ${plan.models[modelIndex + 1]}: rate limit`);
+    context.io.updateTask(task.id, { model_switches: switches });
+    modelIndex++;
+    resume = session !== null;
+    followUp = OPENCODE_SWITCH_FOLLOW_UP;
+    // What the next run starts from: nothing of the last one's output or process.
+    context.stderrTail = '';
+    context.sawOutput = false;
+    context.realWorkerSearched = false;
+  }
 }

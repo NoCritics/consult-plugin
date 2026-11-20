@@ -8,7 +8,8 @@
 //         "limits":{"codex":{"level","note",...},"agy":{...},"local":{...}},
 //         "settings":{"workers_edit","table":{"code","research_review","private"},   (each codex, agy,
 //                     local or ask; research_review is "mixed" when the two differ)
-//                     "fence":{"codex","agy","local"}, "local_fence_check": "sandbox", "guard" or
+//                     "fence":{"codex","agy","local","opencode"}, "opencode":{"models":[...]} (the free
+//                     models opencode tries, in order; read-only in the tab), "local_fence_check": "sandbox", "guard" or
 //                     "unchecked" (what holds a fenced Local task: Codex's sandbox, consult's guard, or
 //                     no cached check yet),
 //                     "local_at_once","local_slots","on_close","time_limit_min"},
@@ -190,13 +191,14 @@ async function localFenceCheck(project, git) {
 // The delegate settings are global-only, so the project's own settings file
 // has nothing to add and nothing needs to run inside the project.
 function settingsView(project) {
-  const delegate = loadSettings().delegate;
+  const { delegate, opencode } = loadSettings();
   const { research, review } = delegate.table;
   const shownProject = projectSettings(project);
   const view = {
     workers_edit: shownProject.workers_edit,
     table: { code: delegate.table.code, research_review: research === review ? research : 'mixed', private: delegate.table.private },
     fence: shownProject.fence,
+    opencode: { models: opencode.models },
     local_at_once: delegate.local_at_once,
     on_close: delegate.on_close,
     time_limit_min: delegate.time_limit_ms / 60000

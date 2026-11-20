@@ -79,7 +79,7 @@ try {
   if (missingDelegate.length) {
     console.error('FAIL: tools/list lacks the delegate tools:', missingDelegate.join(', '));
     failed = true;
-  } else if (!list.find(tool => tool.name === 'delegate').description.startsWith('Background task run by Codex, agy or a local model in the project folder:')) {
+  } else if (!list.find(tool => tool.name === 'delegate').description.startsWith('Background task run by Codex, agy, opencode (free cloud models) or a local model in the project folder:')) {
     console.error('FAIL: the delegate description does not open with the routing text');
     failed = true;
   } else {
@@ -167,7 +167,7 @@ try {
   // A bad delegate worker is an error result naming the choices, and starts nothing.
   const badWorker = await waitFor(7, 10000);
   const badWorkerText = badWorker?.result?.content?.[0]?.text ?? '';
-  if (badWorker?.result?.isError !== true || !/codex, agy, local/.test(badWorkerText) || !/local:<nickname>/.test(badWorkerText)) {
+  if (badWorker?.result?.isError !== true || !/codex, agy, opencode, local/.test(badWorkerText) || !/local:<nickname>/.test(badWorkerText)) {
     console.error('FAIL: delegate with a bad worker was not refused with the choices:', JSON.stringify(badWorker).slice(0, 400));
     failed = true;
   } else {

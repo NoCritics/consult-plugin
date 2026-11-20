@@ -17,7 +17,7 @@ Decide this first. The model the user names picks the worker, never the route. T
 4. The verb: "ask", "consult", "what does X think", "second opinion" -> an ask tool; "task", "hand off", "give X the job", "have X work on" -> `delegate`.
 5. Otherwise an ask tool.
 
-A longer `timeout_s` never replaces `delegate`. When the request belongs to delegate, follow `/consult:delegate`'s steps (the `delegate` tool) and stop reading here.
+opencode (free cloud models) is a delegate worker only; there is no ask tool for it. A longer `timeout_s` never replaces `delegate`. When the request belongs to delegate, follow `/consult:delegate`'s steps (the `delegate` tool) and stop reading here.
 
 ## Decide which tool to call
 

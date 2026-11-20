@@ -17,8 +17,9 @@ import { isLoopback, validateBaseUrl } from './local.js';
 import { parseWorkerWord } from './delegate-route.js';
 import { taskFolder, taskFence, narrowerFence, projectSettings, fenceProtectedPaths, holdsConsultFiles } from './delegate-store.js';
 import { realPathOfTarget, isInside } from './pi-fence.js';
-import { rateLimitsFromTail } from './delegate-limits.js';
+import { rateLimitsFromTail, hitKindOf } from './delegate-limits.js';
 import { SANDBOX_ENV_POLICY_ARGS } from './delegate-fence.js';
+import { findOpencodeBinary, opencodeEnvironment } from './opencode-models.js';
 
 export { lastRateLimitsIn } from './delegate-limits.js';
 
@@ -270,11 +271,54 @@ function localCommand({ task, nickname, workFolder, taskDir, isWrite, resume, pr
   return command;
 }
 
+// opencode's session ids: `ses_` and letters or digits (measured on 2.3.2).
+const OPENCODE_SESSION_RE = /^ses_[A-Za-z0-9]+$/;
+
+// The opencode command. Its environment is built here, not inherited
+// (inheritEnvironment: false): an allow-list, the key of an OpenRouter model,
+// and consult's own settings. `workerTemp` is workerTempFolders('opencode', id).
+function opencodeCommand({ task, workFolder, isWrite, resume, promptText, fence, model, workerTemp, binary, codexPath }) {
+  if (binary.unavailable !== undefined) throw new Error(binary.unavailable);
+  if (typeof model !== 'string' || model === '') throw new Error('An opencode task needs a model (the run\'s model, from the free list).');
+  requireModelId(model);
+  const fenced = fence === 'fenced';
+  if (fenced && !codexPath) throw new Error("opencode's fence needs Codex's sandbox: no Codex was given to run it.");
+
+  const args = ['run', '--standalone', '--format', 'json', '--archived'];
+  if (isWrite) args.push('--auto');
+  args.push('-m', model);
+  if (resume) {
+    if (!OPENCODE_SESSION_RE.test(task.worker_session ?? '')) throw new Error(`Session id ${JSON.stringify(task.worker_session)} is not an opencode session id (ses_…).`);
+    args.push('--session', task.worker_session);
+  }
+
+  // Only the model's own provider is enabled: a different one never loads its key or models.
+  const config = { mcp: {}, plugin: [], enabled_providers: [model.split('/')[0]] };
+  if (!isWrite) config.permission = { edit: 'deny', bash: 'deny' };
+
+  const env = opencodeEnvironment({
+    workFolder, workerTemp, config,
+    openrouterKey: model.startsWith('openrouter/') ? process.env.OPENROUTER_API_KEY : undefined
+  });
+
+  const command = {
+    cmd: binary.path, args, env, inheritEnvironment: false, stdinText: promptText, briefFile: null, files: [],
+    fenceLayer: fenced ? 'sandbox' : null, fenceReason: null, cwd: workFolder, fenced, model, warning: null
+  };
+  if (fenced) {
+    command.wrapper = {
+      program: codexPath,
+      args: ['sandbox', '-c', 'sandbox_mode=workspace-write', ...SANDBOX_ENV_POLICY_ARGS, '-c', 'sandbox_workspace_write.network_access=true', '--']
+    };
+  }
+  return command;
+}
+
 // `task` is a task record (delegate-store.js). The work folder is its
 // worktree, or the project itself for a task that works in place. `brief`
 // defaults to the task's brief.md. A resume continues the worker's session
 // (worker_session, or pi_session for a local task) with `followUp`.
-export function workerCommand(task, { settings, runner = null, inventory = null, resume = false, followUp = null, brief = null, piLayer = null, fence: givenFence = null }) {
+export function workerCommand(task, { settings, runner = null, inventory = null, resume = false, followUp = null, brief = null, piLayer = null, fence: givenFence = null, model: runModel = null, workerTemp = null, opencodeBinary = null, codexPath = null }) {
   const word = parseWorkerWord(task.worker);
   if (word.worker === null) throw new Error(`Unknown delegate worker ${JSON.stringify(task.worker)}.`);
   const workFolder = task.worktree ?? task.project;
@@ -288,6 +332,7 @@ export function workerCommand(task, { settings, runner = null, inventory = null,
   // Which mechanism holds the fence: agy's trusted-workspace settings. (Codex and local layers come with their own tasks.)
   if (word.worker === 'local' && fenced && piLayer === null) throw new Error('A fenced local task needs piLayer (the sandbox or the guard, with its temp folders).');
   let fenceLayer = null;
+  if (word.worker === 'opencode' && fenced) fenceLayer = 'sandbox';
   if (word.worker === 'agy' && fenced) fenceLayer = 'agy';
   if (word.worker === 'local' && fenced) fenceLayer = piLayer.kind;
   let promptText;
@@ -300,6 +345,9 @@ export function workerCommand(task, { settings, runner = null, inventory = null,
 
   if (word.worker === 'local') {
     return localCommand({ task, nickname: word.nickname, workFolder, taskDir, isWrite, resume, promptText, settings, runner, inventory, fenced, fenceLayer, piLayer });
+  }
+  if (word.worker === 'opencode') {
+    return opencodeCommand({ task, workFolder, isWrite, resume, promptText, fence, model: runModel, workerTemp, binary: opencodeBinary ?? findOpencodeBinary(), codexPath });
   }
   let cmd;
   let args;
@@ -412,6 +460,13 @@ function writeWasDenied(events, stderr) {
   return false;
 }
 
+// Adds `target` (a non-empty path, relative ones resolved against the work folder) once.
+function addTarget(targets, workFolder, target) {
+  if (typeof target !== 'string' || target === '') return;
+  const resolvedTarget = path.resolve(workFolder, target);
+  if (!targets.includes(resolvedTarget)) targets.push(resolvedTarget);
+}
+
 // The files agy's own write_file and edit_file steps name, once each, in order, in
 // full (a relative path is resolved against the work folder). agy 1.5.11 reports
 // a new file as write_file and an edit as edit_file, each with an absolute Path,
@@ -428,8 +483,7 @@ function writeStepTargets(events, workFolder) {
     if (parameters === null || typeof parameters !== 'object') continue;
     const key = ['Path', 'TargetFile', 'AbsolutePath'].find((name) => typeof parameters[name] === 'string' && parameters[name] !== '');
     if (key === undefined) continue;
-    const resolvedTarget = path.resolve(workFolder, parameters[key]);
-    if (!targets.includes(resolvedTarget)) targets.push(resolvedTarget);
+    addTarget(targets, workFolder, parameters[key]);
   }
   return targets;
 }
@@ -441,21 +495,35 @@ function piWriteTargets(events, workFolder) {
   const targets = [];
   for (const event of events) {
     if (event?.type !== 'tool_execution_start' || !PI_WRITE_TOOLS.includes(event.toolName)) continue;
-    const target = event.args?.path;
-    if (typeof target !== 'string' || target === '') continue;
-    const resolvedTarget = path.resolve(workFolder, target);
-    if (!targets.includes(resolvedTarget)) targets.push(resolvedTarget);
+    addTarget(targets, workFolder, event.args?.path);
   }
   return targets;
 }
 
 const PI_WRITE_TOOLS = ['write', 'edit'];
 
+// opencode's tool_use events carry the file in input.path (write, edit, read) or
+// input.filePath (patch); edit's other fields are oldString and newString
+// (fixtures/delegate/opencode-write.jsonl). Shell commands name no file.
+const OPENCODE_WRITE_TOOLS = ['write', 'edit', 'patch'];
+
+function opencodeWriteTargets(events, workFolder) {
+  const targets = [];
+  for (const event of events) {
+    if (event?.type !== 'tool_use' || !OPENCODE_WRITE_TOOLS.includes(event.part?.tool)) continue;
+    const input = event.part.state?.input;
+    addTarget(targets, workFolder, input?.path);
+    addTarget(targets, workFolder, input?.filePath);
+  }
+  return targets;
+}
+
 // The files a worker's own steps wrote or edited in a run, from its stdout lines. Codex
 // writes only through shell commands and reports no file changes, so none are attributable.
 export function workerWriteTargets(worker, lines, workFolder) {
   if (worker === 'agy') return writeStepTargets(parseJsonLines(lines), workFolder);
   if (worker === 'local') return piWriteTargets(parseJsonLines(lines), workFolder);
+  if (worker === 'opencode') return opencodeWriteTargets(parseJsonLines(lines), workFolder);
   return [];
 }
 
@@ -579,6 +647,34 @@ function parsePiStream(events) {
   return result;
 }
 
+// opencode ends a run with step_finish (reason "stop"); a failed run ends with one
+// error event instead. Only the rate-limit error (provider.rate-limit or status 429)
+// is a limit; `model` (the stream does not name it) goes into the hit, and
+// `now` dates its reset from retryAfterMs, held at least as long as any throttled hit: retryAfterMs is
+// opencode's own last back-off (1 s in a recorded stream), not when the provider lets the model run again.
+function parseOpencodeStream(events, { model = null, now = Date.now() } = {}) {
+  const result = { finalMessage: null, session: null, limit: null, limitHit: null, error: null, denied: [], complete: false, refusedPaths: [], warning: null };
+  let lastError = null;
+  let textParts = [];
+  for (const event of events) {
+    if (result.session === null && typeof event.sessionID === 'string') result.session = event.sessionID;
+    if (event.type === 'step_start') textParts = [];
+    if (event.type === 'text' && typeof event.part?.text === 'string') textParts.push(event.part.text);
+    if (event.type === 'error' && event.error && typeof event.error === 'object') lastError = event.error;
+  }
+  if (textParts.length > 0) result.finalMessage = textParts.join('');
+  const lastEvent = events.at(-1);
+  result.complete = lastEvent?.type === 'step_finish' && lastEvent.part?.reason === 'stop';
+  if (lastError === null) return result;
+  if (lastError.type === 'provider.rate-limit' || lastError.status === 429) {
+    const retryAfterMs = typeof lastError.retryAfterMs === 'number' ? lastError.retryAfterMs : null;
+    result.limitHit = { kind: 'throttled', resets_at: retryAfterMs === null ? null : now + Math.max(retryAfterMs, hitKindOf('throttled').holdUnknownResetMs), model };
+    return result;
+  }
+  result.error = typeof lastError.message === 'string' ? lastError.message : 'opencode stopped with an error';
+  return result;
+}
+
 // `lines` are the worker's stdout lines (an array, or the text). Unknown events
 // are skipped. `stderr` matters for agy only (its quota error is a stderr line).
 // Returns { finalMessage, session, limit, limitHit, error, denied, complete }, and for
@@ -588,11 +684,12 @@ function parsePiStream(events) {
 // is true only when the worker's terminal event was seen (codex: turn.completed
 // or turn.failed; agy: the result line; pi: agent_settled, or a last agent_end
 // that will not retry), so a stream cut short reads as incomplete.
-export function parseWorkerStream(worker, lines, { stderr = '', workFolder = null } = {}) {
+export function parseWorkerStream(worker, lines, { stderr = '', workFolder = null, model = null, now = Date.now() } = {}) {
   const events = parseJsonLines(lines);
   if (worker === 'codex') return parseCodexStream(events);
   if (worker === 'agy') return parseAgyStream(events, { stderr, workFolder });
   if (worker === 'local') return parsePiStream(events);
+  if (worker === 'opencode') return parseOpencodeStream(events, { model, now });
   throw new Error(`Unknown delegate worker ${JSON.stringify(worker)}.`);
 }
 
@@ -625,6 +722,10 @@ export function noteStepEvent(worker, line, openSteps) {
     if (event.type === 'tool_execution_start') openSteps.add(event.toolCallId);
     if (event.type === 'tool_execution_end') openSteps.delete(event.toolCallId);
   }
+  // opencode: no step is ever open. Its events are only activity (every stdout line
+  // resets the watchdog), so a provider call that stalls after step_start is still caught.
+  // A shell or build call that prints nothing for the whole watchdog period (tool_use
+  // arrives only when it has finished) is stopped too: the stream cannot tell it from a hang.
 }
 
 // ---- codex limits ----

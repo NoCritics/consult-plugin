@@ -187,14 +187,14 @@ export function parseLocalAtOnce(text: string): 'auto' | number | null {
   return null
 }
 
-export const FENCE_WORKERS = ['codex', 'agy', 'local'] as const
+export const FENCE_WORKERS = ['codex', 'agy', 'local', 'opencode'] as const
 export type FenceWorker = (typeof FENCE_WORKERS)[number]
 
 // The fences of a shown settings object. A `shown` kept from before 0.16.0 (the
 // atom survives a plugin update in a live session) has none: it reads as the
 // default, every worker fenced. A 'soft' kept from 0.16.0 reads as fenced too.
 export function fencesOf(settings: { fence?: Record<FenceWorker, string> }): Record<FenceWorker, string> {
-  const fences: Record<FenceWorker, string> = { codex: 'fenced', agy: 'fenced', local: 'fenced' }
+  const fences: Record<FenceWorker, string> = { codex: 'fenced', agy: 'fenced', local: 'fenced', opencode: 'fenced' }
   if (settings.fence === undefined) return fences
   for (const worker of FENCE_WORKERS) {
     fences[worker] = settings.fence[worker] === 'soft' ? 'fenced' : settings.fence[worker]
@@ -206,23 +206,27 @@ export function fencesOf(settings: { fence?: Record<FenceWorker, string> }): Rec
 export function fenceHint(worker: FenceWorker, localFenceCheck: 'sandbox' | 'guard' | 'unchecked' | undefined): string {
   if (worker === 'codex') return "enforced by Codex's sandbox"
   if (worker === 'agy') return 'enforced by agy (trusted folder: this project only)'
+  if (worker === 'opencode') return 'fenced (files); network open: it can read any file you can and send it out'
   if (localFenceCheck === 'sandbox') return "enforced by Codex's sandbox"
   if (localFenceCheck === 'guard') return 'checked by consult: file edits only, commands not'
   return 'checked on the next task'
 }
 
+const FENCE_FIELDS = { codex: 'fence_codex', agy: 'fence_agy', local: 'fence_local', opencode: 'fence_opencode' } as const
+
 // The fence the fold holds for a worker: the edit, or the shown value.
 export function fenceChosen(view: DelegatedView, worker: FenceWorker): string {
   const shownValue: string = view.shown === null ? '' : fencesOf(view.shown.settings)[worker]
   const edits = view.edits
-  const edited = worker === 'codex' ? edits.fence_codex : worker === 'agy' ? edits.fence_agy : edits.fence_local
-  return edited ?? shownValue
+  return edits[FENCE_FIELDS[worker]] ?? shownValue
 }
 
 const CODEX_LIFT_WARNING =
   "Full access: Codex can read, change or delete any file you can, and run any command, without asking. Changes outside the project don't go through the copy and can't be undone."
 const AGY_LIFT_WARNING =
   "Anywhere: agy may change files in every folder your agy settings trust (today: your home folder), without asking. Changes outside the project don't go through the copy and can't be undone."
+const OPENCODE_LIFT_WARNING =
+  "Anywhere: opencode is not fenced: it runs without the sandbox and can change any file you can, without asking. Changes outside the project don't go through the copy and can't be undone."
 const LOCAL_LIFT_WARNING =
   "Anywhere: the local model may change or delete any file you can and run any command, without asking. Changes outside the project don't go through the copy and can't be undone."
 
@@ -239,13 +243,14 @@ function fenceChangesOf(view: DelegatedView): Record<string, string> {
 
 // What to warn about before Save: a fence edited to a lifted value (full / none).
 // An edit put back to the shown value is no change and warns of nothing. Codex's
-// sentence, then agy's, then Local's; null when no lift is waiting.
+// sentence, then agy's, Local's and opencode's; null when no lift is waiting.
 export function liftWarning(view: DelegatedView): string | null {
   const changed = fenceChangesOf(view)
   const warnings: string[] = []
   if (changed.codex === 'full') warnings.push(CODEX_LIFT_WARNING)
   if (changed.agy === 'none') warnings.push(AGY_LIFT_WARNING)
   if (changed.local === 'none') warnings.push(LOCAL_LIFT_WARNING)
+  if (changed.opencode === 'none') warnings.push(OPENCODE_LIFT_WARNING)
   return warnings.length === 0 ? null : warnings.join('\n')
 }
 

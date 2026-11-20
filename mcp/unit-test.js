@@ -27,6 +27,8 @@ import { buildClaudeArgs, CLAUDE_COMMON_ARGS } from './lib/claude.js';
 import { shellSafeArgs, runCli, cliSpawnOptions, killTree, killAllCliChildren, liveCliChildCount, spawnableCmdOrError } from './lib/spawn-cli.js';
 import { callContext } from './lib/util.js';
 import { SPAWN_OPTS, EMPTY_ARG, ensureCmd, isInsideFolder, pickWindowsHit, spawnableCmd, whereCommand, refusedWindowsHits, missingMessage } from './lib/resolve-cmd.js';
+import { dataHome } from './lib/delegate-store.js';
+import { findOpencodeBinary, readFreeModels, chooseModels, resetFreeModelsCache, defaultCatalogFolder, opencodeEnvironment } from './lib/opencode-models.js';
 import { codexTimeoutMs, CODEX_TIMEOUT_FLOOR_MS, hookArgs, codexRunHooks, parseCodexJsonl, codexTimeoutError, configuredCodex, rolloutTurn, codexDefaultLabel } from './lib/codex.js';
 import { incompleteError, PARTIAL_CAP_CHARS, timeoutMsFromSeconds, timeoutRetryHint } from './lib/util.js';
 import { parseAgyResult, agyFailure, conversationIdFrom, agyImageOutputDir, findGeneratedImages, copyImagesTo, retargetPaths, agySubagentIds, finishImageCall, saveConversationImages, finishConversation, hostAppDirs, AGY_IMAGE_PREAMBLE } from './lib/agy.js';
@@ -2673,7 +2675,7 @@ if (SPAWN_OPTS.shell) {
 // --- fence helpers: pi temp folders, the Codex sandbox check, the pi guard ---
 {
   const fenceHelpers = await import('./lib/delegate-fence.js');
-  const { stagePiSessions, returnPiSessions, removePiTemp, piTempFolders, piLauncherFor, sandboxCheck, readSandboxCheck, readCachedSandboxCheck, spawnPlanFor, readCodexVersion } = fenceHelpers;
+  const { hasLeftoverSessions, stageSessions, returnSessions, removeWorkerTemp, workerTempFolders, piLauncherFor, sandboxCheck, readSandboxCheck, readCachedSandboxCheck, spawnPlanFor, readCodexVersion } = fenceHelpers;
   const { default: piFenceExtension } = await import('./lib/pi-fence.js');
   const fenceScratch = fs.mkdtempSync(path.join(os.tmpdir(), 'consult-fence-test-'));
   const previousCheckFile = process.env.CONSULT_SANDBOX_CHECK_FILE;
@@ -2681,65 +2683,86 @@ if (SPAWN_OPTS.shell) {
   process.env.CONSULT_SANDBOX_CHECK_FILE = path.join(fenceScratch, 'check.json');
   const previousPiTempRoot = process.env.CONSULT_PI_TEMP_ROOT;
   process.env.CONSULT_PI_TEMP_ROOT = path.join(fenceScratch, 'consult-pi');
+  const previousOpencodeTempRoot = process.env.CONSULT_OPENCODE_TEMP_ROOT;
+  process.env.CONSULT_OPENCODE_TEMP_ROOT = path.join(fenceScratch, 'consult-opencode');
   const fenceTaskId = (process.pid % 0xffffff).toString(16).padStart(6, '0');
   try {
     const taskDirWithSessions = path.join(fenceScratch, 'task');
     fs.mkdirSync(path.join(taskDirWithSessions, 'pi-sessions'), { recursive: true });
     fs.writeFileSync(path.join(taskDirWithSessions, 'pi-sessions', 'a.jsonl'), 'a');
-    const staged = stagePiSessions(taskDirWithSessions, fenceTaskId);
+    const staged = stageSessions('local', taskDirWithSessions, fenceTaskId);
     eq('stage: copies sessions in', fs.readdirSync(staged.sessions), ['a.jsonl']);
     eq('stage: folders are under consult-pi/<id>', staged.root, path.join(fenceScratch, 'consult-pi', fenceTaskId));
     eq('stage: agent and tmp exist', [fs.existsSync(staged.agent), fs.existsSync(staged.tmp)], [true, true]);
     fs.writeFileSync(path.join(staged.agent, 'auth.json'), '{}');
     fs.writeFileSync(path.join(staged.sessions, 'stale.jsonl'), 'x');
-    const restaged = stagePiSessions(taskDirWithSessions, fenceTaskId);
+    const restaged = stageSessions('local', taskDirWithSessions, fenceTaskId);
     eq('stage: a stale temp copy never survives', fs.readdirSync(restaged.sessions), ['a.jsonl']);
     eq('stage: agent is kept', fs.existsSync(path.join(restaged.agent, 'auth.json')), true);
     fs.writeFileSync(path.join(restaged.sessions, 'b.jsonl'), 'y');
-    returnPiSessions(taskDirWithSessions, fenceTaskId);
+    returnSessions('local', taskDirWithSessions, fenceTaskId);
     eq('return: copies back', fs.readdirSync(path.join(taskDirWithSessions, 'pi-sessions')).sort(), ['a.jsonl', 'b.jsonl']);
-    removePiTemp(fenceTaskId);
-    eq('removePiTemp: removes the folder', fs.existsSync(piTempFolders(fenceTaskId).root), false);
-    eq('removePiTemp: a missing folder does not throw', (() => { removePiTemp(fenceTaskId); return true; })(), true);
-    eq('return: with nothing staged does not throw and keeps the authority', (() => { returnPiSessions(taskDirWithSessions, fenceTaskId); return fs.readdirSync(path.join(taskDirWithSessions, 'pi-sessions')).length; })(), 2);
+    removeWorkerTemp('local', fenceTaskId);
+    eq('removeWorkerTemp: removes the folder', fs.existsSync(workerTempFolders('local', fenceTaskId).root), false);
+    eq('removeWorkerTemp: a missing folder does not throw', (() => { removeWorkerTemp('local', fenceTaskId); return true; })(), true);
+    eq('return: with nothing staged does not throw and keeps the authority', (() => { returnSessions('local', taskDirWithSessions, fenceTaskId); return fs.readdirSync(path.join(taskDirWithSessions, 'pi-sessions')).length; })(), 2);
     // F5: the swap never leaves a moment with no pi-sessions, and a crash inside it is recoverable.
     eq('return: no .old or .incoming is left behind', fs.readdirSync(taskDirWithSessions).sort(), ['pi-sessions']);
     const crashedTask = path.join(fenceScratch, 'crashed task');
     fs.mkdirSync(path.join(crashedTask, 'pi-sessions.old'), { recursive: true });
     fs.writeFileSync(path.join(crashedTask, 'pi-sessions.old', 'kept.jsonl'), 'k');
-    eq('stage: with pi-sessions missing, pi-sessions.old is the authority', fs.readdirSync(stagePiSessions(crashedTask, fenceTaskId).sessions), ['kept.jsonl']);
-    returnPiSessions(crashedTask, fenceTaskId);
+    eq('stage: with pi-sessions missing, pi-sessions.old is the authority', fs.readdirSync(stageSessions('local', crashedTask, fenceTaskId).sessions), ['kept.jsonl']);
+    returnSessions('local', crashedTask, fenceTaskId);
     eq('return: after a crash it restores pi-sessions and clears .old', [fs.readdirSync(path.join(crashedTask, 'pi-sessions')), fs.existsSync(path.join(crashedTask, 'pi-sessions.old'))], [['kept.jsonl'], false]);
     // Non-ASCII folders and nested session folders go both ways (Node 22's cpSync ended the process on Windows here).
     const cyrillicTask = path.join(fenceScratch, 'задача Имя task');
     fs.mkdirSync(path.join(cyrillicTask, 'pi-sessions', 'папка'), { recursive: true });
     fs.writeFileSync(path.join(cyrillicTask, 'pi-sessions', 'папка', 'сессия.jsonl'), 'nested');
-    const cyrillicStaged = stagePiSessions(cyrillicTask, fenceTaskId);
+    const cyrillicStaged = stageSessions('local', cyrillicTask, fenceTaskId);
     eq('stage: a non-ASCII nested session is copied in', fs.readFileSync(path.join(cyrillicStaged.sessions, 'папка', 'сессия.jsonl'), 'utf8'), 'nested');
     fs.writeFileSync(path.join(cyrillicStaged.sessions, 'папка', 'новая.jsonl'), 'new');
-    returnPiSessions(cyrillicTask, fenceTaskId);
+    returnSessions('local', cyrillicTask, fenceTaskId);
     eq('return: a non-ASCII nested session is copied back', fs.readdirSync(path.join(cyrillicTask, 'pi-sessions', 'папка')).sort(), ['новая.jsonl', 'сессия.jsonl']);
     // A temp sessions folder swapped for a junction (pi can write its temp root) is not followed, and a
     // junction inside it is skipped: the authority keeps what it had.
     const elsewhere = path.join(fenceScratch, 'elsewhere');
     fs.mkdirSync(elsewhere, { recursive: true });
     fs.writeFileSync(path.join(elsewhere, 'secret.txt'), 'not a session');
-    const linkedStaged = stagePiSessions(cyrillicTask, fenceTaskId);
+    const linkedStaged = stageSessions('local', cyrillicTask, fenceTaskId);
     fs.symlinkSync(elsewhere, path.join(linkedStaged.sessions, 'inner link'), 'junction');
-    returnPiSessions(cyrillicTask, fenceTaskId);
+    returnSessions('local', cyrillicTask, fenceTaskId);
     eq('return: a junction inside the sessions is skipped', fs.readdirSync(path.join(cyrillicTask, 'pi-sessions')).sort(), ['папка']);
     fs.rmSync(linkedStaged.sessions, { recursive: true, force: true });
     fs.symlinkSync(elsewhere, linkedStaged.sessions, 'junction');
-    const linkedReturn = returnPiSessions(cyrillicTask, fenceTaskId);
+    const linkedReturn = returnSessions('local', cyrillicTask, fenceTaskId);
     eq('return: a sessions folder that is a junction is refused, with a message', typeof linkedReturn === 'string' && linkedReturn.includes('not a folder'), true);
     eq('return: and the authority keeps what it had', fs.readdirSync(path.join(cyrillicTask, 'pi-sessions')).sort(), ['папка']);
     fs.unlinkSync(linkedStaged.sessions);
     // F6: only a real task id becomes a path.
     for (const badId of ['..', '..\\x', 'ABCDEF', 'abc', 'a/b', '', undefined]) {
-      throws('piTempFolders: ' + JSON.stringify(badId) + ' is refused', () => piTempFolders(badId));
-      eq('removePiTemp: ' + JSON.stringify(badId) + ' is a no-op', (() => { removePiTemp(badId); return true; })(), true);
+      throws('workerTempFolders: ' + JSON.stringify(badId) + ' is refused', () => workerTempFolders('local', badId));
+      eq('removeWorkerTemp: ' + JSON.stringify(badId) + ' is a no-op', (() => { removeWorkerTemp('local', badId); return true; })(), true);
     }
-    removePiTemp(fenceTaskId);
+    removeWorkerTemp('local', fenceTaskId);
+
+    // Opencode: its `data` folder is the one copied back, to <taskDir>/opencode-data.
+    const opencodeTaskDir = path.join(fenceScratch, 'opencode-task');
+    fs.mkdirSync(opencodeTaskDir, { recursive: true });
+    eq('opencode: no leftover before a run', hasLeftoverSessions('opencode', fenceTaskId), false);
+    const opencodeStaged = stageSessions('opencode', opencodeTaskDir, fenceTaskId);
+    eq('opencode: temp folders are the data, cache, state, config and tmp ones', Object.keys(opencodeStaged), ['root', 'data', 'cache', 'state', 'config', 'tmp']);
+    eq('opencode: the root is under CONSULT_OPENCODE_TEMP_ROOT', opencodeStaged.root, path.join(fenceScratch, 'consult-opencode', fenceTaskId));
+    fs.mkdirSync(path.join(opencodeStaged.data, 'opencode'), { recursive: true });
+    fs.writeFileSync(path.join(opencodeStaged.data, 'opencode', 'opencode.db'), 'db');
+    for (const name of ['cache', 'state', 'config', 'tmp']) fs.writeFileSync(path.join(opencodeStaged[name], 'x.txt'), name);
+    eq('opencode: written data is a leftover', hasLeftoverSessions('opencode', fenceTaskId), true);
+    eq('opencode: return succeeds', returnSessions('opencode', opencodeTaskDir, fenceTaskId), null);
+    eq('opencode: the database is back in the task folder', fs.readFileSync(path.join(opencodeTaskDir, 'opencode-data', 'opencode', 'opencode.db'), 'utf8'), 'db');
+    eq('opencode: only opencode-data is copied back', fs.readdirSync(opencodeTaskDir), ['opencode-data']);
+    eq('opencode: a restage brings the data back and keeps cache', [fs.readdirSync(path.join(stageSessions('opencode', opencodeTaskDir, fenceTaskId).data, 'opencode')), fs.existsSync(path.join(opencodeStaged.cache, 'x.txt'))], [['opencode.db'], true]);
+    removeWorkerTemp('opencode', fenceTaskId);
+    eq('opencode: removeWorkerTemp removes its folder', fs.existsSync(opencodeStaged.root), false);
+    throws('workerTempFolders: an unknown worker is refused', () => workerTempFolders('codex', fenceTaskId));
 
     // F10: a codex.cmd is started the way spawn-cli.js does, so it works under cmd.exe.
     const cmdPath = 'C:/Users/Jane Doe/npm/codex.cmd';
@@ -2918,6 +2941,48 @@ if (SPAWN_OPTS.shell) {
     eq('check: internet reached is a cached failure', [(await sandboxCheck({ codexPath: 'C:\\h\\codex.exe', run: fakeRun('codex-cli 0.167.0', internetReached) })).failed, readSandboxCheck('C:\\h\\codex.exe', 'codex-cli 0.167.0')], ['internetRefused', { ok: false, failed: 'internetRefused' }]);
     const childNotRefused = JSON.stringify({ cwdWritable: true, homeRefused: true, internetRefused: true, loopbackOpen: true, childHomeRefused: false });
     eq('check: a child that is not refused is a cached failure', (await sandboxCheck({ codexPath: 'C:\\i\\codex.exe', run: fakeRun('codex-cli 0.167.0', childNotRefused) })).failed, 'childHomeRefused');
+    // The network-on check: the probe runs with network_access on, and only the three file checks decide.
+    {
+      const networkOnLine = JSON.stringify({ cwdWritable: true, homeRefused: true, internetRefused: false, loopbackOpen: true, childHomeRefused: true });
+      const networkOnHomeOpen = JSON.stringify({ cwdWritable: true, homeRefused: false, internetRefused: false, loopbackOpen: true, childHomeRefused: true });
+      const networkArgs = [];
+      const recordingRun = async (command, args) => {
+        if (args.includes('--version')) return { code: 0, stdout: 'codex-cli 0.167.0\n', stderr: '', timedOut: false };
+        networkArgs.push(args);
+        return { code: 0, stdout: networkOnLine + '\n', stderr: '', timedOut: false };
+      };
+      const networkOn = await sandboxCheck({ codexPath: 'C:\net\codex.exe', run: recordingRun, network: true });
+      const joined = networkArgs[0].join(' ');
+      eq('check network: the probe is started with network access on', joined.includes('-c sandbox_workspace_write.network_access=true'), true);
+      eq('check network: internet reached is a pass', networkOn, { ok: true, failed: null, cached: false });
+      eq('check network: a home that is not refused fails', (await sandboxCheck({ codexPath: 'C:\net2\codex.exe', run: fakeRun('codex-cli 0.167.0', networkOnHomeOpen), network: true })).failed, 'homeRefused');
+      eq('check network: off still fails on the internet reached', (await sandboxCheck({ codexPath: 'C:\net3\codex.exe', run: fakeRun('codex-cli 0.167.0', networkOnLine), network: false })).failed, 'internetRefused');
+      const offArgs = [];
+      await sandboxCheck({ codexPath: 'C:\net4\codex.exe', run: async (command, args) => {
+        if (args.includes('--version')) return { code: 0, stdout: 'codex-cli 0.167.0\n', stderr: '', timedOut: false };
+        offArgs.push(args);
+        return { code: 0, stdout: allTrue + '\n', stderr: '', timedOut: false };
+      } });
+      eq('check network: the default probe has no network flag', offArgs[0].join(' ').includes('network_access'), false);
+      // The two verdicts do not answer each other.
+      const offCounter = { runs: 0 };
+      await sandboxCheck({ codexPath: 'C:\net5\codex.exe', run: fakeRun('codex-cli 0.167.0', allTrue, offCounter) });
+      const onAfterOff = await sandboxCheck({ codexPath: 'C:\net5\codex.exe', run: fakeRun('codex-cli 0.167.0', networkOnLine, offCounter), network: true });
+      eq('check network: a cached network-off pass does not answer a network-on check', [onAfterOff.cached, offCounter.runs], [false, 2]);
+      eq('check network: the network-on verdict is then cached', (await sandboxCheck({ codexPath: 'C:\net5\codex.exe', run: fakeRun('codex-cli 0.167.0', networkOnLine, offCounter), network: true })).cached, true);
+      eq('check network: and the network-off verdict is still its own', (await sandboxCheck({ codexPath: 'C:\net5\codex.exe', run: fakeRun('codex-cli 0.167.0', allTrue, offCounter) })).cached, true);
+      eq('check network: readSandboxCheck reads each mode under its own key', [
+        readSandboxCheck('C:\net5\codex.exe', 'codex-cli 0.167.0', Date.now, true),
+        readSandboxCheck('C:\net4\codex.exe', 'codex-cli 0.167.0', Date.now, true)
+      ], [{ ok: true, failed: null }, null]);
+      // readCachedSandboxCheck keeps the two apart too.
+      const readerSpy = { read: async () => 'codex-cli 0.167.0' };
+      eq('check network: readCachedSandboxCheck answers per mode', [
+        await readCachedSandboxCheck('C:\net5\codex.exe', { readVersion: readerSpy.read }),
+        await readCachedSandboxCheck('C:\net5\codex.exe', { readVersion: readerSpy.read, network: true }),
+        await readCachedSandboxCheck('C:\net4\codex.exe', { readVersion: readerSpy.read, network: true })
+      ], [{ ok: true, failed: null }, { ok: true, failed: null }, null]);
+    }
     const counter = { runs: 0 };
     const sharedRun = fakeRun('codex-cli 0.167.0', allTrue, counter);
     await Promise.all([
@@ -3055,8 +3120,9 @@ if (SPAWN_OPTS.shell) {
     delete process.env.CONSULT_FENCE_PROTECTED;
     if (previousCheckFile === undefined) delete process.env.CONSULT_SANDBOX_CHECK_FILE; else process.env.CONSULT_SANDBOX_CHECK_FILE = previousCheckFile;
     if (previousFenceDir === undefined) delete process.env.CONSULT_FENCE_DIR; else process.env.CONSULT_FENCE_DIR = previousFenceDir;
+    if (previousOpencodeTempRoot === undefined) delete process.env.CONSULT_OPENCODE_TEMP_ROOT; else process.env.CONSULT_OPENCODE_TEMP_ROOT = previousOpencodeTempRoot;
     if (previousPiTempRoot === undefined) delete process.env.CONSULT_PI_TEMP_ROOT; else process.env.CONSULT_PI_TEMP_ROOT = previousPiTempRoot;
-    removePiTemp(fenceTaskId);
+    removeWorkerTemp('local', fenceTaskId);
     fs.rmSync(fenceScratch, { recursive: true, force: true });
   }
 }
@@ -3087,6 +3153,154 @@ if (SPAWN_OPTS.shell) {
       if (kept[name] === undefined) delete process.env[name]; else process.env[name] = kept[name];
     }
   }
+}
+
+
+// opencode: which models are free, and which ones a run may use.
+{
+  const fixtureFolder = new URL('../tests/fixtures/opencode/', import.meta.url);
+  const fixtureStdout = fs.readFileSync(new URL('models-stdout.txt', fixtureFolder), 'utf8');
+  const catalogFolder = fs.mkdtempSync(path.join(os.tmpdir(), 'consult-oc-models-'));
+  const withCatalog = (folder) => {
+    fs.mkdirSync(path.join(folder, 'cache', 'opencode'), { recursive: true });
+    fs.copyFileSync(new URL('models.json', fixtureFolder), path.join(folder, 'cache', 'opencode', 'models.json'));
+  };
+  const fakeRun = (stdout) => async () => ({ code: 0, stdout, stderr: '' });
+  const noFetch = async () => { throw new Error('no network in this test'); };
+  try {
+    withCatalog(catalogFolder);
+    resetFreeModelsCache();
+    const read = await readFreeModels({ binary: 'opencode', cacheFolder: catalogFolder, run: fakeRun(fixtureStdout), fetchText: noFetch });
+    eq('readFreeModels: free means listed and priced at zero (big-pickle has no -free suffix; paid, unpriced and unlisted are out)', read, { ok: true, free: ['opencode/big-pickle', 'openrouter/google/gemma-4-31b-it:free'] });
+
+    const emptyFolder = fs.mkdtempSync(path.join(os.tmpdir(), 'consult-oc-models-'));
+    resetFreeModelsCache();
+    const missing = await readFreeModels({ binary: 'opencode', cacheFolder: emptyFolder, run: fakeRun(fixtureStdout), fetchText: noFetch });
+    eq('readFreeModels: no price list gives ok:false with a reason', [missing.ok, typeof missing.reason], [false, 'string']);
+
+    resetFreeModelsCache();
+    const fetched = await readFreeModels({ binary: 'opencode', cacheFolder: emptyFolder, run: fakeRun(fixtureStdout), fetchText: async () => fs.readFileSync(new URL('models.json', fixtureFolder), 'utf8') });
+    eq('readFreeModels: a missing price list is fetched and kept in the cache folder', [fetched.ok, fs.existsSync(path.join(emptyFolder, 'cache', 'opencode', 'models.json'))], [true, true]);
+    fs.rmSync(emptyFolder, { recursive: true, force: true });
+
+    resetFreeModelsCache();
+    const failed = await readFreeModels({ binary: 'opencode', cacheFolder: catalogFolder, run: async () => ({ code: 1, stdout: '', stderr: 'boom' }), fetchText: noFetch });
+    eq('readFreeModels: a failing opencode models gives ok:false', failed.ok, false);
+
+    resetFreeModelsCache();
+    let runs = 0;
+    const counting = async () => { runs += 1; return { code: 0, stdout: fixtureStdout, stderr: '' }; };
+    await readFreeModels({ binary: 'opencode', cacheFolder: catalogFolder, run: counting, fetchText: noFetch });
+    await readFreeModels({ binary: 'opencode', cacheFolder: catalogFolder, run: counting, fetchText: noFetch });
+    eq('readFreeModels: cached for the hour', runs, 1);
+  } finally {
+    fs.rmSync(catalogFolder, { recursive: true, force: true });
+    resetFreeModelsCache();
+  }
+
+  // The listing runs opencode too: with the worker's own protections, never with our keys.
+  {
+    const listingFolder = fs.mkdtempSync(path.join(os.tmpdir(), 'consult-oc-listing-'));
+    withCatalog(listingFolder);
+    const savedNames = ['SECRET_FOR_TEST', 'OPENROUTER_API_KEY', 'OPENCODE_API_KEY', 'CODEX_HOME', 'PWD'];
+    const saved = Object.fromEntries(savedNames.map((name) => [name, process.env[name]]));
+    const restore = () => {
+      for (const [name, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    };
+    const seen = [];
+    const spy = async (asked) => { seen.push(asked); return { code: 0, stdout: fixtureStdout, stderr: '' }; };
+    try {
+      process.env.SECRET_FOR_TEST = 'hunter2';
+      process.env.OPENROUTER_API_KEY = 'router-key';
+      process.env.OPENCODE_API_KEY = 'zen-key';
+      process.env.CODEX_HOME = path.join(listingFolder, 'codex home');
+      process.env.PWD = path.join(os.tmpdir(), 'some other folder');
+      resetFreeModelsCache();
+      await readFreeModels({ binary: 'opencode', cacheFolder: listingFolder, run: spy, fetchText: noFetch });
+      const [asked] = seen;
+      const env = asked.env;
+      eq('readFreeModels env: the secrets of ours are not passed; OpenRouter gets a placeholder, not the key', [env.SECRET_FOR_TEST, env.OPENCODE_API_KEY, env.OPENROUTER_API_KEY === 'router-key', typeof env.OPENROUTER_API_KEY], [undefined, undefined, false, 'string']);
+      eq('readFreeModels env: the switches, no plugins or MCP servers',
+        [env.OPENCODE_DISABLE_PROJECT_CONFIG, env.OPENCODE_DISABLE_AUTOUPDATE, env.OPENCODE_DISABLE_CLAUDE_CODE, env.GIT_OPTIONAL_LOCKS, JSON.parse(env.OPENCODE_CONFIG_CONTENT)],
+        ['1', '1', '1', '0', { mcp: {}, plugin: [] }]);
+      eq('readFreeModels env: cwd and PWD are the catalog folder, whatever our PWD is', [asked.cwd, env.PWD], [listingFolder, listingFolder]);
+      eq('readFreeModels env: TEMP and the XDG folders sit under the catalog folder',
+        [env.TEMP, env.TMP, env.XDG_DATA_HOME, env.XDG_CACHE_HOME, env.XDG_STATE_HOME, env.XDG_CONFIG_HOME],
+        [listingFolder, listingFolder, ...['data', 'cache', 'state', 'config'].map((name) => path.join(listingFolder, name))]);
+      eq('readFreeModels env: a system variable passes and CODEX_HOME with it', [Object.keys(env).some((name) => name.toLowerCase() === 'path'), env.CODEX_HOME], [true, process.env.CODEX_HOME]);
+
+      delete process.env.OPENROUTER_API_KEY;
+      resetFreeModelsCache();
+      await readFreeModels({ binary: 'opencode', cacheFolder: listingFolder, run: spy, fetchText: noFetch });
+      eq('readFreeModels env: no OpenRouter key of ours, none given', seen[1].env.OPENROUTER_API_KEY, undefined);
+
+      eq('opencodeEnvironment: the key given is the key passed, and none is none',
+        [opencodeEnvironment({ workFolder: listingFolder, workerTemp: { root: 'r', data: 'd', cache: 'c', state: 's', config: 'g' }, config: {}, openrouterKey: 'k' }).OPENROUTER_API_KEY,
+          'OPENROUTER_API_KEY' in opencodeEnvironment({ workFolder: listingFolder, workerTemp: { root: 'r', data: 'd', cache: 'c', state: 's', config: 'g' }, config: {} })], ['k', false]);
+      throws('opencodeEnvironment: a missing temp folder is refused', () => opencodeEnvironment({ workFolder: listingFolder, workerTemp: { root: 'r' }, config: {} }));
+    } finally {
+      restore();
+      resetFreeModelsCache();
+      fs.rmSync(listingFolder, { recursive: true, force: true });
+    }
+  }
+
+  // A truncated price list (two supervisors racing, a write cut short) is fetched again, never trusted.
+  {
+    const brokenFolder = fs.mkdtempSync(path.join(os.tmpdir(), 'consult-oc-broken-'));
+    try {
+      withCatalog(brokenFolder);
+      const brokenFile = path.join(brokenFolder, 'cache', 'opencode', 'models.json');
+      fs.writeFileSync(brokenFile, '{"opencode": {"models": {"big-pi');
+      resetFreeModelsCache();
+      const healed = await readFreeModels({ binary: 'opencode', cacheFolder: brokenFolder, run: fakeRun(fixtureStdout), fetchText: async () => fs.readFileSync(new URL('models.json', fixtureFolder), 'utf8') });
+      eq('readFreeModels: a truncated price list is fetched again and replaced', [healed.ok, JSON.parse(fs.readFileSync(brokenFile, 'utf8')) !== null], [true, true]);
+      eq('readFreeModels: the price list is written by rename, leaving no temp file', fs.readdirSync(path.dirname(brokenFile)), ['models.json']);
+      fs.writeFileSync(brokenFile, '{"truncated');
+      resetFreeModelsCache();
+      const unfetchable = await readFreeModels({ binary: 'opencode', cacheFolder: brokenFolder, run: fakeRun(fixtureStdout), fetchText: noFetch });
+      eq('readFreeModels: a truncated price list that cannot be fetched again is a refusal with a reason, not a throw', [unfetchable.ok, typeof unfetchable.reason], [false, 'string']);
+    } finally {
+      resetFreeModelsCache();
+      fs.rmSync(brokenFolder, { recursive: true, force: true });
+    }
+  }
+
+  const freeIds = ['opencode/big-pickle', 'openrouter/google/gemma-4-31b-it:free'];
+  eq('chooseModels: explicit free model', chooseModels({ listed: freeIds, explicit: 'opencode/big-pickle', free: freeIds }), { ok: true, models: ['opencode/big-pickle'] });
+  const refused = chooseModels({ listed: ['opencode/paid-pro', ...freeIds], explicit: 'opencode/paid-pro', free: freeIds });
+  eq('chooseModels: a paid explicit model is refused and the free ones are named', [refused.ok, freeIds.every((id) => refused.reason.includes(id))], [false, true]);
+  const manyFree = Array.from({ length: 15 }, (_, index) => `opencode/free-${index}`);
+  eq('chooseModels: names at most 10 free models', chooseModels({ listed: manyFree, explicit: 'x/y', free: manyFree }).reason.split('opencode/free-').length - 1, 10);
+  eq('chooseModels: no explicit model keeps the listed order, free only', chooseModels({ listed: ['opencode/paid-pro', 'openrouter/google/gemma-4-31b-it:free', 'opencode/big-pickle'], explicit: null, free: freeIds }), { ok: true, models: ['openrouter/google/gemma-4-31b-it:free', 'opencode/big-pickle'] });
+  eq('chooseModels: nothing free is a refusal', chooseModels({ listed: ['opencode/paid-pro'], explicit: null, free: freeIds }).ok, false);
+
+  eq('findOpencodeBinary: a bare name is refused (no path under the current folder)', typeof findOpencodeBinary({ resolve: () => ({ path: 'opencode', found: true }) }).unavailable, 'string');
+  eq('findOpencodeBinary: an absolute .exe is used as is', findOpencodeBinary({ resolve: () => ({ path: path.resolve('x', 'opencode.exe'), found: true }) }), { path: path.resolve('x', 'opencode.exe') });
+
+  const staleFolder = fs.mkdtempSync(path.join(os.tmpdir(), 'consult-oc-stale-'));
+  try {
+    withCatalog(staleFolder);
+    const staleFile = path.join(staleFolder, 'cache', 'opencode', 'models.json');
+    const old = new Date(Date.now() - 25 * 60 * 60 * 1000);
+    fs.utimesSync(staleFile, old, old);
+    resetFreeModelsCache();
+    const refused = await readFreeModels({ binary: 'opencode', cacheFolder: staleFolder, run: fakeRun(fixtureStdout), fetchText: noFetch });
+    eq('readFreeModels: a stale catalog whose re-fetch fails is refused', refused.ok, false);
+    resetFreeModelsCache();
+    const refreshed = await readFreeModels({ binary: 'opencode', cacheFolder: staleFolder, run: fakeRun(fixtureStdout), fetchText: async () => fs.readFileSync(new URL('models.json', fixtureFolder), 'utf8') });
+    eq('readFreeModels: a stale catalog is re-fetched and renewed', [refreshed.ok, Date.now() - fs.statSync(staleFile).mtimeMs < 60000], [true, true]);
+  } finally {
+    fs.rmSync(staleFolder, { recursive: true, force: true });
+    resetFreeModelsCache();
+  }
+  eq("defaultCatalogFolder: under consult's data home, not the shared temp folder", defaultCatalogFolder().startsWith(dataHome()), true);
+
+  const found = findOpencodeBinary();
+  eq('findOpencodeBinary: a path or an unavailable reason', [typeof found.path === 'string' || typeof found.unavailable === 'string'], [true]);
 }
 
 // The run's own scratch check file goes with it.

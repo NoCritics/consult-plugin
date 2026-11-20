@@ -4,6 +4,16 @@ All notable changes to this plugin are documented here. Format loosely follows [
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-11-20
+
+### Added
+
+- **opencode as a background worker for free cloud models.** `delegate` (and `/consult:delegate opencode …`) can hand a task to opencode, which runs only models that opencode lists and prices at zero (Zen free models, OpenRouter `:free`). The list is `opencode.models` in the global settings file (default `opencode/deepseek-v4.1-flash-free, opencode/big-pickle`); a named `model` must be free too. Pick it in the Delegated tab's table for `code`, `research` or `review`; `private` never takes it.
+  - **Fenced by default:** it runs inside Codex's sandbox with the task's folder as its one write root and the network open, and the start reply says `fenced (files); network open: it can read any file you can and send it out`. It never runs fenced without the sandbox; lifting the fence (`none`, per project) says it can change any file you can, and a lifted read task says only opencode's own tool rules keep it from writing.
+  - **Switches on a rate limit:** the limited model is recorded and the same session continues on the next free model; each model runs at most once per run.
+  - **Its own environment:** the worker gets an allow-list of variables, its own temp, data, cache and config folders, no project config and no auto-update; your opencode folders are never read or written, and `OPENCODE_API_KEY` is never passed. The model listing consult runs first is built the same way (no plugins, MCP servers or project config, consult's own working folder, no key of yours).
+  - **The 10-minute no-output watchdog applies:** opencode reports a tool call only when it ends, so a shell or build call silent for more than 10 minutes is stopped.
+
 ## [0.17.1] - 2026-11-19
 
 ### Changed

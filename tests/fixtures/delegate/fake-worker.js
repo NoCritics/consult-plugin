@@ -23,6 +23,17 @@
 //   pi          a pi stream (session from --session-id), exits 0; it notes what was in --session-dir and writes s.jsonl there
 //   pi-hang     as pi, then hangs
 //   pi-launch-fail  prints Codex's sandbox launch failure on stderr and exits 1
+//   opencode-answer  an opencode stream on the model after -m (session from --session, else FAKE_OPENCODE_SESSION or ses_fakeopencode1);
+//               keeps a session note in XDG_DATA_HOME/opencode/opencode.db, writes FAKE_WRITE_FILE, FAKE_OTHER_FILE and
+//               deletes FAKE_DELETE_FILE as the pi scenario does, exits 0; FAKE_REFUSED_FILE is a write the sandbox
+//               refused: its write event ends in an error and nothing is written
+//   opencode-ratelimit-then-answer  a provider.rate-limit error (retryAfterMs FAKE_RETRY_AFTER_MS, default 1000) and exit 1 when
+//               the -m model is FAKE_LIMITED_MODEL; otherwise opencode-answer
+//   opencode-all-limited  the rate-limit error on every model
+//   opencode-error  an error event that is no limit, exit 1
+//   opencode-read-other-change  as opencode-answer (the folder changes come from FAKE_OTHER_FILE and FAKE_DELETE_FILE)
+//
+// FAKE_ARGS_LOG: a JSON line (arguments, start of the prompt, cwd, PWD, XDG_DATA_HOME, TEMP) is appended at every opencode start.
 //
 // FAKE_START_LOG: a line with the pid is appended to this file at every start.
 //
@@ -55,6 +66,46 @@ function hangForever() {
 
 const prompt = await readStdin();
 const args = process.argv.slice(2);
+
+// An opencode stream, shaped as opencode-read.jsonl and opencode-ratelimit.jsonl have it.
+function opencodeRun() {
+  const model = args[args.indexOf('-m') + 1];
+  const sessionId = args.includes('--session') ? args[args.indexOf('--session') + 1] : (process.env.FAKE_OPENCODE_SESSION || 'ses_fakeopencode1');
+  if (process.env.FAKE_ARGS_LOG) {
+    const folders = Object.fromEntries(['PWD', 'XDG_DATA_HOME', 'TEMP'].map((name) => [name, process.env[name] ?? null]));
+    fs.appendFileSync(process.env.FAKE_ARGS_LOG, `${JSON.stringify({ args, promptStart: prompt.slice(0, 120), cwd: process.cwd(), folders })}\n`);
+  }
+  // The session database lives in XDG_DATA_HOME; a staged copy is what a follow-up finds there.
+  const databaseFolder = path.join(process.env.XDG_DATA_HOME, 'opencode');
+  fs.mkdirSync(databaseFolder, { recursive: true });
+  fs.appendFileSync(path.join(databaseFolder, 'opencode.db'), `${sessionId} ${model}\n`);
+  const common = { sessionID: sessionId };
+  emit({ type: 'step_start', ...common, part: { type: 'step-start', messageID: 'msg_1' } });
+  const rateLimited = scenario === 'opencode-all-limited' || (scenario === 'opencode-ratelimit-then-answer' && model === process.env.FAKE_LIMITED_MODEL);
+  if (rateLimited) {
+    emit({ type: 'error', ...common, error: { type: 'provider.rate-limit', status: 429, message: 'Rate limit exceeded: free-models-per-min', retryAfterMs: Number(process.env.FAKE_RETRY_AFTER_MS || 1000) } });
+    process.exitCode = 1;
+    return;
+  }
+  if (scenario === 'opencode-error') {
+    emit({ type: 'error', ...common, error: { type: 'provider.error', status: 500, message: 'The model fell over.' } });
+    process.exitCode = 1;
+    return;
+  }
+  if (process.env.FAKE_WRITE_FILE) {
+    const target = path.resolve(process.env.FAKE_WRITE_FILE);
+    emit({ type: 'tool_use', ...common, part: { type: 'tool', tool: 'write', state: { status: 'completed', input: { path: target, content: 'changed by the fake worker\n' } } } });
+    fs.writeFileSync(target, 'changed by the fake worker\n');
+  }
+  if (process.env.FAKE_REFUSED_FILE) {
+    const refused = path.resolve(process.env.FAKE_REFUSED_FILE);
+    emit({ type: 'tool_use', ...common, part: { type: 'tool', tool: 'write', state: { status: 'error', input: { path: refused, content: 'never lands\n' }, error: `Unable to write ${refused}` } } });
+  }
+  if (process.env.FAKE_OTHER_FILE) fs.writeFileSync(process.env.FAKE_OTHER_FILE, 'changed by another session\n');
+  if (process.env.FAKE_DELETE_FILE) fs.rmSync(process.env.FAKE_DELETE_FILE);
+  emit({ type: 'text', ...common, part: { type: 'text', text: `Answer from ${model}.` } });
+  emit({ type: 'step_finish', ...common, part: { type: 'step-finish', reason: 'stop', cost: 0 } });
+}
 
 if (process.env.FAKE_START_LOG) fs.appendFileSync(process.env.FAKE_START_LOG, `${process.pid}\n`);
 
@@ -185,6 +236,8 @@ if (scenario === 'ok') {
   // A recorded agy stream, printed unchanged; agy 1.2.10+ exits 3 after an ERROR result.
   process.stdout.write(fs.readFileSync(process.env.FAKE_STREAM_FILE, 'utf8'));
   process.exitCode = Number(process.env.FAKE_EXIT_CODE || 0);
+} else if (scenario.startsWith('opencode-')) {
+  opencodeRun();
 } else if (scenario === 'pi-launch-fail') {
   process.stderr.write('windows sandbox failed: runner failed during SpawnChild\n');
   process.exitCode = 1;

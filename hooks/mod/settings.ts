@@ -70,8 +70,11 @@ export function isDelegateKey(key: string): boolean {
   return key.startsWith('delegate.')
 }
 
+// opencode's free models, in the order to try them; read from the global file only.
+const OPENCODE_MODELS_KEY = 'opencode.models'
+
 function isGlobalOnlyKey(key: string): boolean {
-  return isRunnerKey(key) || isDelegateKey(key)
+  return isRunnerKey(key) || isDelegateKey(key) || key === OPENCODE_MODELS_KEY
 }
 
 // The same warnings as frontmatterWarnings in mcp/lib/settings.js; the shared
@@ -102,7 +105,7 @@ export function frontmatterWarnings(text: string, projectScope = false): string[
     }
     seenAt.set(key, lineNumber)
     if (projectScope && isGlobalOnlyKey(key)) {
-      const kind = isRunnerKey(key) ? 'runner' : 'delegate'
+      const kind = isRunnerKey(key) ? 'runner' : isDelegateKey(key) ? 'delegate' : 'opencode'
       warnings.push(`line ${lineNumber}: ignored \`${key}\`: ${kind} settings are global-only (~/.claude/consult.local.md)`)
       continue
     }
@@ -110,6 +113,7 @@ export function frontmatterWarnings(text: string, projectScope = false): string[
       if (!DELEGATE_KEYS.includes(key)) warnings.push(`line ${lineNumber}: unknown setting \`${key}\``)
       continue
     }
+    if (key === OPENCODE_MODELS_KEY) continue
     if (key === 'local_runner') {
       runnerChosen = true
       const value = (found[2] ?? '').replace(/\s+#.*$/, '').replace(/^(['"])(.*)\1$/, '$2')

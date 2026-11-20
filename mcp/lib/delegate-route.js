@@ -2,6 +2,7 @@
 // of the request or from the kind of work, plus the default table lookup.
 
 import { NICKNAME_SPELLINGS } from './local-models.js';
+import { DELEGATE_WORKERS } from './settings.js';
 
 // Other names for a worker, for the tool description and the command file.
 export const WORKER_ALIASES = Object.freeze({
@@ -14,7 +15,6 @@ export const WORKER_ALIASES = Object.freeze({
   offline: 'local'
 });
 
-const WORKER_NAMES = ['codex', 'agy', 'local'];
 const TABLE_KINDS = ['code', 'research', 'review', 'private'];
 const LOCAL_NICKNAME_PREFIX = 'local:';
 
@@ -34,7 +34,7 @@ export function parseWorkerWord(word) {
     }
     return { worker: 'local', nickname };
   }
-  if (WORKER_NAMES.includes(lowered)) return { worker: lowered, nickname: null };
+  if (DELEGATE_WORKERS.includes(lowered)) return { worker: lowered, nickname: null };
   if (Object.hasOwn(WORKER_ALIASES, lowered)) return { worker: WORKER_ALIASES[lowered], nickname: null };
   return { worker: null, nickname: null };
 }

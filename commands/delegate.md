@@ -1,19 +1,19 @@
 ---
-description: Hand project work (fix, write, run, debug, investigate) or research over many sources to Codex, agy or a local model as a background task; also whenever the user tells one of them to delegate, even a quick question
-argument-hint: "[codex | agy | local | local:<nickname>] <the task>"
+description: Hand project work (fix, write, run, debug, investigate) or research over many sources to Codex, agy, opencode or a local model as a background task; also whenever the user tells one of them to delegate, even a quick question
+argument-hint: "[codex | agy | opencode | local | local:<nickname>] <the task>"
 allowed-tools: ["mcp__plugin_consult_consult__delegate", "mcp__plugin_consult_consult__delegate_status", "mcp__plugin_consult_consult__delegate_result", "mcp__plugin_consult_consult__delegate_wait", "mcp__plugin_consult_consult__delegate_list", "mcp__plugin_consult_consult__delegate_cancel"]
 ---
 
 # /consult:delegate
 
-Hand a task to another model (Codex, agy or a local model) that works on it in the background, much like one of your own subagents. The user chose consult by typing this command, so do not use your own subagent tool for it.
+Hand a task to another model (Codex, agy, opencode or a local model) that works on it in the background, much like one of your own subagents. The user chose consult by typing this command, so do not use your own subagent tool for it.
 
 ## Steps
 
 1. Read `$ARGUMENTS`. If it is empty, ask "What should I hand to the worker?" and stop. Do not invent a task.
 2. **Pick the worker by the first word** (any case):
-   - `codex`, `agy`, `local`, or `local:<nickname>` (`default`, `fast`, `vision`, `vision-best`, `big`, e.g. `local:fast`) is the worker, and the rest of the text is the task.
-   - A model-family word names a worker too: `gpt` or `openai` is codex, `gemini` or `argon` is agy, `qwen`, `llama` or `offline` is local.
+   - `codex`, `agy`, `opencode`, `local`, or `local:<nickname>` (`default`, `fast`, `vision`, `vision-best`, `big`, e.g. `local:fast`) is the worker, and the rest of the text is the task.
+   - A model-family word names a worker too: `gpt` or `openai` is codex, `gemini` or `argon` is agy, `qwen`, `llama` or `offline` is local. `opencode` is for free cloud models (Zen, OpenRouter free); it never takes private work, which stays local.
    - Anything else: the whole text is the task. Pass `worker: "auto"` and classify the task into `kind`: `code` (writing, building, editing), `research`, `review`, `private` (private or offline work), or `other`. The user's default table maps the kind to a worker; `other` makes `delegate` ask which worker.
 3. **Write the brief yourself.** The worker cannot see this conversation or your context, so put in: the goal, the files and folders involved (paths you know), what "done" means (tests that must pass, behaviour to check), and the constraints (things not to touch, style to match). Plain and complete; no file contents unless they are short and essential.
 4. Declare `mode`: `read` for research, review and questions (the worker changes nothing), `write` when it edits files. Give a `task_title` of a few words. Pass `model`, `effort` or `location` ("here" / "copy") only when the user said so ("Codex on high effort", "in a copy").
@@ -27,6 +27,7 @@ Hand a task to another model (Codex, agy or a local model) that works on it in t
 
 ## Notes
 
-- This command is the guaranteed route to consult's workers. Without it, `delegate` applies once the user names Codex, agy or a local model, or says "through consult", "another model" or "not Claude", and then for work, research over many sources, or an instruction to delegate (the ask-or-delegate rule in the server instructions); otherwise use your own subagent tool.
+- This command is the guaranteed route to consult's workers. Without it, `delegate` applies once the user names Codex, agy, opencode or a local model, or says "through consult", "another model" or "not Claude", and then for work, research over many sources, or an instruction to delegate (the ask-or-delegate rule in the server instructions); otherwise use your own subagent tool.
+- opencode runs free models only (the `opencode.models` list), in Codex's sandbox with the network open: it can read any file the user can and send it out, so never pick it for private work. The start reply's `fence_note` says so; pass it on in your one-line start message. A rate-limited model is swapped for the next free one on its own.
 - A local worker keeps the worker's own model calls on this machine, but it is not offline and you, who write the brief and read the result, are a cloud model. Do not call it "private" beyond that.
 - `delegate_send` sends a follow-up to a task whose run ended, in the same worker session and folder; `delegate_cancel` stops a running one; `delegate_status` and `delegate_list` show where tasks stand.

@@ -1,0 +1,18 @@
+{
+  "opencode": {
+    "id": "opencode",
+    "models": {
+      "big-pickle": { "id": "big-pickle", "cost": { "text": { "input": { "price": 0, "cache": { "read": 0, "write": 0 } }, "output": { "price": 0 } } } },
+      "paid-pro": { "id": "paid-pro", "cost": { "text": { "input": { "price": 1.5 }, "output": { "price": 6 } } } },
+      "retired-free": { "id": "retired-free", "cost": { "text": { "input": { "price": 0 }, "output": { "price": 0 } } } },
+      "no-price": { "id": "no-price" }
+    }
+  },
+  "openrouter": {
+    "id": "openrouter",
+    "models": {
+      "google/gemma-4-31b-it:free": { "id": "google/gemma-4-31b-it:free", "cost": { "input": 0, "output": 0 } },
+      "google/gemma-4-31b-it": { "id": "google/gemma-4-31b-it", "cost": { "input": 0.1, "output": 0.3 } }
+    }
+  }
+}

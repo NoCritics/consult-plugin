@@ -105,6 +105,9 @@ export type DelegateTaskRow = {
   id: string
   worker: string
   model: string | null
+  // opencode: the model its last run used, and "<from> → <to>: rate limit" for each switch in that run
+  model_used?: string | null
+  model_switches?: string[]
   title: string
   state: string
   location: 'here' | 'copy'
@@ -143,7 +146,9 @@ export type DelegateSettingsShown = {
   workers_edit: 'auto' | 'here' | 'copy'
   table: { code: string; research_review: string; private: string }
   // this project's fence for each worker
-  fence: { codex: 'fenced' | 'full'; agy: 'fenced' | 'none'; local: 'fenced' | 'none' }
+  fence: { codex: 'fenced' | 'full'; agy: 'fenced' | 'none'; local: 'fenced' | 'none'; opencode: 'fenced' | 'none' }
+  // opencode's free models in the order to try them; edited in consult.local.md, shown read-only
+  opencode?: { models: string[] }
   // what holds a fenced Local task: Codex's sandbox (checked and cached), consult's guard (Codex missing,
   // no pi launcher, or the check failed), or not known yet (nothing cached). A tab state kept from before
   // 0.17.0 has none.
@@ -174,6 +179,7 @@ export type DelegateEdits = {
   fence_codex?: string
   fence_agy?: string
   fence_local?: string
+  fence_opencode?: string
   local_at_once?: string
   on_close?: string
   time_limit?: string

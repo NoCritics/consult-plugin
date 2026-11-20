@@ -61,11 +61,11 @@ const DELEGATE_ENABLED = process.env.CONSULT_DELEGATE !== 'off';
 // Claude Code truncates them at 2,048 chars -- most important first.
 const SERVER_INSTRUCTIONS = [
   'consult reaches OTHER AI models through their CLIs: Codex (OpenAI), agy/Antigravity (Google; also Claude, GPT-OSS), local models (llama-swap, Ollama, LM Studio, llama-server), legacy Gemini CLI.',
-  'Use it when the user names one of them, wants a second opinion, another model\'s view or a council vote, or an image made by agy or GPT.',
-  'Tools: ask_codex, ask_agy, ask_local, ask_gemini (one prompt, one reply; images except ask_gemini); agy_generate_image, codex_generate_image (to disk); consult_chat_start, consult_chat_send, consult_chat_end (multi-turn); council_vote (models answer and rank each other); agy_status, local_status, codex_login_status, codex_login_start, gemini_auth_status (diagnostics); local_setup (when asked), local_unload (once the user agrees).',
-  ...(DELEGATE_ENABLED ? [`${ASK_OR_DELEGATE_RULE} Delegate tools: delegate (returns at once), delegate_status, delegate_list, delegate_result, delegate_merge, delegate_send, delegate_cancel, delegate_wait.`] : []),
+  'Use it when the user names one of them, wants a second opinion, another model\'s view, a council vote, or an image from agy or GPT.',
+  'Tools: ask_codex, ask_agy, ask_local, ask_gemini (one prompt, one reply; images except ask_gemini); agy_generate_image, codex_generate_image; consult_chat_start, consult_chat_send, consult_chat_end (multi-turn); council_vote (models answer and rank each other); agy_status, local_status, codex_login_status, codex_login_start, gemini_auth_status (diagnostics); local_setup (when asked), local_unload (once the user agrees).',
+  ...(DELEGATE_ENABLED ? [`${ASK_OR_DELEGATE_RULE} Delegate tools: delegate (also opencode: free cloud models), delegate_status, delegate_list, delegate_result, delegate_merge, delegate_send, delegate_cancel, delegate_wait.`] : []),
   'If deferred, load every tool you need in one tool search. Prefer ask_agy over ask_gemini. Ask and chat models see only the prompt: put in it all they need, file contents too.',
-  'Pass timeout_s (30-1800 s) for long calls. A result starting with "INCOMPLETE:" is partial, not an answer: say so; one retry with its suggested timeout_s is fine.'
+  'Pass timeout_s (30-1800) for long calls. A result starting with "INCOMPLETE:" is partial, not an answer: say so; one retry with its suggested timeout_s is fine.'
 ].join('\n');
 
 const server = new Server(
