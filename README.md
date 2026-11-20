@@ -1,13 +1,13 @@
 <h1 align="center">consult</h1>
 
 <p align="center">
-  Ask other AI models from Claude Code and Claude Desktop: Codex, Antigravity, and local models, for second opinions, council votes, images and background tasks.
+  Ask other AI models from Claude Code and Claude Desktop: Codex, Antigravity and local models, for second opinions, council votes and images. Hand background tasks to them or to opencode's free cloud models.
 </p>
 
 <p align="center">
   <a href="https://github.com/NoCritics/consult-plugin/releases"><img alt="release" src="https://img.shields.io/github/v/release/NoCritics/consult-plugin?label=release&color=2f6f9f"></a>
   <a href="https://github.com/NoCritics/consult-plugin/actions/workflows/test.yml"><img alt="tests" src="https://img.shields.io/github/actions/workflow/status/NoCritics/consult-plugin/test.yml?branch=main&label=tests"></a>
-  <img alt="models" src="https://img.shields.io/badge/models-Codex%20%C2%B7%20agy%20%C2%B7%20local-555">
+  <img alt="models" src="https://img.shields.io/badge/models-Codex%20%C2%B7%20agy%20%C2%B7%20opencode%20%C2%B7%20local-555">
   <a href="./LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-4c9a5c"></a>
   <a href="https://github.com/NoCritics/consult-plugin/stargazers"><img alt="stars" src="https://img.shields.io/github/stars/NoCritics/consult-plugin?logo=github&label=stars&color=c9a227"></a>
 </p>
@@ -30,11 +30,11 @@ Needs Node.js 20 or newer. In Claude Code:
 /plugin install consult@nocritics
 ```
 
-Restart Claude Code, then sign in to the providers you want: `codex login`, run `agy` once, or start a local runner and run `/consult:setlocal`. Claude Desktop installs the `.mcpb` from the [releases page](https://github.com/NoCritics/consult-plugin/releases).
+Restart Claude Code, then sign in to the providers you want: `codex login`, run `agy` once, install opencode 2.x (by default it runs inside Codex's sandbox, so Codex must be installed too), or start a local runner and run `/consult:setlocal`. Claude Desktop installs the `.mcpb` from the [releases page](https://github.com/NoCritics/consult-plugin/releases).
 
 ## Use
 
-Ask in plain words: "get a second opinion on this", "ask codex why this test fails", "run the council on this", "make an image of a lighthouse at dusk". Or use the slash commands: `/consult:codex`, `/consult:agy`, `/consult:local`, `/consult:council`, `/consult:chat`, `/consult:delegate`.
+Ask in plain words: "get a second opinion on this", "ask codex why this test fails", "run the council on this", "make an image of a lighthouse at dusk", "have opencode review src/". Or use the slash commands: `/consult:codex`, `/consult:agy`, `/consult:local`, `/consult:council`, `/consult:chat`, `/consult:delegate`.
 
 ## More
 

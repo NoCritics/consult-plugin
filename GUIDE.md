@@ -19,6 +19,7 @@ Then set up the providers you want. Each one is optional; a tool whose provider 
 |---|---|---|
 | Codex | install the `codex` CLI, run `codex login` | questions, chats, council, GPT images, background tasks |
 | Antigravity | install `agy` from [antigravity.google](https://antigravity.google), run `agy` once to sign in | questions, chats, council, images, background tasks |
+| opencode | the `opencode` CLI, 2.x, and Codex for its sandbox (no Codex sign-in needed); `OPENROUTER_API_KEY` for OpenRouter's free models | background tasks, free models only (see [opencode](#opencode)) |
 | Local model | a running runner, then `/consult:setlocal` | questions, council, background tasks (these also need the `pi` CLI) |
 | Claude | the `claude` CLI | council |
 | Gemini CLI (legacy) | the `gemini` CLI and a paid `GEMINI_API_KEY`; the free tier no longer works | `ask_gemini` |
