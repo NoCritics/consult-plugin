@@ -2249,7 +2249,11 @@ try {
       // opencode stream (recorded on 2.3.2; @WORK@ and @SIBLING@ stand for scratch folders)
       const opencodeWorkFolder = path.resolve(os.tmpdir(), 'opencode-fixture-work');
       const opencodeSibling = path.resolve(os.tmpdir(), 'opencode-fixture-sibling');
-      const opencodeLines = (name) => fixtureLines(name).map((line) => line.split('@WORK@').join(JSON.stringify(opencodeWorkFolder).slice(1, -1)).split('@SIBLING@').join(JSON.stringify(opencodeSibling).slice(1, -1)));
+      // The fixture was recorded on Windows: a placeholder's backslash becomes this platform's separator.
+      const jsonText = (value) => JSON.stringify(value).slice(1, -1);
+      const opencodeLines = (name) => fixtureLines(name).map((line) => line
+        .split('@WORK@\\\\').join(`@WORK@${jsonText(path.sep)}`).split('@SIBLING@\\\\').join(`@SIBLING@${jsonText(path.sep)}`)
+        .split('@WORK@').join(jsonText(opencodeWorkFolder)).split('@SIBLING@').join(jsonText(opencodeSibling)));
       const opencodeRead = parseWorkerStream('opencode', fixtureLines('opencode-read.jsonl'), { model: 'opencode/deepseek-v4.1-flash-free' });
       eq('parse opencode: read gives the session, the last step\'s text, complete, no error',
         opencodeRead, { finalMessage: 'The readme.txt file says "hello world."', session: 'ses_e06e01d70ffeQ9cZJhtEPIF58Z', limit: null, limitHit: null, error: null, denied: [], complete: true, refusedPaths: [], warning: null });
