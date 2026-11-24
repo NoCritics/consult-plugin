@@ -277,7 +277,7 @@ const OPENCODE_SESSION_RE = /^ses_[A-Za-z0-9]+$/;
 // The opencode command. Its environment is built here, not inherited
 // (inheritEnvironment: false): an allow-list, the key of an OpenRouter model,
 // and consult's own settings. `workerTemp` is workerTempFolders('opencode', id).
-function opencodeCommand({ task, workFolder, isWrite, resume, promptText, fence, model, workerTemp, binary, codexPath }) {
+function opencodeCommand({ task, workFolder, isWrite, resume, promptText, fence, model, workerTemp, binary, codexPath, testProvider }) {
   if (binary.unavailable !== undefined) throw new Error(binary.unavailable);
   if (typeof model !== 'string' || model === '') throw new Error('An opencode task needs a model (the run\'s model, from the free list).');
   requireModelId(model);
@@ -294,6 +294,7 @@ function opencodeCommand({ task, workFolder, isWrite, resume, promptText, fence,
 
   // Only the model's own provider is enabled: a different one never loads its key or models.
   const config = { mcp: {}, plugin: [], enabled_providers: [model.split('/')[0]] };
+  if (testProvider && model.startsWith(`${testProvider.id}/`)) config.provider = { [testProvider.id]: testProvider.config };
   if (!isWrite) config.permission = { edit: 'deny', bash: 'deny' };
 
   const env = opencodeEnvironment({
@@ -318,7 +319,7 @@ function opencodeCommand({ task, workFolder, isWrite, resume, promptText, fence,
 // worktree, or the project itself for a task that works in place. `brief`
 // defaults to the task's brief.md. A resume continues the worker's session
 // (worker_session, or pi_session for a local task) with `followUp`.
-export function workerCommand(task, { settings, runner = null, inventory = null, resume = false, followUp = null, brief = null, piLayer = null, fence: givenFence = null, model: runModel = null, workerTemp = null, opencodeBinary = null, codexPath = null }) {
+export function workerCommand(task, { settings, runner = null, inventory = null, resume = false, followUp = null, brief = null, piLayer = null, fence: givenFence = null, model: runModel = null, workerTemp = null, opencodeBinary = null, codexPath = null, testProvider = null }) {
   const word = parseWorkerWord(task.worker);
   if (word.worker === null) throw new Error(`Unknown delegate worker ${JSON.stringify(task.worker)}.`);
   const workFolder = task.worktree ?? task.project;
@@ -347,7 +348,7 @@ export function workerCommand(task, { settings, runner = null, inventory = null,
     return localCommand({ task, nickname: word.nickname, workFolder, taskDir, isWrite, resume, promptText, settings, runner, inventory, fenced, fenceLayer, piLayer });
   }
   if (word.worker === 'opencode') {
-    return opencodeCommand({ task, workFolder, isWrite, resume, promptText, fence, model: runModel, workerTemp, binary: opencodeBinary ?? findOpencodeBinary(), codexPath });
+    return opencodeCommand({ task, workFolder, isWrite, resume, promptText, fence, model: runModel, workerTemp, binary: opencodeBinary ?? findOpencodeBinary(), codexPath, testProvider });
   }
   let cmd;
   let args;

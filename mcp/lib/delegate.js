@@ -31,7 +31,7 @@ import {
   projectKey, projectSettings, taskFence, narrowerFence, saveProjectSettings, withLockFolder, removeTaskWhen, unmergedBase, isSupervisorLive, ACTIVE_STATES
 } from './delegate-store.js';
 import { launchSupervisor, copyWorkFolder, cachedPiLayer, refuseProgramInsideProject } from './delegate-supervisor.js';
-import { findOpencodeBinary, readFreeModels, chooseModels } from './opencode-models.js';
+import { findOpencodeBinary, readFreeModels, chooseModels, modelChoices } from './opencode-models.js';
 import { isLongText, previewWithPath } from './long-answer.js';
 
 // ---- the words ----
@@ -365,7 +365,13 @@ async function checkOpencode(model, context, folders) {
     free = { ok: false, reason: error.message };
   }
   if (!free.ok) throw new Error(`opencode cannot run: ${free.reason}.`);
-  const chosen = chooseModels({ listed: context.settings.opencode?.models ?? [], explicit: model, free: free.free });
+  let choices;
+  try {
+    choices = modelChoices({ listed: context.settings.opencode?.models ?? [], free: free.free });
+  } catch (error) {
+    throw new Error(`opencode cannot run: ${error.message}.`);
+  }
+  const chosen = chooseModels({ listed: choices.listed, explicit: model, free: choices.free });
   if (!chosen.ok) throw new Error(`opencode cannot run: ${chosen.reason}.`);
 }
 

@@ -1691,6 +1691,10 @@ try {
       eq('opencode write: --auto and no permission block', [writeCommand.args.includes('--auto'), 'permission' in configOf(writeCommand)], [true, false]);
       eq('opencode: no MCP servers or plugins, and only the model\'s provider', [configOf(readCommand).mcp, configOf(readCommand).plugin, configOf(readCommand).enabled_providers], [{}, [], ['opencode']]);
       eq('opencode: the provider list follows an openrouter model', configOf(workerCommand(opencodeTask(), { ...opencodeOptions, model: 'openrouter/nvidia/nemotron-3.5-super-vl:free' })).enabled_providers, ['openrouter']);
+      const testProvider = { id: 'stub', models: ['stub/stub-model'], config: { npm: '@ai-sdk/openai-compatible', options: { baseURL: 'http://127.0.0.1:4100/v1' }, models: { 'stub-model': {} } } };
+      eq('opencode: a test provider is in the config only for its own model',
+        [configOf(workerCommand(opencodeTask(), { ...opencodeOptions, model: 'stub/stub-model', testProvider })).provider, 'provider' in configOf(workerCommand(opencodeTask(), { ...opencodeOptions, testProvider }))],
+        [{ stub: testProvider.config }, false]);
 
       const env = writeCommand.env;
       eq('opencode env: PWD is the work folder; TEMP, TMP and the XDG folders sit under the temp root',
@@ -5414,6 +5418,19 @@ try {
             readFreeModels: async () => { listings += 1; return { ok: true, free: freeList }; }
           }));
           eq('delegate opencode: and one outside it is listed (the pair that shows the check can tell)', [outsideProject.value.started, listings], [true, 1]);
+
+          const savedTestProvider = process.env.CONSULT_OPENCODE_TEST_PROVIDER;
+          try {
+            process.env.CONSULT_OPENCODE_TEST_PROVIDER = JSON.stringify({ id: 'stub', baseURL: 'http://127.0.0.1:4100/v1', models: ['stub-model'] });
+            const stubNamed = await call('delegate', briefArgs({ worker: 'opencode', mode: 'read', model: 'stub/stub-model' }), opencodeContext());
+            eq('delegate opencode: a test provider\'s model named by the caller counts as free', [stubNamed.isError === true, stubNamed.value?.started], [false, true]);
+            const tasksBeforeBadProvider = listTasks({ project }).length;
+            process.env.CONSULT_OPENCODE_TEST_PROVIDER = JSON.stringify({ id: 'stub', baseURL: 'http://example.com/v1', models: ['stub-model'] });
+            const badProvider = await call('delegate', briefArgs({ worker: 'opencode', mode: 'read' }), opencodeContext());
+            eq('delegate opencode: a test provider that is not on this machine is refused up front, with no task', [badProvider.isError, /CONSULT_OPENCODE_TEST_PROVIDER/.test(badProvider.text), listTasks({ project }).length], [true, true, tasksBeforeBadProvider]);
+          } finally {
+            if (savedTestProvider === undefined) delete process.env.CONSULT_OPENCODE_TEST_PROVIDER; else process.env.CONSULT_OPENCODE_TEST_PROVIDER = savedTestProvider;
+          }
 
           const free = await call('delegate', briefArgs({ worker: 'opencode', mode: 'read', model: 'opencode/big-pickle' }), opencodeContext());
           eq('delegate opencode: a free model starts, fenced, layer sandbox, exact note', [free.value.started, free.value.fence, free.value.fenced, free.value.fence_layer, free.value.fence_note],

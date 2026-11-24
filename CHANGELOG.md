@@ -2,7 +2,16 @@
 
 All notable changes to this plugin are documented here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follow [SemVer](https://semver.org/).
 
-## [Unreleased]
+## [0.18.1] - 2026-11-24
+
+### Added
+
+- **A test provider for checking opencode's model switch live.** `CONSULT_OPENCODE_TEST_PROVIDER` (JSON `{"id","baseURL","models"}`) adds a provider at an `http://` address on this machine, such as a stub that answers 429. Its models count as free and run first, also when a call names one, and they are not price-checked: it is for testing, so don't point it at a local proxy that forwards to a paid API. It refuses any other address and the ids `opencode` and `openrouter`, up front in `delegate`. Checked on 2026-11-20: a fenced read task started on a stub that always answered 429, switched to `opencode/deepseek-v4.1-flash-free` after opencode's 12 retries (about 95 s), finished there, and recorded the switch and the stub's hold.
+
+### Fixed
+
+- **A refused agy read is reported as one.** agy 1.5.16 asked for approval to read one file during an `ask_agy` call. Run headless, it can't get approval, so it cancelled the whole answer. consult then said agy "will not perform file edits or shell actions", and the calling session concluded agy can't read files at all. When every refused action is a read, the error now says agy needed approval to read a file and cancelled the answer, and to put the contents of the text files the prompt points to into the prompt (agy doesn't say which file it was; an image can't be pasted, so that call is asked again as it is). agy still reads most files it is pointed at: four test reads on 2026-11-24 worked (outside its start folder, in a hidden folder, in a `.claude` folder, a git-ignored file). Refused edits and commands keep the old message.
+- **The opencode price-list tests no longer depend on the date.** On Windows a copied fixture keeps its file date, so once the fixture was more than a day old the cached catalog looked stale and the tests tried the network.
 
 ## [0.18.0] - 2026-11-20
 

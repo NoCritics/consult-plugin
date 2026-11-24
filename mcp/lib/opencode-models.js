@@ -9,6 +9,7 @@ import { resolveCmd } from './resolve-cmd.js';
 import { dataHome } from './delegate-store.js';
 import { writeFileAtomic } from './json-file.js';
 import { killTree, cliSpawnOptions } from './spawn-cli.js';
+import { isLoopback } from './local.js';
 
 const MODELS_BUDGET_MS = 60_000;
 const FREE_CACHE_MS = 60 * 60 * 1000;
@@ -181,4 +182,46 @@ export function chooseModels({ listed, explicit, free }) {
   return { ok: true, models };
 }
 
+// The models a run may choose from: the settings' list and the free list, with
+// the test provider's models first in both when CONSULT_OPENCODE_TEST_PROVIDER is
+// set. Throws when that variable is malformed.
+export function modelChoices({ listed, free, env = process.env }) {
+  const testProvider = opencodeTestProvider(env);
+  if (testProvider === null) return { listed, free, testProvider };
+  return { listed: [...testProvider.models, ...listed], free: [...testProvider.models, ...free], testProvider };
+}
+
 export function resetFreeModelsCache() { freeCache = null; }
+
+// For a live check of the model switch: CONSULT_OPENCODE_TEST_PROVIDER holds
+// {"id","baseURL","models"}, a provider on this machine (a stub that answers 429).
+// Its models count as free and run first. Only a loopback address is accepted, so
+// no real provider is ever reached through it. null when the variable is unset.
+export function opencodeTestProvider(env = process.env) {
+  const text = env.CONSULT_OPENCODE_TEST_PROVIDER;
+  if (text === undefined || text === '') return null;
+  let value;
+  try {
+    value = JSON.parse(text);
+  } catch (error) {
+    throw new Error(`CONSULT_OPENCODE_TEST_PROVIDER is not JSON (${error.message})`);
+  }
+  const id = value?.id;
+  if (typeof id !== 'string' || !/^[a-z0-9-]+$/.test(id) || ['opencode', 'openrouter'].includes(id)) {
+    throw new Error('CONSULT_OPENCODE_TEST_PROVIDER needs an id of its own (lower-case letters, digits, dashes; not opencode or openrouter)');
+  }
+  if (typeof value.baseURL !== 'string' || !value.baseURL.startsWith('http://') || !isLoopback(value.baseURL)) {
+    throw new Error('CONSULT_OPENCODE_TEST_PROVIDER takes only an http:// address on this machine');
+  }
+  const names = value.models;
+  if (!Array.isArray(names) || names.length === 0 || !names.every((name) => typeof name === 'string' && /^[A-Za-z0-9._-]+$/.test(name))) {
+    throw new Error('CONSULT_OPENCODE_TEST_PROVIDER needs a list of model names');
+  }
+  const models = {};
+  for (const name of names) models[name] = { name };
+  return {
+    id,
+    models: names.map((name) => `${id}/${name}`),
+    config: { npm: '@ai-sdk/openai-compatible', name: 'consult test provider', options: { baseURL: value.baseURL, apiKey: 'none' }, models }
+  };
+}

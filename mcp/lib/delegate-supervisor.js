@@ -25,7 +25,7 @@ import { readKey, runnerInventory } from './local-runners.js';
 import { workerCommand, parseWorkerStream, noteStepEvent, codexRolloutLimits, deniedNames, workerWriteTargets, workerLabel } from './delegate-workers.js';
 import { gitState, endSnapshot, changedFiles, watchFolder, diffWatch, sortChanges, isOutside, worktreesRoot } from './delegate-git.js';
 import { recordLimit, recordLimitHit, hitKindOf, lastLimits, activeHit, OPENCODE_MODEL_KEY_PREFIX } from './delegate-limits.js';
-import { findOpencodeBinary, readFreeModels, chooseModels } from './opencode-models.js';
+import { findOpencodeBinary, readFreeModels, chooseModels, modelChoices } from './opencode-models.js';
 import {
   stageSessions, returnSessions, removeWorkerTemp, makeWorkerTempFolders, hasLeftoverSessions, piLauncherFor, sandboxCheck, readCachedSandboxCheck, findCodexForFence
 } from './delegate-fence.js';
@@ -786,7 +786,13 @@ async function planOpencode(context, options, settings, workFolder) {
     free = { ok: false, reason: error.message };
   }
   if (!free.ok) return refuse(`Failed: ${free.reason}`);
-  const chosen = chooseModels({ listed: settings.opencode?.models ?? [], explicit: task.model ?? null, free: free.free });
+  let choices;
+  try {
+    choices = modelChoices({ listed: settings.opencode?.models ?? [], free: free.free });
+  } catch (error) {
+    return refuse(`Failed: ${error.message}`);
+  }
+  const chosen = chooseModels({ listed: choices.listed, explicit: task.model ?? null, free: choices.free });
   if (!chosen.ok) return refuse(`Failed: ${chosen.reason}`);
 
   const now = context.now();
@@ -808,7 +814,7 @@ async function planOpencode(context, options, settings, workFolder) {
   }
   // A follow-up starts on the model the task ended on.
   if (models.includes(task.model_used)) models = [task.model_used, ...models.filter((model) => model !== task.model_used)];
-  return { fence, binary, codexPath, models };
+  return { fence, binary, codexPath, models, testProvider: choices.testProvider };
 }
 
 // Whether any output line is a JSON object, which only pi writes: a sandboxed run that printed one got as far as pi.
@@ -1328,7 +1334,7 @@ async function runOpencodeModels(context, options, plan, { settings, workFolder,
     const model = plan.models[modelIndex];
     const commandTask = { ...task, worker_session: session, ...(workFolder === null ? {} : { worktree: workFolder }) };
     const result = await runOnce(context, options, commandTask, {
-      settings, resume, followUp, fence: plan.fence, model, workerTemp, opencodeBinary: plan.binary, codexPath: plan.codexPath
+      settings, resume, followUp, fence: plan.fence, model, workerTemp, opencodeBinary: plan.binary, codexPath: plan.codexPath, testProvider: plan.testProvider
     }, key);
     session = result.parsed.session ?? session;
     const hit = result.parsed.limitHit;

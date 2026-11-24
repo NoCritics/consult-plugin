@@ -26,7 +26,9 @@
 //   - inside any `trustedWorkspaces` entry, headless agy creates and edits
 //     files WITHOUT asking, whatever cwd it was launched from; elsewhere the
 //     write is auto-denied. Shell commands are auto-denied everywhere. Reads
-//     work everywhere (the image feature relies on that).
+//     mostly work anywhere (the image feature relies on that), but agy 1.5.16
+//     once asked approval for a read; headless, that is refused and the whole
+//     turn is cancelled, leaving an empty response.
 //   - `"permissions": { "deny": ["write_file(**)", "command(**)"] }` there
 //     blocks writes even inside trusted workspaces.
 //   - There is no per-invocation override: no flag, and JETSKI_APP_DATA_DIR is
@@ -71,6 +73,16 @@ export function describeDeniedActions(parsed) {
   return list
     .map(d => d && (d.display_name || d.action) ? `${d.display_name || d.action}${d.display_name && d.action ? ` (${d.action})` : ''}` : null)
     .filter(Boolean);
+}
+
+// agy's read tools, by action and by display name: read_file / ReadFile seen
+// live on agy 1.5.16, ViewFile on an earlier agy.
+const READ_TOOLS = new Set(['read_file', 'view_file', 'ReadFile', 'ViewFile']);
+
+// True when agy was refused something and every refusal was a file read.
+function onlyReadsDenied(parsed) {
+  const list = Array.isArray(parsed?.denied_actions) ? parsed.denied_actions.filter(d => d && (d.action || d.display_name)) : [];
+  return list.length > 0 && list.every(d => READ_TOOLS.has(d.action) || READ_TOOLS.has(d.display_name));
 }
 
 export function validateAgyEffort(effort) {
@@ -192,6 +204,14 @@ export function parseAgyResult(stdout, stderr, printTimeoutMs = null) {
     // An empty SUCCESS means agy declined to act. Passing '' back would look
     // like the model had nothing to say.
     const denied = describeDeniedActions(parsed);
+    if (onlyReadsDenied(parsed)) {
+      throw new Error(
+        'agy stopped without an answer: it needed approval to read a file, which it cannot ask for when run headless, ' +
+        `so it cancelled the whole answer (refused: ${denied.join(', ')}). ` +
+        'agy reads most files it is pointed at, and it does not say which one this was. ' +
+        'Put the contents of the text files the prompt points to into the prompt and ask again; an image cannot be pasted, so ask again as it is.'
+      );
+    }
     throw new Error(
       'agy returned an empty response. This usually means it declined to act -- ' +
       'agy answers questions, but will not perform file edits or shell actions without approval, ' +

@@ -28,7 +28,7 @@ import { shellSafeArgs, runCli, cliSpawnOptions, killTree, killAllCliChildren, l
 import { callContext } from './lib/util.js';
 import { SPAWN_OPTS, EMPTY_ARG, ensureCmd, isInsideFolder, pickWindowsHit, spawnableCmd, whereCommand, refusedWindowsHits, missingMessage } from './lib/resolve-cmd.js';
 import { dataHome } from './lib/delegate-store.js';
-import { findOpencodeBinary, readFreeModels, chooseModels, resetFreeModelsCache, defaultCatalogFolder, opencodeEnvironment } from './lib/opencode-models.js';
+import { findOpencodeBinary, readFreeModels, chooseModels, resetFreeModelsCache, defaultCatalogFolder, opencodeEnvironment, opencodeTestProvider } from './lib/opencode-models.js';
 import { codexTimeoutMs, CODEX_TIMEOUT_FLOOR_MS, hookArgs, codexRunHooks, parseCodexJsonl, codexTimeoutError, configuredCodex, rolloutTurn, codexDefaultLabel } from './lib/codex.js';
 import { incompleteError, PARTIAL_CAP_CHARS, timeoutMsFromSeconds, timeoutRetryHint } from './lib/util.js';
 import { parseAgyResult, agyFailure, conversationIdFrom, agyImageOutputDir, findGeneratedImages, copyImagesTo, retargetPaths, agySubagentIds, finishImageCall, saveConversationImages, finishConversation, hostAppDirs, AGY_IMAGE_PREAMBLE } from './lib/agy.js';
@@ -570,6 +570,28 @@ eq('hookArgs: codex_hooks true -> no flag', hookArgs(true), []);
   truthy('agy partial: labelled as cut off mid-stream', err.message.includes('BEGIN PARTIAL AGY OUTPUT (answer cut off mid-stream)'));
   eq('agy partial: partial text carried', err.partial, 'Rivers are among the most dyn');
   eq('agy partial: kind timeout', err.kind, 'timeout');
+}
+
+// ---- agy 1.5: a read that needed approval cancels the whole turn ----
+// Seen live 2026-11-24 (agy 1.5.16): "Print mode: soft-denying tool confirmation
+// "ReadFile"", then an empty SUCCESS. The error must say a read was refused,
+// not that agy won't edit files or run commands.
+{
+  const failureOf = (denied) => {
+    const envelope = JSON.stringify({ conversation_id: 'c', status: 'SUCCESS', response: '', denied_actions: denied });
+    try { parseAgyResult(envelope, ''); } catch (error) { return error; }
+    return null;
+  };
+  const read = failureOf([{ action: 'read_file', display_name: 'ReadFile' }]);
+  const readMessage = read?.message ?? '';
+  truthy('agy refused read: throws', read !== null);
+  truthy('agy refused read: names the refused read', readMessage.includes('ReadFile (read_file)'));
+  truthy('agy refused read: says the read needed approval', /approval to read/i.test(readMessage));
+  truthy('agy refused read: does not claim agy only declines edits or shell actions', !readMessage.includes('file edits or shell actions'));
+  const command = failureOf([{ action: 'command', display_name: 'RunCommand' }]);
+  truthy('agy refused command: keeps the edits-or-shell message', (command?.message ?? '').includes('file edits or shell actions'));
+  const mixed = failureOf([{ action: 'read_file', display_name: 'ReadFile' }, { action: 'command', display_name: 'RunCommand' }]);
+  truthy('agy refused read and command: keeps the edits-or-shell message', (mixed?.message ?? '').includes('file edits or shell actions'));
 }
 
 
@@ -3163,7 +3185,11 @@ if (SPAWN_OPTS.shell) {
   const catalogFolder = fs.mkdtempSync(path.join(os.tmpdir(), 'consult-oc-models-'));
   const withCatalog = (folder) => {
     fs.mkdirSync(path.join(folder, 'cache', 'opencode'), { recursive: true });
-    fs.copyFileSync(new URL('models.json', fixtureFolder), path.join(folder, 'cache', 'opencode', 'models.json'));
+    const copied = path.join(folder, 'cache', 'opencode', 'models.json');
+    fs.copyFileSync(new URL('models.json', fixtureFolder), copied);
+    // A copy keeps the fixture's date on Windows; a catalog older than a day is fetched again.
+    const now = new Date();
+    fs.utimesSync(copied, now, now);
   };
   const fakeRun = (stdout) => async () => ({ code: 0, stdout, stderr: '' });
   const noFetch = async () => { throw new Error('no network in this test'); };
@@ -3277,6 +3303,18 @@ if (SPAWN_OPTS.shell) {
   eq('chooseModels: names at most 10 free models', chooseModels({ listed: manyFree, explicit: 'x/y', free: manyFree }).reason.split('opencode/free-').length - 1, 10);
   eq('chooseModels: no explicit model keeps the listed order, free only', chooseModels({ listed: ['opencode/paid-pro', 'openrouter/google/gemma-4-31b-it:free', 'opencode/big-pickle'], explicit: null, free: freeIds }), { ok: true, models: ['openrouter/google/gemma-4-31b-it:free', 'opencode/big-pickle'] });
   eq('chooseModels: nothing free is a refusal', chooseModels({ listed: ['opencode/paid-pro'], explicit: null, free: freeIds }).ok, false);
+
+  const testProviderOf = (value) => opencodeTestProvider({ CONSULT_OPENCODE_TEST_PROVIDER: JSON.stringify(value) });
+  eq('opencodeTestProvider: unset is none', opencodeTestProvider({}), null);
+  const stubProvider = testProviderOf({ id: 'stub', baseURL: 'http://127.0.0.1:4100/v1', models: ['stub-model'] });
+  eq('opencodeTestProvider: a loopback provider gives its full model ids and an openai-compatible provider pointing at it',
+    [stubProvider.models, stubProvider.config.npm, stubProvider.config.options.baseURL, Object.keys(stubProvider.config.models)],
+    [['stub/stub-model'], '@ai-sdk/openai-compatible', 'http://127.0.0.1:4100/v1', ['stub-model']]);
+  throws('opencodeTestProvider: an address off this machine is refused', () => testProviderOf({ id: 'stub', baseURL: 'http://example.com/v1', models: ['m'] }));
+  throws('opencodeTestProvider: https is refused', () => testProviderOf({ id: 'stub', baseURL: 'https://127.0.0.1/v1', models: ['m'] }));
+  throws('opencodeTestProvider: the id of a real provider is refused', () => testProviderOf({ id: 'openrouter', baseURL: 'http://127.0.0.1/v1', models: ['m'] }));
+  throws('opencodeTestProvider: no models is refused', () => testProviderOf({ id: 'stub', baseURL: 'http://127.0.0.1/v1', models: [] }));
+  throws('opencodeTestProvider: text that is not JSON is refused', () => opencodeTestProvider({ CONSULT_OPENCODE_TEST_PROVIDER: '{' }));
 
   eq('findOpencodeBinary: a bare name is refused (no path under the current folder)', typeof findOpencodeBinary({ resolve: () => ({ path: 'opencode', found: true }) }).unavailable, 'string');
   eq('findOpencodeBinary: an absolute .exe is used as is', findOpencodeBinary({ resolve: () => ({ path: path.resolve('x', 'opencode.exe'), found: true }) }), { path: path.resolve('x', 'opencode.exe') });
